@@ -1,0 +1,12 @@
+bisai_f407_project\port.o: ../Middlewares/Third_Party/FreeRTOS/Source/portable/RVDS/ARM_CM4F/port.c
+bisai_f407_project\port.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/FreeRTOS.h
+bisai_f407_project\port.o: E:\Keil_v5\ARM\ARMCC\Bin\..\include\stddef.h
+bisai_f407_project\port.o: E:\Keil_v5\ARM\ARMCC\Bin\..\include\stdint.h
+bisai_f407_project\port.o: ../Core/Inc/FreeRTOSConfig.h
+bisai_f407_project\port.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/projdefs.h
+bisai_f407_project\port.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/portable.h
+bisai_f407_project\port.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/deprecated_definitions.h
+bisai_f407_project\port.o: ../Middlewares/Third_Party/FreeRTOS/Source/portable/RVDS/ARM_CM4F/portmacro.h
+bisai_f407_project\port.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/mpu_wrappers.h
+bisai_f407_project\port.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/task.h
+bisai_f407_project\port.o: ../Middlewares/Third_Party/FreeRTOS/Source/include/list.h

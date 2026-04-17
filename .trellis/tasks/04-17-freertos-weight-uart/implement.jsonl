@@ -1,0 +1,12 @@
+{"file": ".trellis/workflow.md", "reason": "Project workflow and conventions"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend development guide"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Frontend development guide"}
+{"file": ".trellis\\spec\\backend\\directory-structure.md", "reason": "Place user firmware in User/App and User/Driver; keep Core generated files thin."}
+{"file": ".trellis\\spec\\frontend\\directory-structure.md", "reason": "Organize application feature modules under User/App and user drivers under User/Driver."}
+{"file": ".trellis\\spec\\backend\\quality-guidelines.md", "reason": "Preserve CubeMX ownership boundaries and keep ISR code minimal."}
+{"file": ".trellis\\spec\\backend\\error-handling.md", "reason": "Follow HAL failure checks and fail-fast escalation for low-level init."}
+{"file": ".trellis\\spec\\frontend\\hook-guidelines.md", "reason": "Keep callbacks thin and move work into task context."}
+{"file": ".trellis\\spec\\frontend\\state-management.md", "reason": "Keep measurement state task-owned and synchronize ISR-visible data explicitly."}
+{"file": ".trellis\\spec\\frontend\\quality-guidelines.md", "reason": "Keep app logic deterministic and observable."}
+{"file": ".trellis\\spec\\guides\\code-reuse-thinking-guide.md", "reason": "Search for repeated patterns before adding helpers or constants."}
+{"file": ".trellis\\spec\\frontend\\component-guidelines.md", "reason": "Build measurement and serial functionality as clear app modules."}
