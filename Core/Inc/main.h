@@ -57,6 +57,9 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define LDC1614_INTB_Pin GPIO_PIN_4
+#define LDC1614_INTB_GPIO_Port GPIOC
+#define LDC1614_INTB_EXTI_IRQn EXTI4_IRQn
 
 /* USER CODE BEGIN Private defines */
 

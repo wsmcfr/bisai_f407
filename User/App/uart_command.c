@@ -171,6 +171,16 @@ int my_printf(UART_HandleTypeDef *huart, const char *format, ...)
         return -1;
     }
 
+    /*
+     * 项目里已经出现多个任务共用同一串口打印，
+     * 因此这里补一层惰性初始化，避免某个任务首次打印早于
+     * `UartCommand_StartReceive()` 执行，从而丢失发送互斥保护。
+     */
+    if (g_uart_tx_mutex == NULL)
+    {
+        UartCommand_InitSyncObjects();
+    }
+
     if (g_uart_tx_mutex != NULL)
     {
         (void)xSemaphoreTake(g_uart_tx_mutex, portMAX_DELAY);

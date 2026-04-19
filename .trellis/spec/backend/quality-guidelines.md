@@ -202,6 +202,110 @@ void UartCommandTask(void *argument)
 - Size stacks and buffers from evidence, then confirm with runtime observation.
 - Prefer queue, notification, or event-based decoupling before introducing shared writable state.
 
+### Scenario: UART Command Ownership and Sensor Service Dispatch
+
+#### 1. Scope / Trigger
+
+- Trigger: adding new UART text commands that affect more than one `User/App` service
+- Trigger: reusing one `DMA + IDLE` UART RX path across multiple FreeRTOS tasks
+- Trigger: introducing calibration or inspection modes where a serial command arms one task and another task performs the actual sensor workflow
+
+#### 2. Signatures
+
+- UART RX single-consumer entry:
+  - `uint8_t UartCommand_Fetch(char *command_buffer, uint16_t buffer_size, uint32_t timeout_ms)`
+- Module command dispatch entry:
+  - `uint8_t XxxService_HandleCommand(const char *command_buffer)`
+- Current LDC service command entry:
+  - `uint8_t Ldc1614Service_HandleCommand(const char *command_buffer)`
+- Current LDC calibration commands:
+  - `LDCCAL CH1`
+  - `LDCCAL CH2 20`
+  - `LDCSTOP`
+
+#### 3. Contracts
+
+- `USART1` RX command frames must have exactly one task-context consumer:
+  - one owner calls `UartCommand_Fetch(...)`
+  - other services must not also fetch directly from the same UART command cache
+- Feature modules that need UART commands must expose a dispatch interface instead of competing for RX ownership:
+  - the owner task normalizes the command
+  - the owner task forwards recognized subcommands to module handlers such as `Ldc1614Service_HandleCommand(...)`
+- Calibration/inspection commands must arm a service-local session rather than performing the whole procedure inside the command owner:
+  - command task validates format and starts the session
+  - sensor task executes settle, sample, statistics, and result reporting in its own runtime context
+- LDC calibration sampling semantics are:
+  - one target channel per session
+  - one physical placement of the part
+  - wait for the normal settle phase
+  - then capture `N` stable samples from that same placement
+  - do not interpret `LDCCAL CHx 20` as “place the part 20 times”
+- Public headers that expose fixed-width integer types must include `<stdint.h>` themselves:
+  - do not rely on transitive includes from unrelated HAL or application headers
+
+#### 4. Validation & Error Matrix
+
+| Check | Expected | Failure Meaning | Required Action |
+|-------|----------|-----------------|-----------------|
+| UART RX ownership | exactly one consumer calls `UartCommand_Fetch(...)` | commands may be stolen or lost between tasks | move parsing to one owner task and dispatch by handler function |
+| Module command dispatch | non-owner modules expose `HandleCommand(...)`-style entry | service is tightly coupled to UART driver | add command forwarding interface |
+| Calibration command format | channel and optional count parse deterministically | invalid session arming or silent wrong target | reject with explicit error and usage hint |
+| Calibration session semantics | one placement produces multiple stable samples | operator may re-place part between samples and corrupt statistics | document command behavior and only count samples after settle |
+| Early part removal during calibration | partially collected statistics are discarded or restarted | mean/reference becomes invalid | clear session progress and wait for a new valid placement |
+| Public header self-sufficiency | headers compile with their own direct includes | unrelated include-order dependency | add `<stdint.h>` or other direct dependency to the header |
+
+#### 5. Good / Base / Bad Cases
+
+- Good:
+  - `WeightService_Task` remains the only UART command consumer
+  - `Ldc1614Service_HandleCommand(...)` only arms or stops a calibration session
+  - `Ldc1614Service_Task` performs settle, stable sample capture, and summary output itself
+  - `LDCCAL CH1 20` means “single placement, 20 stable samples”
+- Base:
+  - a second module needs serial commands
+  - but it receives them through the existing command owner task
+  - and only exposes a narrow handler function
+- Bad:
+  - two tasks both call `UartCommand_Fetch(...)`
+  - a command callback performs long sensor sampling inline
+  - “20 samples” is implemented as forcing the operator to place the same part 20 separate times without documenting it
+  - a public header uses `uint8_t` or `uint16_t` without including `<stdint.h>`
+
+#### 6. Tests Required
+
+- Build contract test:
+  - assert that every public header with fixed-width integer types compiles after including its own declared dependencies
+- UART ownership review:
+  - assert that only one task consumes `UartCommand_Fetch(...)`
+  - assert that other modules use dispatch handlers instead of direct UART fetch
+- Command parser test:
+  - assert that `LDCCAL CH1`, `LDCCAL CH2 20`, and `LDCSTOP` are accepted
+  - assert that bad forms such as `LDCCAL`, `LDCCAL CH3`, or oversize counts are rejected
+- Hardware behavior test:
+  - arm `LDCCAL CHx 20`
+  - place one part once
+  - assert that the service outputs 20 stable samples from that single settled placement
+  - assert that summary statistics are emitted once
+- Early-removal test:
+  - remove the part before the capture completes
+  - assert that the session does not publish a false final reference
+
+#### 7. Wrong vs Correct
+
+##### Wrong
+
+- Let both `WeightService_Task` and `Ldc1614Service_Task` call `UartCommand_Fetch(...)`.
+- Parse a calibration command in one task and then busy-loop there until all sensor samples are captured.
+- Treat “sample count” as “operator must repeat placement count times” when the intended workflow is one placement plus a stable batch.
+- Add `uint8_t` to a public header and assume another include chain will define it.
+
+##### Correct
+
+- Keep one UART RX command owner and dispatch feature-specific commands through explicit service handlers.
+- Let the command owner arm or cancel a calibration session, and let the sensor task complete the workflow in task context.
+- Define LDC calibration sampling as “one stable placement, N captured samples, one summary”.
+- Make every public header self-contained by including the standard type headers it directly uses.
+
 --- 
 
 ## Testing Requirements
@@ -312,6 +416,16 @@ For timing-sensitive changes, also verify interrupt priority and RTOS interactio
 **Fix**: Read `MDK-ARM/bisai_f407_project/bisai_f407_project.build_log.htm` and verify that the `.axf` and `.hex` artifacts were regenerated.
 
 **Prevention**: Never report "build passed" unless the current-run log and current-run artifacts both confirm success.
+
+### Common Mistake: Relying on indirect type includes in public headers
+
+**Symptom**: The project builds until one header is included from a different translation unit, then errors such as `identifier "uint8_t" is undefined` appear.
+
+**Cause**: The header exposes fixed-width integer types but does not include `<stdint.h>` itself, and instead depends on an unrelated upstream include order.
+
+**Fix**: Any public header that declares `uint8_t`, `uint16_t`, `int32_t`, and similar types must include `<stdint.h>` directly.
+
+**Prevention**: Review public headers as standalone interfaces; they must compile from their own declared dependencies rather than from lucky transitive includes.
 
 ---
 

@@ -2,6 +2,7 @@
 
 #include "cmsis_os.h"
 #include "hx711.h"
+#include "ldc1614_service.h"
 #include "uart_command.h"
 #include "usart.h"
 
@@ -362,6 +363,8 @@ static void WeightService_ReportSample(const HX711_Handle_t *hx711,
  * - `GET`：返回当前重量或净计数差值
  * - `TARE`：重新执行一次去皮
  * - `CAL <克重>`：用当前带载值和已知砝码重量完成标定
+ * - `LDCCAL CHx [N]`：启动 LDC 通道的稳定批量采样模式
+ * - `LDCSTOP`：停止当前 LDC 标定采样会话
  */
 static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
                                          HX711_Status_t latest_status,
@@ -448,9 +451,14 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
             }
         }
     }
+    else if (Ldc1614Service_HandleCommand(command_buffer) != 0U)
+    {
+        /* LDC 命令已由对应模块接管，这里不再重复输出。 */
+    }
     else
     {
-        my_printf(&huart1, "[ERROR][UART] Unknown command. Use GET / TARE / CAL <g>.\r\n");
+        my_printf(&huart1,
+                  "[ERROR][UART] Unknown command. Use GET / TARE / CAL <g> / LDCCAL CHx [N] / LDCSTOP.\r\n");
     }
 }
 
