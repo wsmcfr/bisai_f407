@@ -1,0 +1,32 @@
+* text=auto
+
+# STM32/FreeRTOS 源码与项目配置统一使用 LF，避免 Windows 下反复出现 CRLF 脏改动。
+*.c text eol=lf
+*.h text eol=lf
+*.s text eol=lf
+*.S text eol=lf
+*.ld text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.xml text eol=lf
+*.ioc text eol=lf
+*.uvprojx text eol=lf
+*.uvmpw text eol=lf
+*.mxproject text eol=lf
+
+# Windows 批处理脚本保留 CRLF，避免命令解释器兼容性问题。
+*.bat text eol=crlf
+
+# 常见二进制文件禁止文本归一化。
+*.axf binary
+*.o binary
+*.pdf binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.doc binary
+*.docx binary
