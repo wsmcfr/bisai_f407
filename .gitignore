@@ -1,0 +1,17 @@
+# Keil / MDK-ARM 本地用户文件与构建产物
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.uvoptx
+MDK-ARM/*.lst
+MDK-ARM/bisai_f407_project/*.axf
+MDK-ARM/bisai_f407_project/*.build_log.htm
+MDK-ARM/bisai_f407_project/*.crf
+MDK-ARM/bisai_f407_project/*.d
+MDK-ARM/bisai_f407_project/*.dep
+MDK-ARM/bisai_f407_project/*.hex
+MDK-ARM/bisai_f407_project/*.htm
+MDK-ARM/bisai_f407_project/*.lnp
+MDK-ARM/bisai_f407_project/*.map
+MDK-ARM/bisai_f407_project/*.o
+
+# 本地参考资料目录，当前不纳入仓库
+HX711相关资料/
