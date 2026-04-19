@@ -12,8 +12,9 @@ extern "C" {
  * 该任务负责：
  * 1. 初始化HX711驱动；
  * 2. 执行空载去皮；
- * 3. 周期性读取重量；
- * 4. 通过USART1输出串口文本结果。
+ * 3. 周期性读取并滤波重量；
+ * 4. 响应串口 `GET/TARE/CAL <克重>` 命令；
+ * 5. 通过USART1输出串口文本结果。
  */
 void WeightService_Task(void *argument);
 

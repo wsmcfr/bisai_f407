@@ -53,18 +53,25 @@ typedef struct
     HX711_GainPulses_t gain_pulses;
     int32_t offset;
     float scale_counts_per_g;
+    float rated_capacity_g;
+    uint8_t is_scale_calibrated;
 } HX711_Handle_t;
 
 /*
  * 默认接线配置说明：
  * 1. 这里先给出一个可编译的默认映射，方便项目先跑起来。
- * 2. 若你的实际接线不是PB12/PB13，请只修改下面4个宏即可。
- * 3. 若后续改用CubeMX管理这些引脚，也应保持这里与.ioc一致。
+ * 2. 当前已按你的实物接线切换为：
+ *    - DOUT -> PB0
+ *    - SCK  -> PB2
+ * 3. 这组引脚已经在当前 .ioc 中配置为：
+ *    - PB0 = GPIO_Input
+ *    - PB2 = GPIO_Output
+ * 4. 若你的后续接线再次变化，请只修改下面 4 个宏即可。
  */
 #define HX711_DEFAULT_SCK_GPIO_PORT   GPIOB
-#define HX711_DEFAULT_SCK_GPIO_PIN    GPIO_PIN_12
+#define HX711_DEFAULT_SCK_GPIO_PIN    GPIO_PIN_2
 #define HX711_DEFAULT_DOUT_GPIO_PORT  GPIOB
-#define HX711_DEFAULT_DOUT_GPIO_PIN   GPIO_PIN_13
+#define HX711_DEFAULT_DOUT_GPIO_PIN   GPIO_PIN_0
 
 /*
  * 默认标定系数说明：
@@ -73,6 +80,13 @@ typedef struct
  * 3. 当该值保持为1.0f时，应用层输出的“克重”本质上只是计数差值。
  */
 #define HX711_DEFAULT_SCALE_COUNTS_PER_G  (1.0f)
+
+/*
+ * 默认量程说明：
+ * 1. 用户当前明确使用 5kg 称重模块，因此默认额定量程按 5000g 处理。
+ * 2. 该值主要用于串口标定命令的合法性检查与调试提示，不直接参与重量换算。
+ */
+#define HX711_DEFAULT_RATED_CAPACITY_G    (5000.0f)
 
 /**
  * @brief 加载HX711默认硬件配置与默认标定参数。
@@ -123,6 +137,41 @@ HX711_Status_t HX711_Tare(HX711_Handle_t *hx711, uint8_t sample_count, uint32_t 
  * 当scale_counts_per_g尚未标定时，返回值仅作趋势观察，不代表真实重量。
  */
 float HX711_ConvertToGrams(const HX711_Handle_t *hx711, int32_t raw_value);
+
+/**
+ * @brief 判断当前HX711是否已经完成有效标定。
+ * @param hx711 HX711句柄指针，不能为空。
+ * @return uint8_t 1表示已标定，0表示未标定。
+ *
+ * 应用层可利用该状态决定串口返回“真实克重”还是“净计数差值”。
+ */
+uint8_t HX711_IsCalibrated(const HX711_Handle_t *hx711);
+
+/**
+ * @brief 直接写入“每克对应多少计数”的标定系数。
+ * @param hx711 HX711句柄指针，不能为空。
+ * @param counts_per_g 每克对应的计数差值，必须大于0。
+ * @retval HX711_Status_t 设置结果。
+ *
+ * 该函数提供了清晰的“标定参数入口”，便于未来扩展为Flash保存或上位机下发。
+ */
+HX711_Status_t HX711_SetScaleCountsPerGram(HX711_Handle_t *hx711, float counts_per_g);
+
+/**
+ * @brief 使用“当前带载原始值 + 已知砝码重量”完成一次标定。
+ * @param hx711 HX711句柄指针，不能为空。
+ * @param raw_value 当前带载原始读数。
+ * @param known_weight_g 当前砝码重量，单位克，必须大于0。
+ * @retval HX711_Status_t 标定结果。
+ *
+ * 标定公式为：
+ * `scale_counts_per_g = (raw_value - offset) / known_weight_g`
+ *
+ * 调用该函数前，通常应先完成空载去皮。
+ */
+HX711_Status_t HX711_CalibrateByKnownWeight(HX711_Handle_t *hx711,
+                                            int32_t raw_value,
+                                            float known_weight_g);
 
 #ifdef __cplusplus
 }

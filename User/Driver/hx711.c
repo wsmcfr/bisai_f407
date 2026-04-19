@@ -92,6 +92,8 @@ void HX711_LoadDefaultConfig(HX711_Handle_t *hx711)
     hx711->gain_pulses = HX711_GAIN_PULSES_A128;
     hx711->offset = 0;
     hx711->scale_counts_per_g = HX711_DEFAULT_SCALE_COUNTS_PER_G;
+    hx711->rated_capacity_g = HX711_DEFAULT_RATED_CAPACITY_G;
+    hx711->is_scale_calibrated = 0U;
 }
 
 /**
@@ -260,4 +262,79 @@ float HX711_ConvertToGrams(const HX711_Handle_t *hx711, int32_t raw_value)
     }
 
     return ((float)(raw_value - hx711->offset)) / hx711->scale_counts_per_g;
+}
+
+/**
+ * @brief 判断当前HX711是否已经具备有效标定系数。
+ * @param hx711 HX711句柄指针，不能为空。
+ * @return uint8_t 1表示已标定，0表示未标定。
+ *
+ * 该状态位由驱动层维护，避免应用层到处比较特殊浮点值。
+ */
+uint8_t HX711_IsCalibrated(const HX711_Handle_t *hx711)
+{
+    if (hx711 == NULL)
+    {
+        return 0U;
+    }
+
+    return hx711->is_scale_calibrated;
+}
+
+/**
+ * @brief 直接设置HX711标定系数。
+ * @param hx711 HX711句柄指针，不能为空。
+ * @param counts_per_g 每克对应的计数差值，必须大于0。
+ * @retval HX711_Status_t 设置结果。
+ *
+ * 该函数把标定值合法性检查统一放在驱动层处理，
+ * 避免应用层命令解析和后续配置加载出现两套边界逻辑。
+ */
+HX711_Status_t HX711_SetScaleCountsPerGram(HX711_Handle_t *hx711, float counts_per_g)
+{
+    if ((hx711 == NULL) || (counts_per_g <= 0.0f))
+    {
+        return HX711_STATUS_INVALID_PARAM;
+    }
+
+    hx711->scale_counts_per_g = counts_per_g;
+    hx711->is_scale_calibrated = 1U;
+    return HX711_STATUS_OK;
+}
+
+/**
+ * @brief 根据当前带载读数和已知砝码完成标定。
+ * @param hx711 HX711句柄指针，不能为空。
+ * @param raw_value 当前带载原始值。
+ * @param known_weight_g 已知砝码重量，单位克，必须大于0。
+ * @retval HX711_Status_t 标定结果。
+ *
+ * 若“带载值与offset相同”，说明当前没有测到有效净载荷，
+ * 此时拒绝标定，避免把无意义结果写成系数。
+ */
+HX711_Status_t HX711_CalibrateByKnownWeight(HX711_Handle_t *hx711,
+                                            int32_t raw_value,
+                                            float known_weight_g)
+{
+    float counts_per_g;
+    int32_t net_counts;
+
+    if ((hx711 == NULL) || (known_weight_g <= 0.0f))
+    {
+        return HX711_STATUS_INVALID_PARAM;
+    }
+
+    net_counts = raw_value - hx711->offset;
+    if (net_counts == 0)
+    {
+        return HX711_STATUS_INVALID_PARAM;
+    }
+
+    counts_per_g = ((float)net_counts) / known_weight_g;
+    if (counts_per_g < 0.0f)
+    {
+        counts_per_g = -counts_per_g;
+    }
+
+    return HX711_SetScaleCountsPerGram(hx711, counts_per_g);
 }
