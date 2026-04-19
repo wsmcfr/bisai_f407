@@ -144,3 +144,36 @@ Implemented the FreeRTOS weight-query firmware changes, but this session did not
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: LDC1614 标定采样模式联调
+
+**Date**: 2026-04-19
+**Task**: LDC1614 标定采样模式联调
+**Branch**: `main`
+
+### Summary
+
+LDC1614 标定采样模式已跑通；单轮稳定，跨轮差异主要来自放置位置/姿态，需要非金属治具限位后再定参考值与容差。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b70b8f1` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

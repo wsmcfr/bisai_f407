@@ -1,0 +1,7 @@
+{"file": ".trellis/workflow.md", "reason": "Project workflow and conventions"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend development guide"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "FreeRTOS 任务、共享资源和实时性约束"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "HAL 返回值和驱动错误处理规则"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "串口日志与结构化输出规范"}
+{"file": "User/App/weight_service.c", "reason": "现有传感器服务任务模式与串口输出风格"}
+{"file": "User/App/uart_command.c", "reason": "线程安全串口输出和 DMA+空闲中断接收实现"}
