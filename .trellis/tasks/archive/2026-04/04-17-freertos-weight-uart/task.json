@@ -3,7 +3,7 @@
   "name": "freertos-weight-uart",
   "title": "FreeRTOS Weight UART",
   "description": "",
-  "status": "planning",
+  "status": "completed",
   "dev_type": "fullstack",
   "scope": null,
   "package": null,
@@ -11,7 +11,7 @@
   "creator": "caofengrui",
   "assignee": "caofengrui",
   "createdAt": "2026-04-17",
-  "completedAt": null,
+  "completedAt": "2026-04-19",
   "branch": null,
   "base_branch": "master",
   "worktree_path": null,
@@ -48,6 +48,6 @@
   "children": [],
   "parent": null,
   "relatedFiles": [],
-  "notes": "",
+  "notes": "2026-04-18: Firmware implementation and Keil build verification were completed, but no physical board validation was performed because the hardware was not available. Do not treat this task as hardware-verified until on-board testing confirms HX711 measurement and UART GET response behavior.",
   "meta": {}
 }
