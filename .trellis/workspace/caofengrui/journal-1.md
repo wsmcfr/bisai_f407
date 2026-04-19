@@ -100,3 +100,47 @@ Implemented the FreeRTOS weight-query firmware changes, but this session did not
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: 仓库规范化与构建产物清理
+
+**Date**: 2026-04-19
+**Task**: 仓库规范化与构建产物清理
+**Branch**: `main`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| 项目 | 内容 |
+|---|---|
+| 代码状态 | 电子称功能提交后，继续完成仓库整洁性治理并保持 `main` 分支干净 |
+| 换行符治理 | 新增 `.gitattributes` 与 `.editorconfig`，统一源码/配置/文档为 `LF`，`*.bat` 保持 `CRLF` |
+| Git 本地策略 | 本仓库已覆盖为 `core.autocrlf=false`、`core.eol=lf`、`core.safecrlf=warn`，避免 Windows 下反复出现 CRLF 脏文件 |
+| 脏文件结论 | 已确认 `Core/Src/freertos.c` 当时属于纯行尾/索引状态问题，不是漏提业务代码 |
+| MDK-ARM 清理 | 将 `uvguix/uvoptx/axf/hex/map/htm/lnp/dep/crf/d/o/lst` 等 Keil 构建产物从 Git 索引移除，并交由 `.gitignore` 管控 |
+| 工程保留项 | 保留 `MDK-ARM/*.uvprojx`、链接脚本、startup 源文件、`RTE` 与 `DebugConfig` 等工程必需文件 |
+| 参考资料处理 | `HX711相关资料/` 当前整目录忽略，本地保留，不纳入仓库 |
+| 相关提交 | `919834d` 统一换行符规范；`31aa0d6` 清理 Keil 构建产物并忽略参考资料 |
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `919834d` | (see git log) |
+| `31aa0d6` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
