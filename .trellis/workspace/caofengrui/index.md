@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 4
-- **Last Active**: 2026-04-19
+- **Total Sessions**: 5
+- **Last Active**: 2026-04-21
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~179 | Active |
+| `journal-1.md` | ~235 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 5 | 2026-04-21 | Emm42 conveyor integration and startup recovery | `cd418c0`, `1e483ca`, `a9fae94` | `main` |
 | 4 | 2026-04-19 | LDC1614 标定采样模式联调 | `b70b8f1` | `main` |
 | 3 | 2026-04-19 | 仓库规范化与构建产物清理 | `919834d`, `31aa0d6` | `main` |
 | 2 | 2026-04-19 | FreeRTOS 电子称串口查询与标定完成 | `c137d64` | `main` |

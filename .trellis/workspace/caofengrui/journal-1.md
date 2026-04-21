@@ -177,3 +177,59 @@ LDC1614 标定采样模式已跑通；单轮稳定，跨轮差异主要来自放
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: Emm42 conveyor integration and startup recovery
+
+**Date**: 2026-04-21
+**Task**: Emm42 conveyor integration and startup recovery
+**Branch**: `main`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| Item | Details |
+|------|---------|
+| Scope | Completed Emm42 conveyor control integration, startup self-healing config, heartbeat task glue, LDC startup false-trigger stabilization, and spec/documentation sync |
+| Firmware Commits | `cd418c0` ignore local reference materials; `1e483ca` add Emm42 conveyor control and stabilize LDC startup; `a9fae94` document startup recovery and persistence rules |
+| Hardware / Build Verification | User provided Keil build success, AXF download success, board boot logs, and startup logs confirming `ctrl=CLOSED_LOOP_FOC`, `startup_fix`, and `btn_lock=1` |
+| Key Decisions | External module startup recovery must distinguish force-apply flags from target-state flags; routine boot keeps external-module save target in RAM/volatile mode rather than FLASH |
+| Repo Hygiene | Reference material directories were excluded from Git via `.gitignore`; only source, project config, and spec/docs were pushed |
+
+**Delivered**:
+- Added `User/Driver/emm42_motor.c/.h` to wrap Emm42 TTL control-mode, lock-button, velocity, and stop commands.
+- Added `User/App/conveyor_motor_service.c/.h` for SCAN/TRACK/STOP state-machine control and startup recovery.
+- Added `User/App/system_heartbeat_service.c/.h` and FreeRTOS glue in `Core/Src/freertos.c`.
+- Updated CubeMX/Keil-integrated files (`usart.c`, `gpio.c`, `dma.c`, `stm32f4xx_it.c`, `.ioc`, `.uvprojx`) to support USART2 motor control and board heartbeat behavior.
+- Stabilized LDC1614 startup detection behavior and improved early-removal logging.
+- Synced executable specs in `.trellis/spec/backend/quality-guidelines.md` and `.trellis/spec/backend/database-guidelines.md`.
+- Added `User/App/emm42_conveyor_code_guide.md` to explain the Emm42 chain and related bootstrap files.
+
+**Manual Verification Notes**:
+- This session did not include a new full physical regression sweep with all modules together.
+- The user confirmed compile/download success and provided live startup logs from the board.
+- A remaining recommended manual spot-check is to confirm motor panel keys are physically ineffective after boot when `btn_lock=1`.
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `cd418c0` | (see git log) |
+| `1e483ca` | (see git log) |
+| `a9fae94` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
