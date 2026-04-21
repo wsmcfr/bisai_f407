@@ -459,6 +459,16 @@
               <FileType>1</FileType>
               <FilePath>../User/App/ldc1614_service.c</FilePath>
             </File>
+            <File>
+              <FileName>conveyor_motor_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/App/conveyor_motor_service.c</FilePath>
+            </File>
+            <File>
+              <FileName>system_heartbeat_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/App/system_heartbeat_service.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -473,6 +483,11 @@
               <FileName>ldc1614.c</FileName>
               <FileType>1</FileType>
               <FilePath>../User/Driver/ldc1614.c</FilePath>
+            </File>
+            <File>
+              <FileName>emm42_motor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/Driver/emm42_motor.c</FilePath>
             </File>
           </Files>
         </Group>

@@ -25,7 +25,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "conveyor_motor_service.h"
 #include "ldc1614_service.h"
+#include "system_heartbeat_service.h"
 #include "weight_service.h"
 
 /* USER CODE END Includes */
@@ -47,6 +49,25 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
+/* 传送带电机任务句柄保留在用户区，避免后续 CubeMX 重新生成时被覆盖。 */
+static osThreadId_t conveyorMotorTaskHandle = NULL;
+
+/* 传送带电机任务需要周期性闭环调速，优先级保持在普通业务级。 */
+static const osThreadAttr_t conveyorMotorTask_attributes = {
+  .name = "conveyorMotorTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+/* 心跳灯任务句柄保留在用户区，避免后续 CubeMX 重新生成时被覆盖。 */
+static osThreadId_t heartbeatTaskHandle = NULL;
+
+/* 心跳灯任务使用低优先级，便于观察系统调度是否被高优先级任务长期占用。 */
+static const osThreadAttr_t heartbeatTask_attributes = {
+  .name = "heartbeatTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
 
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
@@ -63,7 +84,6 @@ const osThreadAttr_t ldc1614Task_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityBelowNormal,
 };
-
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 
@@ -108,7 +128,29 @@ void MX_FREERTOS_Init(void) {
   ldc1614TaskHandle = osThreadNew(StartLdc1614Task, NULL, &ldc1614Task_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  /* 传送带电机任务独立创建在用户区，负责 Emm42 的串口控制与状态机推进。 */
+  conveyorMotorTaskHandle = osThreadNew(ConveyorMotorService_Task, NULL, &conveyorMotorTask_attributes);
+  if (conveyorMotorTaskHandle == NULL)
+  {
+    /*
+     * 传送带任务属于关键业务任务。
+     * 若这里创建失败，后续串口命令虽然还能收发，但电机功能不会真正运行，
+     * 因此直接进入统一错误处理，避免系统带着“半残状态”继续启动。
+     */
+    Error_Handler();
+  }
+
+  /* 心跳灯任务独立创建在用户区，后续重新生成 freertos.c 时不会被 CubeMX 覆盖。 */
+  heartbeatTaskHandle = osThreadNew(SystemHeartbeatService_Task, NULL, &heartbeatTask_attributes);
+  if (heartbeatTaskHandle == NULL)
+  {
+    /*
+     * 心跳灯任务本身不参与业务控制，
+     * 但它承担“调度器是否活着”的现场可视化观察职责。
+     * 如果这里都创建失败，说明当前系统资源已经异常，仍然按致命错误处理。
+     */
+    Error_Handler();
+  }
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */

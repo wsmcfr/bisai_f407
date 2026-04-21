@@ -1,6 +1,7 @@
 #include "weight_service.h"
 
 #include "cmsis_os.h"
+#include "conveyor_motor_service.h"
 #include "hx711.h"
 #include "ldc1614_service.h"
 #include "uart_command.h"
@@ -365,6 +366,7 @@ static void WeightService_ReportSample(const HX711_Handle_t *hx711,
  * - `CAL <克重>`：用当前带载值和已知砝码重量完成标定
  * - `LDCCAL CHx [N]`：启动 LDC 通道的稳定批量采样模式
  * - `LDCSTOP`：停止当前 LDC 标定采样会话
+ * - `BELTSCAN / BELTSTOP / BELTTRACK <error> / BELTCAM ...`：传送带电机控制
  */
 static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
                                          HX711_Status_t latest_status,
@@ -455,10 +457,19 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
     {
         /* LDC 命令已由对应模块接管，这里不再重复输出。 */
     }
+    else if (ConveyorMotorService_HandleCommand(command_buffer) != 0U)
+    {
+        /* 传送带电机命令已由对应模块接管，这里不再重复输出。 */
+    }
     else
     {
+        /*
+         * 这里故意把提示压短。
+         * 当前串口格式化发送缓存只有 128 字节，若把所有命令完整展开，
+         * 日志会被截断并和其它事件日志混在一起，反而更难看清。
+         */
         my_printf(&huart1,
-                  "[ERROR][UART] Unknown command. Use GET / TARE / CAL <g> / LDCCAL CHx [N] / LDCSTOP.\r\n");
+                  "[ERROR][UART] Unknown cmd. Use GET/TARE/CAL/LDCCAL/LDCSTOP/BELTSCAN/BELTSTOP/BELTTRACK/BELTINFO.\r\n");
     }
 }
 

@@ -41,6 +41,7 @@
  * @brief 触发“工件已移开”所需的连续样本数。
  */
 #define LDC1614_SERVICE_RELEASE_CONFIRM_COUNT        (5U)
+#define LDC1614_SERVICE_STARTUP_ARM_CONFIRM_COUNT    (6U)
 
 /**
  * @brief 工件放上去后额外等待的稳定时间，单位毫秒。
@@ -239,6 +240,8 @@ typedef struct
     int8_t detect_direction;
     uint8_t detect_confirm_count;
     uint8_t release_confirm_count;
+    uint8_t detect_armed;
+    uint8_t startup_quiet_count;
 } LDC1614_ChannelContext_t;
 
 /**
@@ -469,7 +472,21 @@ static int32_t Ldc1614Service_GetDirectionalDelta(const LDC1614_ChannelContext_t
     }
 
     signed_delta = Ldc1614Service_GetSignedDelta(sample, channel_context->baseline);
-    return signed_delta * (int32_t)channel_context->detect_direction;
+    /*
+     * 不再依赖固定的 rise/fall 方向。
+     * 实测中一旦方向配置与真实线圈响应方向相反，
+     * IDLE 状态下的基线会在“第一次放上去”时被慢慢带偏，
+     * 随后就会出现“放上去显示离开、拿开反而检测到”的反向现象。
+     *
+     * 这里统一返回相对基线的绝对变化量，
+     * 让状态机只关心“偏离了多少”，不关心“往上还是往下偏”。
+     */
+    if (signed_delta < 0)
+    {
+        signed_delta = -signed_delta;
+    }
+
+    return signed_delta;
 }
 
 /**
@@ -477,11 +494,6 @@ static int32_t Ldc1614Service_GetDirectionalDelta(const LDC1614_ChannelContext_t
  * @param detect_direction 通道方向配置值。
  * @return const char* `"rise"` 或 `"fall"`。
  */
-static const char *Ldc1614Service_GetDirectionName(int8_t detect_direction)
-{
-    return (detect_direction == LDC1614_SERVICE_DIRECTION_FALL) ? "fall" : "rise";
-}
-
 /**
  * @brief 复位一次标定采样会话。
  * @param session 会话对象指针，不能为空。
@@ -980,6 +992,8 @@ static void Ldc1614Service_EnterIdle(LDC1614_ChannelContext_t *channel_context,
     if (reset_to_latest_baseline != 0U)
     {
         channel_context->baseline = channel_context->latest_filtered_sample;
+        channel_context->detect_armed = 1U;
+        channel_context->startup_quiet_count = 0U;
     }
 }
 
@@ -1055,6 +1069,8 @@ static void Ldc1614Service_InitChannelContexts(LDC1614_ChannelContext_t *channel
         channel_contexts[index].measure_count = 0U;
         channel_contexts[index].detect_confirm_count = 0U;
         channel_contexts[index].release_confirm_count = 0U;
+        channel_contexts[index].detect_armed = 0U;
+        channel_contexts[index].startup_quiet_count = 0U;
         Ldc1614Service_FilterReset(&channel_contexts[index].filter);
     }
 }
@@ -1263,14 +1279,13 @@ static void Ldc1614Service_ReportReady(const LDC1614_ChannelContext_t *channel_c
     for (index = 0U; index < channel_count; ++index)
     {
         my_printf(&huart1,
-                  "[INFO][LDC] %s baseline=%lu, detect=%lu, release=%lu, settle=%ums, samples=%u, direction=%s\r\n",
+                  "[INFO][LDC] %s baseline=%lu, detect=%lu, release=%lu, settle=%ums, samples=%u, mode=abs-delta\r\n",
                   channel_contexts[index].label,
                   (unsigned long)channel_contexts[index].baseline,
                   (unsigned long)channel_contexts[index].detect_threshold,
                   (unsigned long)channel_contexts[index].release_threshold,
                   (unsigned int)LDC1614_SERVICE_SETTLE_DELAY_MS,
-                  (unsigned int)LDC1614_SERVICE_MEASURE_SAMPLE_COUNT,
-                  Ldc1614Service_GetDirectionName(channel_contexts[index].detect_direction));
+                  (unsigned int)LDC1614_SERVICE_MEASURE_SAMPLE_COUNT);
 
         if (channel_contexts[index].reference_enabled != 0U)
         {
@@ -1420,6 +1435,43 @@ static void Ldc1614Service_ProcessChannelSample(LDC1614_ChannelContext_t *channe
     switch (channel_context->state)
     {
         case LDC1614_SERVICE_STATE_IDLE:
+            /*
+             * 上电刚完成基线建立时，先要求通道回到空载稳定区再放开检测。
+             * 否则某些通道第一次较大的自然漂移会被误判成工件放入，
+             * 用户就会看到“什么都没放先检测到，放上去反而没反应”的现象。
+             */
+            if (channel_context->detect_armed == 0U)
+            {
+                if (directional_delta <= (int32_t)channel_context->release_threshold)
+                {
+                    channel_context->baseline = Ldc1614Service_UpdateBaseline(channel_context->baseline,
+                                                                              channel_context->latest_filtered_sample);
+
+                    if (channel_context->startup_quiet_count < LDC1614_SERVICE_STARTUP_ARM_CONFIRM_COUNT)
+                    {
+                        ++channel_context->startup_quiet_count;
+                    }
+
+                    if (channel_context->startup_quiet_count >= LDC1614_SERVICE_STARTUP_ARM_CONFIRM_COUNT)
+                    {
+                        channel_context->detect_armed = 1U;
+                        channel_context->startup_quiet_count = 0U;
+                    }
+                }
+                else
+                {
+                    /*
+                     * 启动阶段如果仍存在大幅漂移，说明当前基线还没有真正收敛。
+                     * 这里直接把最新空载样本吸收到基线中，尽快消除启动假触发。
+                     */
+                    channel_context->baseline = channel_context->latest_filtered_sample;
+                    channel_context->startup_quiet_count = 0U;
+                }
+
+                channel_context->detect_confirm_count = 0U;
+                break;
+            }
+
             if (directional_delta >= (int32_t)channel_context->detect_threshold)
             {
                 ++channel_context->detect_confirm_count;
@@ -1449,6 +1501,9 @@ static void Ldc1614Service_ProcessChannelSample(LDC1614_ChannelContext_t *channe
                 ++channel_context->release_confirm_count;
                 if (channel_context->release_confirm_count >= LDC1614_SERVICE_RELEASE_CONFIRM_COUNT)
                 {
+                    my_printf(&huart1,
+                              "[WARN][LDC] %s settling cancelled, part removed before stable\r\n",
+                              channel_context->label);
                     Ldc1614Service_EnterIdle(channel_context, 0U);
                 }
             }
