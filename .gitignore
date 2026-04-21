@@ -15,3 +15,6 @@ MDK-ARM/bisai_f407_project/*.o
 
 # 本地参考资料目录，当前不纳入仓库
 HX711相关资料/
+HAL_Emm_TTL/
+ldc1614电感检测模块/
+M144Z-M4最小系统板IO引脚分配表——STM32F407版.xlsx
