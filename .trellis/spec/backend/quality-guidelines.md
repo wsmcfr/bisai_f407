@@ -306,6 +306,298 @@ void UartCommandTask(void *argument)
 - Define LDC calibration sampling as “one stable placement, N captured samples, one summary”.
 - Make every public header self-contained by including the standard type headers it directly uses.
 
+### Scenario: CubeMX-Managed Heartbeat Task and Board LED Ownership
+
+#### 1. Scope / Trigger
+
+- Trigger: adding a heartbeat/status LED task that runs under FreeRTOS
+- Trigger: binding an application task to a GPIO already initialized by CubeMX
+- Trigger: editing `Core/Src/freertos.c` to create a new thread for a user module
+- Trigger: choosing a board pin based on the actual development board resource map rather than only the STM32 pin list
+
+#### 2. Signatures
+
+- Heartbeat task entry:
+  - `void SystemHeartbeatService_Task(void *argument)`
+- Heartbeat module location:
+  - `User/App/system_heartbeat_service.h`
+  - `User/App/system_heartbeat_service.c`
+- RTOS bootstrap creation example:
+  - `heartbeatTaskHandle = osThreadNew(SystemHeartbeatService_Task, NULL, &heartbeatTask_attributes);`
+- Timing contract example:
+  - `#define SYSTEM_HEARTBEAT_TOGGLE_PERIOD_MS 500U`
+  - `vTaskDelayUntil(&last_wake_tick, pdMS_TO_TICKS(...))`
+- Board resource source of truth:
+  - `M144Z-M4最小系统板IO引脚分配表——STM32F407版.xlsx`
+  - current confirmed mapping: `PF9 -> LED0`, not fully independent, not routed out as a general external pin
+
+#### 3. Contracts
+
+- Heartbeat behavior belongs to `User/App/*`, not to generated `Core/*` business code:
+  - task body, timing policy, and LED toggle logic must live in a dedicated user module
+- `Core/Src/freertos.c` remains RTOS bootstrap only:
+  - allowed changes are limited to `USER CODE BEGIN/END` regions
+  - if a new task is needed, keep includes, task attributes, and `osThreadNew(...)` glue inside user sections that survive CubeMX regeneration
+- `Core/Src/gpio.c` remains the owner of GPIO initialization:
+  - if CubeMX already configured `PF9`, the heartbeat module must only call `HAL_GPIO_TogglePin(...)`
+  - do not re-run `HAL_GPIO_Init(...)` or duplicate pin mode configuration in `User/App`
+- Heartbeat task priority must stay below real-time business tasks:
+  - use low or below-normal priority
+  - the goal is to observe scheduler health, not to compete with control/sampling tasks
+- Heartbeat timing should use periodic RTOS delay rather than busy wait:
+  - prefer `vTaskDelayUntil(...)` to reduce drift and avoid wasting CPU
+- Board pin selection must first consult the board resource sheet:
+  - if a pin is already tied to an on-board LED and not exposed, it is a preferred heartbeat candidate
+  - if the sheet marks a pin as shared or “not fully independent”, document the ownership before reusing it
+
+#### 4. Validation & Error Matrix
+
+| Check | Expected | Failure Meaning | Required Action |
+|-------|----------|-----------------|-----------------|
+| Board pin source | pin choice is confirmed from the board IO workbook, not guessed from MCU package only | selected pin may conflict with on-board hardware or may not be routed out | check the workbook row first and record the board resource relationship |
+| GPIO init ownership | `gpio.c` performs init, heartbeat module only toggles the pin | duplicated initialization may conflict with CubeMX output | remove user-side `HAL_GPIO_Init(...)` and keep GPIO ownership in CubeMX files |
+| `freertos.c` edit location | new task glue is inside `USER CODE BEGIN/END` regions | CubeMX regeneration may delete the task | move includes, attributes, and `osThreadNew(...)` calls into user regions |
+| Task priority | heartbeat task is lower than control/sampling tasks | heartbeat may interfere with real-time behavior | reduce priority and keep the task body minimal |
+| Timing implementation | periodic delay uses `vTaskDelayUntil(...)` or equivalent RTOS delay | busy loop wastes CPU or causes unstable blink period | replace busy wait with scheduler-friendly periodic delay |
+| Module placement | heartbeat logic is in `User/App/*.c/.h` and the source is added to `MDK-ARM/*.uvprojx` | build may miss the file or logic may be buried in generated code | move logic to `User/App` and register the file in Keil |
+
+#### 5. Good / Base / Bad Cases
+
+- Good:
+  - `PF9/LED0` is chosen after checking the board workbook
+  - `system_heartbeat_service.c/.h` is created under `User/App`
+  - `freertos.c` only adds a user-section include plus `osThreadNew(...)` glue
+  - heartbeat task uses low priority and `vTaskDelayUntil(...)`
+- Base:
+  - another board LED or dedicated status pin is used
+  - but the board workbook confirms ownership and the RTOS glue still stays inside user sections
+- Bad:
+  - a task body or full business loop is written directly into generated `freertos.c`
+  - thread attributes are declared in generated regions that CubeMX may overwrite
+  - the user module reconfigures `PF9` even though `gpio.c` already owns it
+  - a busy loop toggles the LED without yielding to the scheduler
+
+#### 6. Tests Required
+
+- Board resource review:
+  - assert that the selected heartbeat pin exists in the board workbook
+  - assert that its row explains whether it is independent, shared, or board-bound
+- RTOS bootstrap review:
+  - assert that heartbeat-related changes in `Core/Src/freertos.c` are only inside `USER CODE BEGIN/END`
+  - assert that the task entry itself lives in `User/App`
+- Project file review:
+  - assert that the new heartbeat source file is present in `MDK-ARM/bisai_f407_project.uvprojx`
+- Hardware behavior test:
+  - after boot, assert that `PF9/LED0` toggles with the configured period
+  - if the scheduler stalls or a high-priority task monopolizes CPU, assert that the heartbeat visibly freezes or stops changing
+- Regeneration safety test:
+  - after any future `.ioc` regeneration touching `freertos.c`, assert that the heartbeat task glue still exists in the surviving user sections
+
+#### 7. Wrong vs Correct
+
+##### Wrong
+
+```c
+/* 反例：把新增任务定义直接塞进 CubeMX 生成区，后续重新生成容易丢失。 */
+osThreadId_t heartbeatTaskHandle;
+const osThreadAttr_t heartbeatTask_attributes = {
+    .name = "heartbeatTask",
+    .stack_size = 128 * 4,
+    .priority = (osPriority_t)osPriorityLow,
+};
+
+void MX_FREERTOS_Init(void)
+{
+    heartbeatTaskHandle = osThreadNew(StartHeartbeatTask, NULL, &heartbeatTask_attributes);
+}
+```
+
+##### Correct
+
+```c
+/* 正确：业务任务放在 User/App，freertos.c 只在 USER CODE 区挂接任务。 */
+/* USER CODE BEGIN Includes */
+#include "system_heartbeat_service.h"
+/* USER CODE END Includes */
+
+/* USER CODE BEGIN Variables */
+static osThreadId_t heartbeatTaskHandle = NULL;
+static const osThreadAttr_t heartbeatTask_attributes = {
+    .name = "heartbeatTask",
+    .stack_size = 128 * 4,
+    .priority = (osPriority_t)osPriorityLow,
+};
+/* USER CODE END Variables */
+
+/* USER CODE BEGIN RTOS_THREADS */
+heartbeatTaskHandle = osThreadNew(SystemHeartbeatService_Task, NULL, &heartbeatTask_attributes);
+/* USER CODE END RTOS_THREADS */
+```
+
+### Common Mistake: Putting extra RTOS task glue outside `USER CODE` regions in `freertos.c`
+
+**Symptom**: A newly added task builds and runs once, but disappears or partially breaks after CubeMX regenerates the project.
+
+**Cause**: Task handles, task attributes, prototypes, or `osThreadNew(...)` calls were inserted into generated sections instead of persistent user sections.
+
+**Fix**: Keep the actual task implementation in `User/App/*`, and keep `freertos.c` changes limited to lightweight glue inside `USER CODE BEGIN/END`.
+
+**Prevention**: Treat `Core/Src/freertos.c` as a bootstrap file only. If a change would not survive regeneration, it belongs either in a user section or in a dedicated `User/App` module.
+
+### Scenario: Startup Self-Healing Config for External Motion Modules
+
+#### 1. Scope / Trigger
+
+- Trigger: adding a device driver or service for a module whose local buttons or internal settings can drift from MCU-side assumptions
+- Trigger: adding boot-time “restore working mode” logic for motors, sensors, or smart modules that support both volatile apply and internal flash save
+- Trigger: adding startup macros where one flag decides whether to send a config command and another flag decides the target payload
+- Trigger: creating FreeRTOS bootstrap glue for a service whose correct runtime depends on those startup recovery commands
+
+#### 2. Signatures
+
+- Driver configuration APIs:
+  - `EMM42_MotorStatus_t EMM42_MotorSetControlMode(const EMM42_MotorHandle_t *motor, EMM42_MotorControlMode_t control_mode, bool save_flag)`
+  - `EMM42_MotorStatus_t EMM42_MotorSetButtonLock(const EMM42_MotorHandle_t *motor, bool locked, bool save_flag)`
+- Service-side startup macros:
+  - `CONVEYOR_MOTOR_STARTUP_FORCE_CTRL_MODE`
+  - `CONVEYOR_MOTOR_STARTUP_CTRL_MODE`
+  - `CONVEYOR_MOTOR_STARTUP_FORCE_BUTTON_LOCK`
+  - `CONVEYOR_MOTOR_STARTUP_BUTTON_LOCKED`
+  - `CONVEYOR_MOTOR_STARTUP_SAVE_TO_FLASH`
+- Startup recovery step:
+  - `static EMM42_MotorStatus_t ConveyorMotorService_ApplyStartupConfig(const EMM42_MotorHandle_t *motor, const char **failed_stage)`
+- Startup sequence contract:
+  - `Init -> StartupConfig -> Enable -> StopNow`
+- RTOS bootstrap examples:
+  - `conveyorMotorTaskHandle = osThreadNew(ConveyorMotorService_Task, NULL, &conveyorMotorTask_attributes);`
+  - `heartbeatTaskHandle = osThreadNew(SystemHeartbeatService_Task, NULL, &heartbeatTask_attributes);`
+- Observable startup log:
+  - `[INFO][BELT] startup_fix ctrl_force=%u, btn_lock_force=%u, btn_lock=%u, save=%s`
+
+#### 3. Contracts
+
+- If a module can be reconfigured outside the MCU flow, startup code must actively restore the required working state:
+  - do not assume the device still uses the last expected mode
+  - examples: panel button mis-touch, internal menu changes, previously saved module parameters
+- `FORCE_*` and target-state macros have different meanings and must never be conflated:
+  - `CONVEYOR_MOTOR_STARTUP_FORCE_BUTTON_LOCK != 0` means “send the button-lock command during boot”
+  - `CONVEYOR_MOTOR_STARTUP_BUTTON_LOCKED != 0` means “the payload requests locked state”
+  - therefore `force=1, locked=0` is an explicit unlock, not a lock
+- Boot-time recovery must default to volatile apply rather than persistent writes:
+  - `CONVEYOR_MOTOR_STARTUP_SAVE_TO_FLASH` should default to `0U`
+  - normal debug and daily boot flows should use RAM/volatile apply only
+  - flash save is reserved for one-time commissioning or final parameter solidification
+- If flash save is temporarily enabled for commissioning:
+  - verify the device accepted the intended values
+  - then revert the firmware default back to RAM/volatile apply
+  - do not ship a debug image that writes external-module flash on every boot unless this is a deliberate, reviewed requirement
+- RTOS bootstrap task creation handles must be checked immediately:
+  - if `osThreadNew(...)` returns `NULL` for a critical service task, escalate to `Error_Handler()`
+  - do not leave task-handle assignments “write-only” with no failure handling
+- Startup logs must expose the actual recovery inputs:
+  - print whether control-mode recovery is enabled
+  - print whether button-lock recovery is enabled
+  - print the actual target lock value
+  - print whether the write target is `RAM` or `FLASH`
+  - avoid vague “startup ok” logs that hide the effective payload
+
+#### 4. Validation & Error Matrix
+
+| Check | Expected | Failure Meaning | Required Action |
+|-------|----------|-----------------|-----------------|
+| Out-of-band config recovery | boot path includes an explicit restore step before normal control loop | module may stay in panel-modified or previously saved wrong mode | add startup recovery function and place it before enable/normal state-machine execution |
+| Force vs target semantics | code comments, macro names, and logs distinguish “send command” from “target state” | developers may believe a module is locked when firmware is explicitly unlocking it | keep separate macros and print both values in startup log |
+| Save target default | boot recovery uses RAM/volatile apply by default | repeated flash writes to external module may happen on every boot | set default save flag to `0U`; reserve `1U` for reviewed one-shot commissioning |
+| Commissioning flow | temporary flash-save usage is reverted after confirmation | debug image silently keeps writing external flash forever | document the one-time write flow and restore RAM default afterward |
+| Task bootstrap handle check | every critical `osThreadNew(...)` result is checked for `NULL` | service may never start while firmware continues in a degraded state | fail fast through `Error_Handler()` or equivalent fatal path |
+| Startup observability | boot log prints real recovery values such as `btn_lock=1` and `save=RAM` | hardware behavior may be misread from a generic success log | extend startup log to include concrete flags and save target |
+
+#### 5. Good / Base / Bad Cases
+
+- Good:
+  - startup sends control-mode recovery and button-lock recovery explicitly
+  - `CONVEYOR_MOTOR_STARTUP_SAVE_TO_FLASH` stays `0U` in normal development images
+  - startup log shows `ctrl_force=1, btn_lock_force=1, btn_lock=1, save=RAM`
+  - `freertos.c` checks task-handle creation results and fails fast if critical tasks cannot be created
+- Base:
+  - startup chooses not to force button lock because manual现场操作 is currently required
+  - but the code comments and log still make the unlocked behavior explicit
+  - and the separation between “force command” and “target state” remains intact
+- Bad:
+  - assume the motor still uses the intended control mode after panel-button changes
+  - set `CONVEYOR_MOTOR_STARTUP_FORCE_BUTTON_LOCK = 1U` and `CONVEYOR_MOTOR_STARTUP_BUTTON_LOCKED = 0U`, then mistakenly believe the panel is locked
+  - keep `SAVE_TO_FLASH = 1U` in a normal boot image so the module writes internal flash every reset
+  - ignore `osThreadNew(...)` results and leave task-handle assignments with no error path
+
+#### 6. Tests Required
+
+- Code review assertions:
+  - assert that startup recovery happens before normal service motion/control logic
+  - assert that `FORCE_*` macros and target-state macros are not merged into one ambiguous flag
+  - assert that critical `osThreadNew(...)` results are checked immediately
+- Boot log assertion:
+  - power on the board
+  - assert that startup log prints `ctrl_force`, `btn_lock_force`, `btn_lock`, and `save`
+  - assert that printed values match the current macros in source
+- Hardware recovery assertion:
+  - deliberately modify the external module state out of band if possible
+  - reboot
+  - assert that the module returns to the MCU-expected working mode
+- Button-lock assertion:
+  - with `btn_lock=1`, verify on hardware that panel keys no longer alter the target behavior after boot
+  - with `btn_lock=0`, verify that panel control remains available when intentionally allowed
+- Flash-write policy assertion:
+  - assert that routine development builds keep `SAVE_TO_FLASH == 0U`
+  - if a commissioning build temporarily sets `SAVE_TO_FLASH == 1U`, assert that the default is reverted after confirmation
+
+#### 7. Wrong vs Correct
+
+##### Wrong
+
+```c
+/*
+ * 反例：
+ * 1. 只打开“是否发送锁键命令”，却把真正的目标状态留成 0；
+ * 2. 每次启动都写外设内部 FLASH；
+ * 3. 创建任务后不检查句柄是否为空。
+ */
+#define CONVEYOR_MOTOR_STARTUP_FORCE_BUTTON_LOCK (1U)
+#define CONVEYOR_MOTOR_STARTUP_BUTTON_LOCKED     (0U)
+#define CONVEYOR_MOTOR_STARTUP_SAVE_TO_FLASH     (1U)
+
+conveyorMotorTaskHandle = osThreadNew(ConveyorMotorService_Task, NULL, &conveyorMotorTask_attributes);
+```
+
+##### Correct
+
+```c
+/*
+ * 正确：
+ * 1. “是否发送命令”和“目标状态”分开定义；
+ * 2. 常规启动默认只写 RAM/volatile 状态；
+ * 3. 关键任务创建后立即判空。
+ */
+#define CONVEYOR_MOTOR_STARTUP_FORCE_BUTTON_LOCK (1U)
+#define CONVEYOR_MOTOR_STARTUP_BUTTON_LOCKED     (1U)
+#define CONVEYOR_MOTOR_STARTUP_SAVE_TO_FLASH     (0U)
+
+conveyorMotorTaskHandle = osThreadNew(ConveyorMotorService_Task, NULL, &conveyorMotorTask_attributes);
+if (conveyorMotorTaskHandle == NULL)
+{
+    Error_Handler();
+}
+```
+
+### Common Mistake: Confusing “send config command” with “target config state”
+
+**Symptom**: Startup log shows `btn_lock_force=1`, but the actual target state is still unlock and the panel remains operable.
+
+**Cause**: The code changed the “force apply” flag, but did not change the payload flag that encodes the final target state.
+
+**Fix**: Review both `CONVEYOR_MOTOR_STARTUP_FORCE_BUTTON_LOCK` and `CONVEYOR_MOTOR_STARTUP_BUTTON_LOCKED`, and confirm the startup log prints the intended pair.
+
+**Prevention**: Any startup self-healing config that uses multiple flags must log both the “apply” flag and the final payload state instead of logging only a generic success message.
+
 --- 
 
 ## Testing Requirements

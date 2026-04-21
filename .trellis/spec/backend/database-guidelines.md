@@ -56,7 +56,29 @@ For any future persisted fields:
 - keep units obvious in names or comments
 - group related values in a versioned struct instead of unrelated standalone globals
 
----
+### Convention: External Module Persistence Should Default to Volatile Apply
+
+**What**: If a third-party device supports both volatile parameter apply and internal flash save, routine firmware boot should default to volatile apply.
+
+**Why**: This project often recovers hardware state during startup. Repeating an external-device flash write on every reset is usually unnecessary, increases wear risk, and makes debug iterations less reversible.
+
+**Example**:
+```c
+/*
+ * 正确示例：
+ * 常规启动默认只恢复当前上电周期的工作状态，
+ * 最终固化时才临时打开 flash save。
+ */
+#define CONVEYOR_MOTOR_STARTUP_SAVE_TO_FLASH (0U)
+
+status = EMM42_MotorSetControlMode(&motor,
+                                   EMM42_MOTOR_CONTROL_MODE_CLOSED_LOOP_FOC,
+                                   false);
+```
+
+**Related**: See `quality-guidelines.md` scenario "Startup Self-Healing Config for External Motion Modules".
+
+--- 
 
 ## Common Mistakes
 
@@ -66,3 +88,4 @@ Avoid these mistakes when persistence is eventually added:
 - writing calibration constants directly into unrelated application files
 - editing generated CubeMX files to emulate persistence
 - changing persisted struct layout without a version field
+- leaving an external device flash-save flag enabled in a normal boot image after one-time commissioning is already finished
