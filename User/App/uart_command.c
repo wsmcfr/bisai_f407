@@ -45,7 +45,11 @@
  *
  * 当前仅用于输出状态、错误和重量文本，128字节足够覆盖本任务。
  */
-#define UART_COMMAND_TX_BUFFER_SIZE       (128U)
+/*
+ * 机械臂调试日志改为更长的可读英文句子，避免 ARMCC5 解析 UTF-8 中文字符串时报错。
+ * 384 字节可以容纳动作组排查建议和接线检查提示，避免日志被截断。
+ */
+#define UART_COMMAND_TX_BUFFER_SIZE       (384U)
 
 /**
  * @brief DMA接收原始缓存区。

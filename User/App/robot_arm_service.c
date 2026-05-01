@@ -129,6 +129,21 @@
 #define ROBOT_ARM_SERVICE_CMD_ACTION_DOWNLOAD (0x19U)
 
 /**
+ * @brief LeArm 协议中的运行动作组命令号。
+ *
+ * 该命令只要求 ESP32 从 Flash 中取出已经保存的动作组并执行，出厂协议不会主动回包。
+ * 如果指定编号下没有动作组，STM32 仍然只能看到“已发送”，机械臂不会动作。
+ */
+#define ROBOT_ARM_SERVICE_CMD_ACTION_GROUP_RUN (0x06U)
+
+/**
+ * @brief LeArm 协议中的复位机械臂姿态命令号。
+ *
+ * 该命令不依赖 ESP32 预存动作组，适合作为“串口链路已经通，但动作组不动”时的直控验证命令。
+ */
+#define ROBOT_ARM_SERVICE_CMD_SERVOS_RESET     (0x0CU)
+
+/**
  * @brief 自定义 STM32 通讯模式命令号。
  *
  * ESP32 出厂固件原始协议没有“串口切换到 STM32 模式”的命令。
@@ -263,6 +278,99 @@ static uint8_t RobotArmService_CommandExpectsReply(uint8_t command)
 }
 
 /**
+ * @brief 把 LeArm 命令字节翻译成串口日志里能直接看懂的动作说明。
+ * @param command LeArm 协议中的 CMD 字节。
+ * @return const char* 面向操作者的命令说明字符串。
+ *
+ * 这里集中维护“命令字节 -> 人话说明”的映射，避免日志里只出现 `cmd=0x18` 这类内部术语。
+ * 后续如果新增机械臂命令，也要同步补充本函数和文件顶部的协议速查表。
+ */
+static const char *RobotArmService_GetCommandDescription(uint8_t command)
+{
+    switch (command)
+    {
+        case ROBOT_ARM_SERVICE_CMD_VERSION_QUERY:
+            return "query ESP32 firmware version";
+
+        case ROBOT_ARM_SERVICE_CMD_STM32_LINK_MODE:
+            return "switch ESP32 to STM32 link mode";
+
+        case ROBOT_ARM_SERVICE_CMD_SERVOS_READ:
+            return "read all 6 servo positions";
+
+        case ROBOT_ARM_SERVICE_CMD_ACTION_ERASE:
+            return "erase action groups";
+
+        case ROBOT_ARM_SERVICE_CMD_ACTION_DOWNLOAD:
+            return "download action group";
+
+        case 0x03U:
+            return "move one or more servos to target position";
+
+        case 0x04U:
+            return "move arm tip by XYZ coordinate";
+
+        case ROBOT_ARM_SERVICE_CMD_ACTION_GROUP_RUN:
+            return "run saved action group";
+
+        case 0x07U:
+            return "stop current action group";
+
+        case ROBOT_ARM_SERVICE_CMD_SERVOS_RESET:
+            return "reset arm to default pose";
+
+        default:
+            return "unknown arm command";
+    }
+}
+
+/**
+ * @brief 把内部来源标签翻译成串口日志里能看懂的来源说明。
+ * @param source_label 发送入口传入的内部来源标签，例如 `startup` 或 `uart1`。
+ * @return const char* 面向操作者的来源说明字符串。
+ *
+ * 来源说明用于区分“系统上电自动发送”和“用户从串口1手动发送”，
+ * 这样看到日志时能判断当前动作是不是自己刚才触发的。
+ */
+static const char *RobotArmService_GetSourceDescription(const char *source_label)
+{
+    if (source_label == NULL)
+    {
+        return "unknown source";
+    }
+
+    if (strcmp(source_label, "startup-mode") == 0)
+    {
+        return "startup mode request";
+    }
+
+    if (strcmp(source_label, "startup") == 0)
+    {
+        return "startup link probe";
+    }
+
+    if (strcmp(source_label, "uart1") == 0)
+    {
+        return "UART1 user command";
+    }
+
+    return source_label;
+}
+
+/**
+ * @brief 把 ESP32 返回的舵机类型编号翻译成可读名称。
+ * @param servo_type ESP32 版本查询回包中的舵机类型字节。
+ * @return const char* 舵机类型说明。
+ *
+ * 出厂固件中 0 通常表示 PWM 舵机，非 0 表示总线舵机。
+ * 日志同时保留原始数字，便于资料或源码中继续对照。
+ */
+static const char *RobotArmService_GetServoTypeDescription(uint8_t servo_type)
+{
+    return (servo_type == 0U) ? "PWM servo" : "bus servo";
+}
+
+/**
  * @brief 清理 USART3 上可能残留的 ESP32 启动输出或错误标志。
  *
  * ESP32 的 PA5/PA4 现在作为 STM32 二进制协议口使用。
@@ -349,8 +457,20 @@ static void RobotArmService_ReportReply(uint8_t command,
     if ((reply_buffer == NULL) || (reply_length == 0U))
     {
         my_printf(&huart1,
-                  "[WARN][ARM] No ESP32 reply for cmd=0x%02X. Check USART3 wiring/baud/ESP firmware mode.\r\n",
-                  command);
+                  "[ARM] No ESP32 reply: sent '%s'(0x%02X). Burn updated ESP32 firmware first; then check PD8->PA5, PD9<-PA4, common GND, 9600 baud.\r\n",
+                  RobotArmService_GetCommandDescription(command),
+                  (unsigned int)command);
+        return;
+    }
+
+    if ((reply_length >= 5U) &&
+        (reply_buffer[0] == ROBOT_ARM_SERVICE_FRAME_HEADER) &&
+        (reply_buffer[1] == ROBOT_ARM_SERVICE_FRAME_HEADER) &&
+        (reply_buffer[3] == ROBOT_ARM_SERVICE_CMD_STM32_LINK_MODE) &&
+        (reply_buffer[4] == 0U))
+    {
+        my_printf(&huart1,
+                  "[ARM] Link mode ready: ESP32 left PS2/offline mode. STM32 can now send arm commands on USART3.\r\n");
         return;
     }
 
@@ -360,21 +480,66 @@ static void RobotArmService_ReportReply(uint8_t command,
         (reply_buffer[3] == ROBOT_ARM_SERVICE_CMD_VERSION_QUERY))
     {
         my_printf(&huart1,
-                  "[OK][ARM] ESP32 version reply. len=%u servo_type=%u software=%u\r\n",
+                  "[ARM] Link OK: ESP32 version reply. len=%u, servo=%s(%u), fw=%u. You can send motion commands now.\r\n",
                   (unsigned int)reply_length,
+                  RobotArmService_GetServoTypeDescription(reply_buffer[4]),
                   (unsigned int)reply_buffer[4],
                   (unsigned int)reply_buffer[5]);
         return;
     }
 
     my_printf(&huart1,
-              "[INFO][ARM] ESP32 reply. len=%u head=%02X %02X cmd=0x%02X data=%02X %02X\r\n",
+              "[ARM] ESP32 replied to '%s': len=%u, raw=%02X %02X %02X %02X %02X %02X.\r\n",
+              RobotArmService_GetCommandDescription(command),
               (unsigned int)reply_length,
               (reply_length > 0U) ? reply_buffer[0] : 0U,
               (reply_length > 1U) ? reply_buffer[1] : 0U,
+              (reply_length > 2U) ? reply_buffer[2] : 0U,
               (reply_length > 3U) ? reply_buffer[3] : 0U,
               (reply_length > 4U) ? reply_buffer[4] : 0U,
               (reply_length > 5U) ? reply_buffer[5] : 0U);
+}
+
+/**
+ * @brief 说明那些“发送后不会回包”的机械臂命令该如何判断结果。
+ * @param command 本次发送的 LeArm 命令号。
+ * @param frame_data 本次发送的完整 LeArm 协议帧，不能为 NULL。
+ * @param frame_length 本次发送的协议帧长度。
+ *
+ * LeArm 出厂协议里，动作类命令多数不会返回确认帧。
+ * 如果只打印“已发送”，操作者容易误以为 ESP32 一定执行了动作；
+ * 因此这里把最容易误解的动作组编号和验证方法单独打印出来。
+ */
+static void RobotArmService_ReportNoReplyCommand(uint8_t command,
+                                                 const uint8_t *frame_data,
+                                                 uint16_t frame_length)
+{
+    if ((frame_data == NULL) || (frame_length < ROBOT_ARM_SERVICE_MIN_FRAME_LENGTH))
+    {
+        return;
+    }
+
+    if ((command == ROBOT_ARM_SERVICE_CMD_ACTION_GROUP_RUN) && (frame_length >= 7U))
+    {
+        uint16_t repeat_times = (uint16_t)frame_data[5] | ((uint16_t)frame_data[6] << 8);
+
+        my_printf(&huart1,
+                  "[ARM] Motion command has no reply: requested saved action group %u, repeat %u time(s). If the arm does not move, ESP32 may not have this group saved. Test direct reset with 55 55 02 0C.\r\n",
+                  (unsigned int)frame_data[4],
+                  (unsigned int)repeat_times);
+        return;
+    }
+
+    if (command == ROBOT_ARM_SERVICE_CMD_SERVOS_RESET)
+    {
+        my_printf(&huart1,
+                  "[ARM] Reset command has no reply. The arm should move to default pose if servo power and bus wiring are OK.\r\n");
+        return;
+    }
+
+    my_printf(&huart1,
+              "[ARM] '%s' has no reply frame. Judge it by arm movement or by the next query command.\r\n",
+              RobotArmService_GetCommandDescription(command));
 }
 
 /**
@@ -411,15 +576,17 @@ static void RobotArmService_TransmitFrame(const uint8_t *frame_data,
     if (tx_status == HAL_OK)
     {
         my_printf(&huart1,
-                  "[OK][ARM] TX %s len=%u cmd=0x%02X\r\n",
-                  (source_label != NULL) ? source_label : "frame",
+                  "[ARM] Sent to ESP32: %s. source=%s, len=%u, cmd=0x%02X.\r\n",
+                  RobotArmService_GetCommandDescription(command),
+                  RobotArmService_GetSourceDescription(source_label),
                   (unsigned int)frame_length,
                   (unsigned int)command);
     }
     else
     {
         my_printf(&huart1,
-                  "[ERROR][ARM] USART3 TX failed. status=%d len=%u cmd=0x%02X\r\n",
+                  "[ARM] Send failed: '%s' did not leave USART3. HAL=%d, len=%u, cmd=0x%02X. Check USART3 wiring or pin conflict.\r\n",
+                  RobotArmService_GetCommandDescription(command),
                   (int)tx_status,
                   (unsigned int)frame_length,
                   (unsigned int)command);
@@ -430,6 +597,10 @@ static void RobotArmService_TransmitFrame(const uint8_t *frame_data,
     {
         reply_length = RobotArmService_ReadReply(reply_buffer, sizeof(reply_buffer));
         RobotArmService_ReportReply(command, reply_buffer, reply_length);
+    }
+    else
+    {
+        RobotArmService_ReportNoReplyCommand(command, frame_data, frame_length);
     }
 }
 
@@ -491,7 +662,10 @@ uint8_t RobotArmService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_
 
     if ((g_robot_arm_frame_queue == NULL) && (RobotArmService_Init() == 0U))
     {
-        my_printf(&huart1, "[ERROR][ARM] Queue init failed. Drop cmd=0x%02X\r\n", frame_buffer[3]);
+        my_printf(&huart1,
+                  "[ARM] Queue create failed: '%s'(0x%02X) was not sent. Check FreeRTOS heap.\r\n",
+                  RobotArmService_GetCommandDescription(frame_buffer[3]),
+                  (unsigned int)frame_buffer[3]);
         return 1U;
     }
 
@@ -507,7 +681,8 @@ uint8_t RobotArmService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_
     if (queue_status == pdTRUE)
     {
         my_printf(&huart1,
-                  "[INFO][ARM] Queued frame. rx_len=%u tx_len=%u cmd=0x%02X\r\n",
+                  "[ARM] UART1 accepted: %s. rx_len=%u, tx_len=%u, cmd=0x%02X.\r\n",
+                  RobotArmService_GetCommandDescription(queued_frame.data[3]),
                   (unsigned int)frame_length,
                   (unsigned int)protocol_length,
                   (unsigned int)queued_frame.data[3]);
@@ -515,7 +690,8 @@ uint8_t RobotArmService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_
     else
     {
         my_printf(&huart1,
-                  "[WARN][ARM] Queue full. Drop frame len=%u cmd=0x%02X\r\n",
+                  "[ARM] Command queue is busy: '%s' was dropped. Retry after the previous arm log ends. len=%u, cmd=0x%02X.\r\n",
+                  RobotArmService_GetCommandDescription(queued_frame.data[3]),
                   (unsigned int)protocol_length,
                   (unsigned int)queued_frame.data[3]);
     }
