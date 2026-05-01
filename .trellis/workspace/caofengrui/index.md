@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
+- **Total Sessions**: 7
 - **Last Active**: 2026-05-01
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~268 | Active |
+| `journal-1.md` | ~301 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-05-01 | Record robot arm UART recovery and diagnostics | `3b76725` | `main` |
 | 6 | 2026-05-01 | STM32 LeArm 串口桥接与协议注释沉淀 | `d092c0f` | `main` |
 | 5 | 2026-04-21 | Emm42 conveyor integration and startup recovery | `cd418c0`, `1e483ca`, `a9fae94` | `main` |
 | 4 | 2026-04-19 | LDC1614 标定采样模式联调 | `b70b8f1` | `main` |
