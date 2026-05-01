@@ -64,9 +64,9 @@
  */
 typedef struct
 {
-    int32_t raw_samples[WEIGHT_SERVICE_MEDIAN_FILTER_SIZE];
-    uint8_t sample_count;
-    uint8_t write_index;
+    int32_t raw_samples[WEIGHT_SERVICE_MEDIAN_FILTER_SIZE]; /* 最近的 HX711 原始采样窗口，单位为 ADC 计数，用于计算中值。 */
+    uint8_t sample_count;                                   /* 当前窗口内有效样本数量，未填满窗口时只在已有样本内取中值。 */
+    uint8_t write_index;                                    /* 环形写入位置，指向下一次新样本要覆盖的数组下标。 */
 } WeightService_Filter_t;
 
 /**

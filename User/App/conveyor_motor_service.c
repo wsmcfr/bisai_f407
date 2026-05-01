@@ -197,8 +197,8 @@ typedef enum
  */
 typedef struct
 {
-    ConveyorMotor_CommandType_t type;
-    int32_t error_px;
+    ConveyorMotor_CommandType_t type; /* 命令类型，决定电机任务本轮切换到停止、巡航还是视觉跟踪模式。 */
+    int32_t error_px;                 /* 视觉目标相对中心的带符号像素误差，单位像素，仅 TRACK 命令使用。 */
 } ConveyorMotor_Command_t;
 
 /**
@@ -209,13 +209,13 @@ typedef struct
  */
 typedef struct
 {
-    ConveyorMotor_Mode_t desired_mode;
-    ConveyorMotor_Mode_t applied_mode;
-    int32_t latest_error_px;
-    uint16_t applied_speed_rpm;
-    EMM42_MotorDirection_t applied_direction;
-    uint8_t center_stable_count;
-    uint8_t centered_flag;
+    ConveyorMotor_Mode_t desired_mode;             /* 命令层期望进入的模式，用于反映用户或视觉主机最近一次控制意图。 */
+    ConveyorMotor_Mode_t applied_mode;             /* 实际已经下发到电机侧的模式，用于区分期望跟踪但当前已因死区停机的情况。 */
+    int32_t latest_error_px;                       /* 最近一次视觉跟踪误差，单位像素，用于 BELTINFO 查询和调试观察。 */
+    uint16_t applied_speed_rpm;                    /* 当前已下发的电机转速，单位 RPM，0 表示当前命令为停止。 */
+    EMM42_MotorDirection_t applied_direction;      /* 当前已下发的电机方向，结合速度用于判断传送带实际运动方向。 */
+    uint8_t center_stable_count;                   /* 连续落入中心死区的帧数，用于判断视觉目标是否已经稳定对中。 */
+    uint8_t centered_flag;                         /* 对中状态标志，1 表示已经连续达到中心稳定条件，0 表示仍需调整。 */
 } ConveyorMotor_RuntimeSnapshot_t;
 
 /**
@@ -223,16 +223,16 @@ typedef struct
  */
 typedef struct
 {
-    ConveyorMotor_Mode_t desired_mode;
-    ConveyorMotor_Mode_t applied_mode;
-    int32_t latest_error_px;
-    uint16_t applied_speed_rpm;
-    EMM42_MotorDirection_t applied_direction;
-    uint8_t center_stable_count;
-    uint8_t centered_flag;
-    uint8_t fresh_track_sample_flag;
-    uint8_t track_timeout_reported_flag;
-    TickType_t last_track_update_tick;
+    ConveyorMotor_Mode_t desired_mode;             /* 任务内部期望模式，由命令队列更新，是状态机决策的主输入。 */
+    ConveyorMotor_Mode_t applied_mode;             /* 任务内部实际模式，记录最近一次已经执行的电机控制状态。 */
+    int32_t latest_error_px;                       /* 最新视觉像素误差，单位像素，正负号用于决定电机转向。 */
+    uint16_t applied_speed_rpm;                    /* 最近一次下发到 Emm42 的速度，单位 RPM，用于避免重复发送相同速度。 */
+    EMM42_MotorDirection_t applied_direction;      /* 最近一次下发到 Emm42 的方向，用于判断是否需要重新发送速度命令。 */
+    uint8_t center_stable_count;                   /* 连续中心稳定帧计数，达到阈值后置位 centered_flag。 */
+    uint8_t centered_flag;                         /* 当前目标是否已经稳定对中，影响日志输出和后续控制策略。 */
+    uint8_t fresh_track_sample_flag;               /* 新跟踪样本标志，1 表示本周期刚收到新的 BELTTRACK 误差。 */
+    uint8_t track_timeout_reported_flag;           /* 跟踪超时日志抑制标志，避免超时期间反复刷同一条告警。 */
+    TickType_t last_track_update_tick;             /* 最近一次收到视觉跟踪样本的 RTOS tick，用于计算跟踪输入超时。 */
 } ConveyorMotor_Runtime_t;
 
 /**

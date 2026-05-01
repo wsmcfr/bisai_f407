@@ -42,6 +42,46 @@ Always follow these rules:
 - use clear ownership: driver acquires data, app task decides behavior
 - keep ISR bodies as dispatchers and move work to task context when possible
 
+### Convention: Generated-Code Comment Boundary
+
+**What**: Treat CubeMX-generated files as generated code and avoid broad comment-only rewrites. The only standing exception is `Core/Src/freertos.c`, where this project intentionally maintains RTOS task attributes, task creation, and task-entry forwarding.
+
+**Why**: CubeMX regeneration can overwrite formatting and generated comments. Keeping generated files close to CubeMX output reduces merge noise, while documenting `freertos.c` prevents task ownership and stack/priority decisions from becoming implicit.
+
+**Contracts**:
+
+- `Core/Src/main.c`, `gpio.c`, `dma.c`, `usart.c`, `i2c.c`, and interrupt files should only contain CubeMX-managed setup plus minimal glue in `USER CODE BEGIN/END` blocks
+- do not perform broad comment-only rewrites in generated peripheral setup files
+- if a hand-written change must stay in a generated file, keep it inside the matching `USER CODE` block when possible and explain the reason there
+- `Core/Src/freertos.c` may contain Chinese comments on task handles, `osThreadAttr_t` members, task creation failure handling, and task-entry forwarding
+- application behavior, driver logic, command parsing, filtering, calibration, and state machines belong in `User/App/` or `User/Driver/`
+
+**Example**:
+
+```c
+/* Good: freertos.c documents task metadata because it is the RTOS bootstrap contract. */
+const osThreadAttr_t ldc1614Task_attributes = {
+  .name = "ldc1614Task",                   /* LDC1614 检测任务名称，用于调试器区分电感检测线程。 */
+  .stack_size = 256 * 4,                   /* LDC 检测包含采样、滤波和状态机处理，预留比默认任务更大的栈。 */
+  .priority = (osPriority_t) osPriorityBelowNormal, /* 低于普通业务优先级，避免连续检测逻辑影响称重和电机控制响应。 */
+};
+
+/* Bad: rewriting CubeMX USART init with extensive comments but no hand-written contract. */
+huart3.Init.BaudRate = 115200;
+huart3.Init.WordLength = UART_WORDLENGTH_8B;
+huart3.Init.StopBits = UART_STOPBITS_1;
+```
+
+**Validation**:
+
+| Check | Expected | Failure Meaning | Required Action |
+|-------|----------|-----------------|-----------------|
+| Generated peripheral files | diff contains functional CubeMX-style config or small user-block glue | comment churn may be overwritten by CubeMX | move explanations to spec or `User/` code |
+| `Core/Src/freertos.c` task attributes | each task attribute member explains name, stack size, and priority reason | task scheduling contract is implicit | add member-specific Chinese comments |
+| App or driver logic location | behavior lives under `User/App` or `User/Driver` | generated file is becoming an app module | extract logic to a user module and call it from task entry |
+
+**Related**: See frontend `quality-guidelines.md` for the `User/` code comment contract.
+
 ### Convention: STM32 FreeRTOS Engineering Baseline
 
 **What**: In STM32 FreeRTOS projects, prioritize functional correctness, thread safety, real-time behavior, and bounded resource usage before convenience or quick implementation.

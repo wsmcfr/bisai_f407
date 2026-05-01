@@ -46,15 +46,15 @@ typedef enum
  */
 typedef struct
 {
-    GPIO_TypeDef *sck_port;
-    uint16_t sck_pin;
-    GPIO_TypeDef *dout_port;
-    uint16_t dout_pin;
-    HX711_GainPulses_t gain_pulses;
-    int32_t offset;
-    float scale_counts_per_g;
-    float rated_capacity_g;
-    uint8_t is_scale_calibrated;
+    GPIO_TypeDef *sck_port;             /* HX711 SCK 时钟引脚所在 GPIO 端口，由 MCU 主动输出采样时钟。 */
+    uint16_t sck_pin;                   /* HX711 SCK 时钟引脚编号，必须与 CubeMX GPIO 输出配置一致。 */
+    GPIO_TypeDef *dout_port;            /* HX711 DOUT 数据引脚所在 GPIO 端口，由 HX711 输出数据就绪和串行数据。 */
+    uint16_t dout_pin;                  /* HX711 DOUT 数据引脚编号，低电平表示本次 24 位转换数据已就绪。 */
+    HX711_GainPulses_t gain_pulses;     /* 读完 24 位数据后补发的增益选择脉冲数，决定下一次转换通道和增益。 */
+    int32_t offset;                     /* 空载去皮偏移值，单位为 HX711 原始计数，用于从原始值中扣除零点。 */
+    float scale_counts_per_g;           /* 每克重量对应的原始计数差值，单位 counts/g，由已知砝码标定得到。 */
+    float rated_capacity_g;             /* 当前称重模块额定量程，单位克，用于校验标定砝码输入是否合理。 */
+    uint8_t is_scale_calibrated;        /* 标定有效标志，1 表示 scale_counts_per_g 来自有效标定，0 表示仍是默认占位值。 */
 } HX711_Handle_t;
 
 /*

@@ -202,9 +202,9 @@ typedef enum
  */
 typedef struct
 {
-    uint32_t samples[LDC1614_SERVICE_FILTER_SIZE];
-    uint8_t sample_count;
-    uint8_t write_index;
+    uint32_t samples[LDC1614_SERVICE_FILTER_SIZE]; /* 最近的 LDC1614 原始采样窗口，单位为 28 位原始计数，用于中值滤波。 */
+    uint8_t sample_count;                          /* 当前窗口内有效样本数量，启动初期未填满时只对已有样本排序取中值。 */
+    uint8_t write_index;                           /* 环形写入下标，指向下一次新样本要覆盖的位置。 */
 } LDC1614_Filter_t;
 
 /**
@@ -220,28 +220,28 @@ typedef struct
  */
 typedef struct
 {
-    LDC1614_Channel_t channel;
-    const char *label;
-    LDC1614_Filter_t filter;
-    LDC1614_ServiceState_t state;
-    uint32_t baseline;
-    uint32_t detect_threshold;
-    uint32_t release_threshold;
-    uint32_t latest_filtered_sample;
-    uint32_t reference_delta;
-    uint32_t defect_tolerance;
-    uint32_t last_stable_delta;
-    uint64_t measure_sum;
-    uint32_t measure_min;
-    uint32_t measure_max;
-    TickType_t settle_deadline_tick;
-    uint16_t measure_count;
-    uint8_t reference_enabled;
-    int8_t detect_direction;
-    uint8_t detect_confirm_count;
-    uint8_t release_confirm_count;
-    uint8_t detect_armed;
-    uint8_t startup_quiet_count;
+    LDC1614_Channel_t channel;              /* 底层 LDC1614 通道编号，决定读取哪个 DATAx 寄存器。 */
+    const char *label;                      /* 人类可读通道标签，用于串口日志区分实际线圈位置。 */
+    LDC1614_Filter_t filter;                /* 本通道独立中值滤波器，避免双通道样本互相污染。 */
+    LDC1614_ServiceState_t state;           /* 本通道检测状态机状态，控制 IDLE/SETTLING/MEASURING/WAIT_REMOVE 流程。 */
+    uint32_t baseline;                      /* 空载基线原始计数，用于计算当前样本相对空载的变化量。 */
+    uint32_t detect_threshold;              /* 检测进入阈值，单位原始计数差值，超过后才累计进入确认。 */
+    uint32_t release_threshold;             /* 释放阈值，单位原始计数差值，低于该值才累计移除确认。 */
+    uint32_t latest_filtered_sample;        /* 最近一次滤波后的样本，单位原始计数，用于日志和状态机判断。 */
+    uint32_t reference_delta;               /* 标准良品参考变化量，单位原始计数差值，用于 OK/DEFECT 判定。 */
+    uint32_t defect_tolerance;              /* 允许偏差范围，单位原始计数差值，决定与 reference_delta 的合格窗口。 */
+    uint32_t last_stable_delta;             /* 最近一次稳定测量得到的变化量，用于结果上报和移除比例判断。 */
+    uint64_t measure_sum;                   /* 测量窗口样本变化量累计和，用于计算稳定结果均值。 */
+    uint32_t measure_min;                   /* 测量窗口内最小变化量，用于评估本轮稳定性。 */
+    uint32_t measure_max;                   /* 测量窗口内最大变化量，用于评估本轮稳定性。 */
+    TickType_t settle_deadline_tick;        /* SETTLING 状态结束的 RTOS tick，达到后进入稳定采样窗口。 */
+    uint16_t measure_count;                 /* 当前测量窗口已累计的有效样本数量。 */
+    uint8_t reference_enabled;              /* 参考判定启用标志，1 表示输出 OK/DEFECT，0 表示只输出测量值。 */
+    int8_t detect_direction;                /* 检测方向，1 表示原始值上升为进入，-1 表示原始值下降为进入。 */
+    uint8_t detect_confirm_count;           /* 连续满足进入阈值的样本计数，用于抑制偶发毛刺误触发。 */
+    uint8_t release_confirm_count;          /* 连续满足释放条件的样本计数，用于确认工件确实已经移开。 */
+    uint8_t detect_armed;                   /* 启动武装标志，1 表示已通过空载安静期，允许进入正常检测。 */
+    uint8_t startup_quiet_count;            /* 启动阶段连续空载安静样本计数，用于防止启动漂移误判为工件。 */
 } LDC1614_ChannelContext_t;
 
 /**
@@ -254,16 +254,16 @@ typedef struct
  */
 typedef struct
 {
-    uint8_t active;
-    uint8_t target_channel_index;
-    uint16_t target_sample_count;
-    uint16_t captured_sample_count;
-    uint32_t min_raw;
-    uint32_t max_raw;
-    uint64_t raw_sum;
-    uint32_t min_delta;
-    uint32_t max_delta;
-    uint64_t delta_sum;
+    uint8_t active;                 /* 会话激活标志，1 表示正在等待或采集某个通道的标定样本。 */
+    uint8_t target_channel_index;   /* 目标通道在 g_ldc1614_channels 数组中的下标，而不是芯片原始 CH 编号。 */
+    uint16_t target_sample_count;   /* 本次标定计划采集的稳定样本数量，来自命令参数或默认值。 */
+    uint16_t captured_sample_count; /* 当前已经采集到的稳定样本数量，达到目标后输出汇总并结束会话。 */
+    uint32_t min_raw;               /* 标定会话内最小滤波后原始值，用于观察原始读数离散范围。 */
+    uint32_t max_raw;               /* 标定会话内最大滤波后原始值，用于观察原始读数离散范围。 */
+    uint64_t raw_sum;               /* 标定会话内原始值累计和，用于计算平均原始值。 */
+    uint32_t min_delta;             /* 标定会话内最小基线变化量，用于观察有效测量值离散范围。 */
+    uint32_t max_delta;             /* 标定会话内最大基线变化量，用于观察有效测量值离散范围。 */
+    uint64_t delta_sum;             /* 标定会话内变化量累计和，用于计算建议参考变化量。 */
 } LDC1614_CalibrationSession_t;
 
 /**
