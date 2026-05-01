@@ -20,10 +20,10 @@ extern "C" {
  */
 typedef enum
 {
-    EMM42_MOTOR_STATUS_OK = 0,
-    EMM42_MOTOR_STATUS_ERROR,
-    EMM42_MOTOR_STATUS_INVALID_PARAM,
-    EMM42_MOTOR_STATUS_RANGE_ERROR
+    EMM42_MOTOR_STATUS_OK = 0,       /* 命令帧已经成功交给 HAL UART 发送，不代表电机运动一定已完成。 */
+    EMM42_MOTOR_STATUS_ERROR,        /* UART 发送或底层 HAL 调用失败，调用者应输出阶段信息便于排查。 */
+    EMM42_MOTOR_STATUS_INVALID_PARAM,/* 句柄、串口指针或模式参数非法，驱动不会发送任何字节。 */
+    EMM42_MOTOR_STATUS_RANGE_ERROR   /* 速度、加速度等数值超出协议允许范围，驱动拒绝组帧发送。 */
 } EMM42_MotorStatus_t;
 
 /**
@@ -37,8 +37,8 @@ typedef enum
  */
 typedef enum
 {
-    EMM42_MOTOR_DIRECTION_CW = 0U,
-    EMM42_MOTOR_DIRECTION_CCW = 1U
+    EMM42_MOTOR_DIRECTION_CW = 0U,  /* 协议方向字段为 0，对应电机顺时针方向，实际传送带方向需结合安装确认。 */
+    EMM42_MOTOR_DIRECTION_CCW = 1U  /* 协议方向字段为 1，对应电机逆时针方向，实际传送带方向需结合安装确认。 */
 } EMM42_MotorDirection_t;
 
 /**
@@ -53,8 +53,8 @@ typedef enum
  */
 typedef enum
 {
-    EMM42_MOTOR_CONTROL_MODE_OPEN_LOOP = 0U,
-    EMM42_MOTOR_CONTROL_MODE_CLOSED_LOOP_FOC = 1U
+    EMM42_MOTOR_CONTROL_MODE_OPEN_LOOP = 0U,       /* 开环模式，当前传送带不默认使用，保留用于故障排查。 */
+    EMM42_MOTOR_CONTROL_MODE_CLOSED_LOOP_FOC = 1U  /* 闭环 FOC 模式，当前工程启动时会强制恢复到该控制模式。 */
 } EMM42_MotorControlMode_t;
 
 /**

@@ -16,9 +16,9 @@ extern "C" {
  */
 typedef enum
 {
-    HX711_STATUS_OK = 0,
-    HX711_STATUS_TIMEOUT,
-    HX711_STATUS_INVALID_PARAM
+    HX711_STATUS_OK = 0,        /* 操作成功，读数、去皮或标定流程已经按预期完成。 */
+    HX711_STATUS_TIMEOUT,       /* 等待 DOUT 数据就绪超时，通常需要检查接线、供电或 HX711 是否工作。 */
+    HX711_STATUS_INVALID_PARAM  /* 调用参数非法，例如句柄为空、输出指针为空或采样数量为 0。 */
 } HX711_Status_t;
 
 /**
@@ -29,9 +29,9 @@ typedef enum
  */
 typedef enum
 {
-    HX711_GAIN_PULSES_A128 = 1U,
-    HX711_GAIN_PULSES_B32  = 2U,
-    HX711_GAIN_PULSES_A64  = 3U
+    HX711_GAIN_PULSES_A128 = 1U, /* 读完 24bit 后补 1 个脉冲，下一轮选择 A 通道 128 倍增益。 */
+    HX711_GAIN_PULSES_B32  = 2U, /* 读完 24bit 后补 2 个脉冲，下一轮选择 B 通道 32 倍增益。 */
+    HX711_GAIN_PULSES_A64  = 3U  /* 读完 24bit 后补 3 个脉冲，下一轮选择 A 通道 64 倍增益。 */
 } HX711_GainPulses_t;
 
 /**

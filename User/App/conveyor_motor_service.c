@@ -11,6 +11,32 @@
 #include <string.h>
 
 /**
+ * @brief 传送带文本命令和 Emm42 控制效果速查。
+ *
+ * 通信链路：
+ * 1. 用户/MP157 通过 USART1 发送 ASCII 文本命令，命令先由 `weight_service.c` 统一取出并规范化；
+ * 2. 本文件只处理 `BELT...` 前缀命令，不直接读取 USART1 DMA 缓存；
+ * 3. 传送带任务独占 USART2，PA2(TX)/PA3(RX)，115200 8N1，用 Emm42 TTL 协议控制电机。
+ *
+ * 用户可发送的 BELT 命令：
+ * | 命令 | 参数含义 | 电机效果 | 典型返回/观察方式 |
+ * | --- | --- | --- | --- |
+ * | `BELTSTOP` | 无参数 | 进入 STOP，立即下发停止命令 | `[OK][BELT] Mode set to STOP.` |
+ * | `BELTSCAN` | 无参数 | 进入 SCAN，以 `CONVEYOR_MOTOR_SCAN_SPEED_RPM` 巡航 | `[OK][BELT] Mode set to SCAN.` |
+ * | `BELTINFO` | 无参数 | 不改变电机，只读取运行快照 | `[INFO][BELT] desired/applied/error/speed/dir/stable/centered` |
+ * | `BELTTRACK <error>` | `error` 为目标 x 坐标相对中心的有符号像素误差 | 进入 TRACK；误差在死区内停机，超出死区按方向和大小调速 | 可继续发 `BELTINFO` 看速度/方向 |
+ * | `BELTENABLE 0 [error]` | `0` 表示视觉未使能，后续 error 可省略 | 回到 SCAN 巡航 | 无固定成功回包，必要时查 `BELTINFO` |
+ * | `BELTENABLE 1 <error>` | `1` 表示视觉使能，error 为像素误差 | 进入 TRACK 并按 error 调速 | 无固定成功回包，必要时查 `BELTINFO` |
+ * | `BELTCAM 0 [current_x center_x]` | `0` 表示视觉未使能，坐标字段即使存在也会忽略 | 回到 SCAN 巡航 | 无固定成功回包 |
+ * | `BELTCAM 1 <current_x> <center_x>` | 下位机计算 `error=current_x-center_x` | 进入 TRACK 并按计算出的误差调速 | 无固定成功回包 |
+ *
+ * 运行边界：
+ * - 如果 TRACK 模式超过 `CONVEYOR_MOTOR_TRACK_TIMEOUT_MS` 没有新视觉误差，会主动停机；
+ * - 正误差默认映射到 CW，若现场方向相反，只改 `CONVEYOR_MOTOR_POSITIVE_ERROR_IS_CW`；
+ * - 本文件只决定模式和速度，具体 Emm42 字节帧见 `User/Driver/emm42_motor.c` 顶部协议表。
+ */
+
+/**
  * @brief 控制任务主循环周期，单位毫秒。
  *
  * 该周期同时承担两件事：
@@ -173,9 +199,9 @@
  */
 typedef enum
 {
-    CONVEYOR_MOTOR_MODE_STOP = 0,
-    CONVEYOR_MOTOR_MODE_SCAN,
-    CONVEYOR_MOTOR_MODE_TRACK
+    CONVEYOR_MOTOR_MODE_STOP = 0, /* 停止模式，电机保持静止，等待下一条巡航或跟踪命令。 */
+    CONVEYOR_MOTOR_MODE_SCAN,     /* 巡航扫描模式，传送带按固定低速匀速运行，用于寻找或输送目标。 */
+    CONVEYOR_MOTOR_MODE_TRACK     /* 视觉跟踪模式，根据相机中心误差动态调整速度和方向。 */
 } ConveyorMotor_Mode_t;
 
 /**
@@ -183,9 +209,9 @@ typedef enum
  */
 typedef enum
 {
-    CONVEYOR_MOTOR_COMMAND_STOP = 0,
-    CONVEYOR_MOTOR_COMMAND_SCAN,
-    CONVEYOR_MOTOR_COMMAND_TRACK
+    CONVEYOR_MOTOR_COMMAND_STOP = 0, /* 队列命令：要求电机任务切换到 STOP，并立即下发停止帧。 */
+    CONVEYOR_MOTOR_COMMAND_SCAN,     /* 队列命令：要求电机任务切换到 SCAN，并按巡航速度运行。 */
+    CONVEYOR_MOTOR_COMMAND_TRACK     /* 队列命令：要求电机任务使用最新像素误差执行视觉对中。 */
 } ConveyorMotor_CommandType_t;
 
 /**

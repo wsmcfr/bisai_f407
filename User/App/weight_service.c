@@ -4,11 +4,41 @@
 #include "conveyor_motor_service.h"
 #include "hx711.h"
 #include "ldc1614_service.h"
+#include "robot_arm_service.h"
 #include "uart_command.h"
 #include "usart.h"
 
 #include <stdlib.h>
 #include <string.h>
+
+/**
+ * @brief USART1 用户命令总入口速查。
+ *
+ * 通信入口：
+ * - USART1：115200 8N1，PA9(TX)/PA10(RX)，由串口助手、MP157 或其它上位机发送命令；
+ * - 本文件的 `WeightService_ProcessCommand()` 是当前 USART1 命令的唯一任务级消费者；
+ * - 机械臂二进制帧会先走 `RobotArmService_HandleFrame()`，识别成功后直接转发到 USART3，不再按文本命令解析；
+ * - 文本命令会去掉首尾空白并转成大写，因此 `get`、`GET\r\n`、`Get` 都等价于 `GET`。
+ *
+ * 用户可从 USART1 直接发送的文本命令：
+ * | 命令 | 作用 | 是否影响硬件动作 | 典型返回 |
+ * | --- | --- | --- | --- |
+ * | `GET` | 查询当前 HX711 重量；未标定时返回 raw/delta，已标定时返回 g | 否 | `[DATA][WEIGHT] ...` |
+ * | `TARE` | 重新执行 10 次采样去皮，并刷新 offset | 否，但会改变重量零点 | `[OK][WEIGHT] Tare success...` 或错误 |
+ * | `CAL <克重>` | 用当前带载值和已知砝码重量标定比例，例如 `CAL 1000` | 否，但会改变称重比例 | `[OK][WEIGHT] Calibration success...` 或拒绝原因 |
+ * | `LDCCAL CH1 [N]` / `LDCCAL CH2 [N]` | 转交 LDC 服务，单次放置工件并采集 N 个稳定样本 | 否 | `[OK][LDC] Calibration sampling armed...` |
+ * | `LDCSTOP` | 转交 LDC 服务，停止当前 LDC 标定采样 | 否 | `[OK][LDC] Calibration sampling stopped.` |
+ * | `BELTSTOP` | 转交传送带服务，停止 Emm42 电机 | 是，传送带停止 | `[OK][BELT] Mode set to STOP.` |
+ * | `BELTSCAN` | 转交传送带服务，进入巡航扫描 | 是，传送带低速匀速运行 | `[OK][BELT] Mode set to SCAN.` |
+ * | `BELTINFO` | 转交传送带服务，查询期望模式、实际速度、方向和对中状态 | 否 | `[INFO][BELT] desired=...` |
+ * | `BELTTRACK <error>` | 转交传送带服务，用像素误差进入视觉跟踪，例如 `BELTTRACK 80` | 是，按误差方向/大小调速 | 无固定成功回包，状态可用 `BELTINFO` 查 |
+ * | `BELTENABLE <0|1> [error]` | `0` 回巡航，`1` 按 error 跟踪 | 是 | 无固定成功回包 |
+ * | `BELTCAM <enable> <current_x> <center_x>` | 下位机计算 `error=current_x-center_x` 后控制传送带 | 是 | 无固定成功回包 |
+ *
+ * 用户可从 USART1 直接发送的机械臂二进制帧：
+ * - 例如 `55 55 02 01` 查询 ESP32 版本，`55 55 05 06 03 01 00` 运行 3 号动作组 1 次；
+ * - 详细帧表和接线要求在 `User/App/robot_arm_service.c` 顶部维护。
+ */
 
 /**
  * @brief 周期性重量采样周期，单位毫秒。
@@ -374,7 +404,10 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
                                          uint8_t *tare_ready,
                                          WeightService_Filter_t *filter)
 {
+    uint8_t raw_frame[64];
+    uint16_t raw_frame_length;
     char command_buffer[64];
+    uint16_t text_length;
     uint32_t known_weight_g;
     HX711_Status_t status;
 
@@ -383,12 +416,35 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
         return;
     }
 
-    if (UartCommand_Fetch(command_buffer,
-                          sizeof(command_buffer),
-                          WEIGHT_SERVICE_COMMAND_WAIT_MS) == 0U)
+    if (UartCommand_FetchRaw(raw_frame,
+                             sizeof(raw_frame),
+                             &raw_frame_length,
+                             WEIGHT_SERVICE_COMMAND_WAIT_MS) == 0U)
     {
         return;
     }
+
+    if (RobotArmService_HandleFrame(raw_frame, raw_frame_length) != 0U)
+    {
+        /*
+         * 机械臂帧是二进制协议，不能继续走文本命令规范化流程。
+         * 这里直接返回，后续由 RobotArmService_Task 通过 USART3 转发给 ESP32。
+         */
+        return;
+    }
+
+    text_length = raw_frame_length;
+    if (text_length >= sizeof(command_buffer))
+    {
+        /*
+         * 文本命令必须预留字符串结束符；超过缓存时截断到最大可解析长度，
+         * 防止后续 strcmp/strncmp 访问越界。
+         */
+        text_length = (uint16_t)(sizeof(command_buffer) - 1U);
+    }
+
+    (void)memcpy(command_buffer, raw_frame, text_length);
+    command_buffer[text_length] = '\0';
 
     WeightService_NormalizeCommand(command_buffer);
 

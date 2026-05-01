@@ -1,5 +1,42 @@
 #include "ldc1614.h"
 
+/**
+ * @brief LDC1614 I2C 寄存器协议速查。
+ *
+ * 本文件是 LDC1614 的底层 I2C 寄存器驱动，不直接处理 USART1 用户命令。
+ * 用户能发送的 `LDCCAL CH1 [N]`、`LDCCAL CH2 [N]`、`LDCSTOP` 由 `ldc1614_service.c`
+ * 解析；解析后最终会调用本文件的寄存器读写函数完成采样、初始化和状态查询。
+ *
+ * 硬件链路：
+ * - STM32 I2C2：PB10=SCL，PB11=SDA；
+ * - LDC1614 地址：`LDC1614_DEFAULT_DEVICE_ADDRESS=0x54`，这是 STM32 HAL 传参使用的左移后地址；
+ * - 当前业务只启用 CH0/CH1，CH2/CH3 的寄存器映射保留在驱动层，便于后续扩展。
+ *
+ * 寄存器访问格式：
+ * | 操作 | HAL 调用 | 地址宽度 | 数据宽度 | 本文件函数 |
+ * | --- | --- | --- | --- | --- |
+ * | 写寄存器 | `HAL_I2C_Mem_Write` | 8 bit 寄存器地址 | 16 bit 大端数据 | `LDC1614_WriteRegister()` |
+ * | 读寄存器 | `HAL_I2C_Mem_Read` | 8 bit 寄存器地址 | 16 bit 大端数据 | `LDC1614_ReadRegister()` |
+ * | 读通道原始值 | 先读 DATAx_MSB，再读 DATAx_LSB | 8 bit | 28 bit 有效值 | `LDC1614_ReadChannelRaw()` |
+ *
+ * 常用寄存器效果：
+ * | 寄存器 | 作用 | 当前使用方式 |
+ * | --- | --- | --- |
+ * | `RCOUNTx` | 设置通道转换积分窗口，影响分辨率和转换时间 | CH0/CH1 使用同一默认值 |
+ * | `SETTLECOUNTx` | 设置传感线圈稳定等待时间 | CH0/CH1 使用同一默认值 |
+ * | `CLOCK_DIVIDERSx` | 设置传感器时钟分频 | CH0/CH1 使用同一默认值 |
+ * | `DRIVE_CURRENTx` | 设置线圈驱动电流 | CH0/CH1 使用同一默认值 |
+ * | `MUX_CONFIG` | 设置通道扫描模式 | 当前配置为 CH0/CH1 顺序扫描 |
+ * | `ERROR_CONFIG` | 设置 DRDY/错误输出行为 | 打开 DRDY 到 INTB，供任务等待新数据 |
+ * | `CONFIG` | 设置连续转换、INTB 等全局行为 | 初始化最后写入，使芯片进入连续转换 |
+ * | `STATUS` | 查询数据就绪与错误状态 | `LDC1614_HasUnreadConversion()` 按通道解析 |
+ *
+ * 维护要求：
+ * 1. 新增寄存器或改变默认值时，必须在本速查表写清楚寄存器用途、影响和上层可观察效果；
+ * 2. 本文件只返回 `LDC1614_Status_t`，不直接串口打印，用户可见日志统一放在 `ldc1614_service.c`；
+ * 3. I2C 失败只转换为状态码，由应用任务决定是否重试、报警或停止检测。
+ */
+
 #define LDC1614_I2C_TIMEOUT_MS                 (100U)
 #define LDC1614_REG_DATA0_MSB                  (0x00U)
 #define LDC1614_REG_DATA0_LSB                  (0x01U)

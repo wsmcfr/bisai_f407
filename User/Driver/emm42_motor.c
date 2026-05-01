@@ -1,6 +1,28 @@
 #include "emm42_motor.h"
 
 /**
+ * @brief Emm42 TTL 串口协议帧速查。
+ *
+ * 通信链路：
+ * - 本驱动由传送带电机任务独占调用；
+ * - 当前硬件使用 STM32 USART2，PA2(TX) 接 Emm42 RX，PA3(RX) 接 Emm42 TX，波特率 115200 8N1，必须共地；
+ * - 当前实现只负责发送命令帧，不解析电机回包；上层通过返回的 HAL 发送状态判断“是否成功发出”，不代表电机一定已经执行完成。
+ *
+ * 本文件会发送的 Emm42 命令帧：
+ * | 函数 | 帧格式 | 参数效果 | 是否会让电机动作 |
+ * | --- | --- | --- | --- |
+ * | `EMM42_MotorSetEnable()` | `[addr F3 AB enable sync 6B]` | `enable=1` 使能电机，`enable=0` 失能；`sync` 为同步标志 | 使能本身不转动，但会改变电机是否接受运动命令 |
+ * | `EMM42_MotorSetControlMode()` | `[addr 46 69 save mode 6B]` | `save=0` 仅本次上电生效，`save=1` 写入电机存储；`mode=0` 开环，`mode=1` 闭环 FOC | 不转动，但会改变后续速度控制方式 |
+ * | `EMM42_MotorSetButtonLock()` | `[addr D0 B3 save locked 6B]` | `locked=1` 锁面板按键，`locked=0` 解锁；`save` 含义同上 | 不转动，但会影响现场按键能否改参数 |
+ * | `EMM42_MotorSetVelocity()` | `[addr F6 dir speedH speedL acc sync 6B]` | `dir` 控制方向，`speedH/speedL` 为 RPM，`acc` 为加速度参数 | 会让电机按目标速度运行 |
+ * | `EMM42_MotorStopNow()` | `[addr FE 98 sync 6B]` | 立即停止当前运动 | 会让正在运行的电机停下 |
+ *
+ * 维护要求：
+ * - 后续新增 Emm42 命令函数时，必须在此表补充帧格式、参数含义和是否会让电机动作；
+ * - 默认开发固件不要频繁把 `save` 置 1，避免每次上电都写电机内部存储。
+ */
+
+/**
  * @brief 统一发送一帧 Emm42 TTL 命令。
  * @param motor 电机句柄指针，不能为空。
  * @param frame 待发送的命令帧缓存区，不能为空。

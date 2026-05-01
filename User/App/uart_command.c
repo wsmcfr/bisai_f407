@@ -9,6 +9,30 @@
 #include <string.h>
 
 /**
+ * @brief USART1 命令接收底座与业务命令分发约定。
+ *
+ * 本文件只负责“收完整一帧”和“串口安全打印”，不直接解释业务含义。
+ * 用户真正能从 USART1 发送的命令由上层服务解释，维护时必须按下面索引同步更新：
+ * | 命令类型 | 示例 | 处理文件 | 主要效果 | 是否回包 |
+ * | --- | --- | --- | --- | --- |
+ * | 称重文本命令 | `GET` / `TARE` / `CAL 1000` | `weight_service.c` | 查询重量、重新去皮、用已知砝码标定比例 | 是，返回 `[DATA]` / `[OK]` / `[ERROR]` 文本 |
+ * | LDC 标定命令 | `LDCCAL CH1 20` / `LDCSTOP` | `ldc1614_service.c` | 启动或停止 LDC 单件稳定采样标定 | 是，返回 `[OK]` / `[INFO]` / `[ERROR]` 文本 |
+ * | 传送带命令 | `BELTSCAN` / `BELTSTOP` / `BELTTRACK 80` / `BELTINFO` | `conveyor_motor_service.c` | 切换巡航、停止、按视觉误差跟踪或查询状态 | 部分命令立即回包，运动命令可用 `BELTINFO` 查询 |
+ * | 机械臂 HEX 帧 | `55 55 02 01` / `55 55 05 06 03 01 00` | `robot_arm_service.c` | 透传到 USART3/ESP32，查询或执行 LeArm 动作 | 查询类有 `[ARM] RX...` 日志，运动类通常看机械臂动作 |
+ *
+ * 串口链路：
+ * - USART1：115200 8N1，PA9(TX)/PA10(RX)，面向串口助手、MP157 或其它上位机；
+ * - 本文件使用 `HAL_UARTEx_ReceiveToIdle_DMA()` 接收，空闲中断认为“一帧命令结束”；
+ * - 文本命令通过 `UartCommand_Fetch()` 取出并补 `\0`，二进制机械臂帧通过
+ *   `UartCommand_FetchRaw()` 取出，避免帧内 `0x00` 被字符串逻辑截断。
+ *
+ * 维护要求：
+ * 1. 后续新增 USART1 可发送命令时，必须在本注释表和具体处理文件的命令表里同时写清楚“能发什么、有什么效果、是否回包”；
+ * 2. 本文件只允许做接收缓存、ISR 到任务通知、串口打印互斥，不把业务状态机塞进串口底座；
+ * 3. HAL 回调中只复制数据和释放信号量，禁止在中断上下文解析命令或格式化打印。
+ */
+
+/**
  * @brief DMA接收缓存区大小。
  *
  * 当前命令集非常小，64字节足够容纳一条文本命令以及换行符。
@@ -116,6 +140,75 @@ void UartCommand_StartReceive(void)
  *
  * 该函数先等待接收信号量，再在临界区内复制单帧缓存。
  * 因为当前只保留“最近一帧”，所以这里的逻辑比环形缓冲区更轻量。
+ */
+/**
+ * @brief 从接收模块中安全取出一帧原始串口数据。
+ * @param frame_buffer 调用者提供的原始字节输出缓存，不能为 NULL。
+ * @param buffer_size 输出缓存大小，必须大于0。
+ * @param frame_length 实际拷贝出的字节数输出参数，不能为 NULL。
+ * @param timeout_ms 等待命令的超时时间，单位毫秒。传0表示立即返回。
+ * @return uint8_t 1表示成功取到一帧数据，0表示没有新数据或参数非法。
+ *
+ * 该函数和 UartCommand_Fetch 使用同一个 USART1 单消费者缓存。
+ * 与文本接口不同的是，这里不会补字符串结束符，也不会因为帧内存在 0x00 而提前截断，
+ * 因此可用于机械臂 `55 55 ...` 二进制协议透传。
+ */
+uint8_t UartCommand_FetchRaw(uint8_t *frame_buffer,
+                             uint16_t buffer_size,
+                             uint16_t *frame_length,
+                             uint32_t timeout_ms)
+{
+    uint16_t copy_length;
+    TickType_t wait_ticks;
+
+    if ((frame_buffer == NULL) ||
+        (buffer_size == 0U) ||
+        (frame_length == NULL) ||
+        (g_uart_rx_semaphore == NULL))
+    {
+        return 0U;
+    }
+
+    *frame_length = 0U;
+
+    wait_ticks = (timeout_ms == 0U) ? 0U : pdMS_TO_TICKS(timeout_ms);
+    if (xSemaphoreTake(g_uart_rx_semaphore, wait_ticks) != pdTRUE)
+    {
+        return 0U;
+    }
+
+    taskENTER_CRITICAL();
+
+    copy_length = g_uart_pending_length;
+    if (copy_length > buffer_size)
+    {
+        /*
+         * 调用者缓存比 DMA 缓存小时，只复制调用者能容纳的部分。
+         * 当前机械臂帧和文本命令都很短，正常不会触发该分支；保留该边界处理防止越界。
+         */
+        copy_length = buffer_size;
+    }
+
+    (void)memcpy(frame_buffer, g_uart_pending_command, copy_length);
+    *frame_length = copy_length;
+
+    /* 当前帧已交给唯一消费者，清零长度等待下一次 DMA 空闲中断写入新帧。 */
+    g_uart_pending_length = 0U;
+
+    taskEXIT_CRITICAL();
+
+    return 1U;
+}
+
+/**
+ * @brief 从接收模块中安全取出一条文本命令。
+ * @param command_buffer 调用者提供的文本输出缓存，不能为 NULL。
+ * @param buffer_size 文本输出缓存大小，必须大于0，并且函数会预留 1 字节写入 `\0`。
+ * @param timeout_ms 等待命令的超时时间，单位毫秒。传0表示立即返回。
+ * @return uint8_t 1表示成功取到命令，0表示没有新命令或参数非法。
+ *
+ * 该接口适合 `GET/TARE/CAL/BELT...` 等 ASCII 文本命令。
+ * 如果需要保留帧内 `0x00`，例如机械臂二进制协议，应使用 UartCommand_FetchRaw。
  */
 uint8_t UartCommand_Fetch(char *command_buffer, uint16_t buffer_size, uint32_t timeout_ms)
 {

@@ -32,6 +32,22 @@ void UartCommand_StartReceive(void);
 uint8_t UartCommand_Fetch(char *command_buffer, uint16_t buffer_size, uint32_t timeout_ms);
 
 /**
+ * @brief 从接收模块中取出一帧原始串口数据。
+ * @param frame_buffer 调用者提供的原始字节输出缓存，不能为 NULL。
+ * @param buffer_size 输出缓存大小，必须大于0。
+ * @param frame_length 实际拷贝出来的原始字节长度输出参数，不能为 NULL。
+ * @param timeout_ms 等待命令的超时时间，单位毫秒。传0表示立即返回。
+ * @return uint8_t 1表示成功取到一帧数据，0表示当前没有新数据或参数非法。
+ *
+ * 该接口保留二进制数据中的 `0x00`，用于机械臂 `55 55 ...` 协议透传；
+ * 文本命令仍可继续使用 `UartCommand_Fetch()` 自动补 `\0` 后再解析。
+ */
+uint8_t UartCommand_FetchRaw(uint8_t *frame_buffer,
+                             uint16_t buffer_size,
+                             uint16_t *frame_length,
+                             uint32_t timeout_ms);
+
+/**
  * @brief 串口线程安全格式化输出。
  * @param huart 目标串口句柄，不能为空。
  * @param format `printf` 风格格式串。

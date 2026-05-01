@@ -346,6 +346,201 @@ void UartCommandTask(void *argument)
 - Define LDC calibration sampling as “one stable placement, N captured samples, one summary”.
 - Make every public header self-contained by including the standard type headers it directly uses.
 
+### Scenario: STM32-to-ESP32 LeArm UART Bridge
+
+#### 1. Scope / Trigger
+
+- Trigger: adding or modifying the STM32 bridge that receives upstream commands on `USART1` and forwards LeArm binary frames to an ESP32-based mechanical arm.
+- Trigger: changing the ESP32 LeArm factory firmware UART pins, baud rate, PC/BLE mode behavior, or binary protocol commands.
+- Trigger: debugging cases where STM32 logs are visible on `USART1`, but the mechanical arm does not move or ESP32 replies are not visible.
+- Trigger: adding startup handshakes between STM32 and the ESP32 arm controller.
+
+#### 2. Signatures
+
+- STM32 upstream debug/control port:
+  - `USART1 = 115200 8N1`
+  - current STM32 pins: `PA9 TX`, `PA10 RX`
+  - role: serial assistant / MP157 command input and human-readable logs
+- STM32-to-ESP32 arm port:
+  - `USART3 = 9600 8N1`
+  - current STM32 pins: `PD8 TX`, `PD9 RX`
+  - role: binary LeArm protocol transport to ESP32
+- ESP32 LeArm firmware serial binding:
+  - `Serial.begin(9600, SERIAL_8N1, PA5, PA4)`
+  - `PA5 = GPIO33 = ESP32 RX`, connect to `STM32 USART3_TX / PD8`
+  - `PA4 = GPIO32 = ESP32 TX`, connect to `STM32 USART3_RX / PD9`
+  - common ground is mandatory
+- STM32 service entry points:
+  - `uint8_t UartCommand_FetchRaw(uint8_t *frame_buffer, uint16_t buffer_size, uint16_t *frame_length, uint32_t timeout_ms)`
+  - `uint8_t RobotArmService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_length)`
+  - `void RobotArmService_Task(void *argument)`
+- LeArm binary frame format:
+  - `55 55 Length CMD Params...`
+  - total bytes sent to ESP32 must be `Length + 2`
+- Confirmed startup / diagnostic frames:
+  - STM32 link-mode request: `55 55 02 18`
+  - expected custom ESP32 ACK after matching firmware update: `55 55 03 18 00`
+  - version query: `55 55 02 01`
+  - expected version reply shape: `55 55 04 01 <servo_type> <software_version>`
+- Confirmed motion frame example:
+  - action group 3 once: `55 55 05 06 03 01 00`
+
+#### 3. Contracts
+
+- `USART1` remains the only upstream command/log port:
+  - serial assistant and MP157 talk to STM32 through `USART1`
+  - STM32 logs for bridge acceptance, transmit status, and ESP32 replies must go back to `USART1`
+- `USART3` is the only STM32-owned port for the ESP32 arm controller:
+  - LeArm binary frames must be sent by `RobotArmService_Task`
+  - do not let multiple STM32 tasks call `HAL_UART_Transmit(&huart3, ...)` for the arm without a single owner or serialization rule
+- The STM32 parser must preserve binary data:
+  - use `UartCommand_FetchRaw(...)` before text normalization
+  - do not parse LeArm frames through string APIs because valid frames may contain `0x00`
+- The STM32 parser may accept serial-assistant line endings, but must not forward them:
+  - input `55 55 05 06 03 01 00 0D 0A` may be accepted
+  - only the first `Length + 2` bytes may be queued to ESP32
+- ESP32 must listen on PA5/PA4 before STM32 startup handshakes can work:
+  - a command cannot switch to PA5/PA4 if the ESP32 firmware is still listening on USB/default `Serial` pins
+  - therefore the ESP32 firmware must bind `Serial` to `PA5, PA4` during `setup()`
+- ESP32 `Serial` must be treated as a binary protocol port after rebinding to PA5/PA4:
+  - remove or guard `Serial.print/println/printf` debug output in active code paths
+  - debug ASCII on this port can corrupt STM32 reply parsing
+- The STM32 startup handshake is allowed to send no-motion frames only:
+  - first send `55 55 02 18` to request/confirm STM32 link mode
+  - then send `55 55 02 01` to verify the protocol reply path
+  - do not move the arm during boot-time link probing
+- Hardware validation already confirmed the bridge direction:
+  - STM32 can send commands to ESP32
+  - the mechanical arm can move from STM32-originated commands
+
+#### 4. Validation & Error Matrix
+
+| Check | Expected | Failure Meaning | Required Action |
+|-------|----------|-----------------|-----------------|
+| Physical wiring | `PD8 -> ESP32 PA5(GPIO33/RX)`, `PD9 <- ESP32 PA4(GPIO32/TX)`, common GND | ESP32 never receives STM32 bytes or STM32 never sees replies | fix crossed TX/RX wiring and ground before changing software |
+| STM32 USART3 baud | `9600 8N1` | frame bytes are garbled or ignored | keep CubeMX USART3 config aligned with ESP32 `Serial.begin(...)` |
+| ESP32 serial binding | `Serial.begin(9600, SERIAL_8N1, PA5, PA4)` | Type-C/USB tests pass but external STM32 wiring has no effect | reflash ESP32 firmware with PA5/PA4 binding |
+| Startup link command | STM32 sends `55 55 02 18` and receives/prints ACK when ESP32 supports it | ESP32 firmware did not include custom command or USART3 RX path is broken | verify ESP32 custom command `APP_STM32_LINK_MODE = 24` and wiring |
+| Version query | STM32 sends `55 55 02 01`, ESP32 replies `55 55 04 01 ...` | half-duplex direction, RX wiring, or ESP32 PC/BLE task is wrong | inspect STM32 USART3 RX, ESP32 `PC_BLE_Task`, and any debug prints on `Serial` |
+| Motion frame | `55 55 05 06 03 01 00` moves the arm if action group 3 exists | bridge works but stored action group is missing/invalid | test reset/read/version first, then verify ESP32 action group storage |
+| CR/LF handling | STM32 accepts trailing `0D 0A` but queues only protocol bytes | serial assistant “send newline” makes frames silently fail | trim line endings after length validation, never forward them to ESP32 |
+| Reply visibility | STM32 prints reply diagnostics on `USART1` | user cannot distinguish no-reply from no-forwarding | add short timeout reply read and stable `[ARM]` logs |
+
+#### 5. Good / Base / Bad Cases
+
+- Good:
+  - `USART1` receives raw bytes and dispatches LeArm frames before text command normalization
+  - `RobotArmService_Task` owns `USART3` arm transmission
+  - ESP32 factory firmware binds `Serial` to `PA5/PA4`
+  - STM32 sends `55 55 02 18` and `55 55 02 01` at startup
+  - user can see `[ARM]` queue/TX/reply logs on `USART1`
+  - hardware test proves STM32-originated commands make the arm move
+- Base:
+  - only one-way motion commands are needed
+  - ESP32 replies are still logged when query commands are used
+  - motion commands do not block waiting for replies that the firmware does not send
+- Bad:
+  - connect STM32 to ESP32 Type-C/USB expectations while the firmware listens on PA5/PA4
+  - call `Serial.begin(9600)` without pin binding and expect PA5/PA4 to work
+  - configure PA5/PA4 as normal GPIO outputs before using them as UART pins
+  - leave active `Serial.println(...)` debug text on the same PA5/PA4 binary protocol port
+  - reject valid LeArm frames because the serial assistant appended `0D 0A`
+  - forward `0D 0A` to ESP32 as if they were protocol bytes
+
+#### 6. Tests Required
+
+- Static code review:
+  - assert that STM32 arm frames enter through `UartCommand_FetchRaw(...)`
+  - assert that LeArm frame validation uses `Length + 2`
+  - assert that trailing `\r\n` is accepted but not forwarded
+  - assert that only `RobotArmService_Task` owns arm-port `HAL_UART_Transmit(&huart3, ...)`
+- ESP32 firmware review:
+  - assert that `Serial.begin(9600, SERIAL_8N1, PA5, PA4)` is present
+  - assert that active code paths on PA5/PA4 do not emit ASCII debug text through `Serial.print*`
+  - assert that `APP_STM32_LINK_MODE = 24` returns a deterministic ACK if the startup command is used
+- Startup hardware test:
+  - power both boards with common ground
+  - observe STM32 `USART1` logs for startup link-mode TX and version-query TX
+  - assert that ESP32 reply diagnostics appear for query-capable commands
+- Motion hardware test:
+  - send `55 55 05 06 03 01 00` from the upstream port
+  - assert that STM32 logs the frame as queued and transmitted
+  - assert that the mechanical arm executes the expected action group
+- Negative test:
+  - send the same frame with serial-assistant “append newline” enabled
+  - assert that STM32 still queues `tx_len=7` and the arm still moves
+
+#### 7. Wrong vs Correct
+
+##### Wrong
+
+```c
+/*
+ * Wrong:
+ * 1. ESP32 keeps default Serial pins, so PA5/PA4 wiring cannot receive STM32 bytes.
+ * 2. PA5/PA4 are configured as GPIO outputs before being used as UART pins.
+ * 3. ASCII debug text shares the binary protocol port.
+ */
+pinMode(PA4, OUTPUT);
+pinMode(PA5, OUTPUT);
+Serial.begin(9600);
+Serial.println("begin");
+```
+
+##### Correct
+
+```c
+/*
+ * Correct:
+ * 1. ESP32 binds Serial to the external STM32 UART header.
+ * 2. PA5 is ESP32 RX and PA4 is ESP32 TX.
+ * 3. The port is reserved for binary LeArm frames after setup.
+ */
+Serial.begin(9600, SERIAL_8N1, PA5, PA4);
+pc_ble_obj.init(0);
+```
+
+##### Wrong
+
+```c
+/* Wrong: require the DMA frame length to exactly equal the LeArm length, so newline-appended HEX frames fail. */
+expected_total_length = frame_buffer[2] + 2U;
+if (expected_total_length != frame_length)
+{
+    return 0U;
+}
+```
+
+##### Correct
+
+```c
+/*
+ * Correct:
+ * 1. Calculate the protocol length from the LeArm length field.
+ * 2. Permit only CR/LF after the protocol frame.
+ * 3. Queue only the true protocol bytes to USART3.
+ */
+protocol_length = frame_buffer[2] + 2U;
+for (suffix_index = protocol_length; suffix_index < frame_length; ++suffix_index)
+{
+    if ((frame_buffer[suffix_index] != '\r') && (frame_buffer[suffix_index] != '\n'))
+    {
+        return 0U;
+    }
+}
+queued_frame.length = protocol_length;
+```
+
+### Common Mistake: Treating the ESP32 Type-C serial path as the PA5/PA4 STM32 path
+
+**Symptom**: The ESP32 responds when connected through its Type-C programming/serial interface, but the mechanical arm does not respond when STM32 sends the same bytes through USART3.
+
+**Cause**: ESP32 factory firmware may use default `Serial.begin(9600)` unless explicitly rebound. That listens on the default serial path, not the PA5/PA4 external header used by STM32.
+
+**Fix**: Rebuild and flash the ESP32 firmware with `Serial.begin(9600, SERIAL_8N1, PA5, PA4)`, wire `STM32 PD8 -> ESP32 PA5`, `STM32 PD9 <- ESP32 PA4`, and share ground.
+
+**Prevention**: Any future ESP32 firmware change for this arm must document which physical pins own `Serial`, and must not rely on Type-C test success as proof that STM32 wiring works.
+
 ### Scenario: CubeMX-Managed Heartbeat Task and Board LED Ownership
 
 #### 1. Scope / Trigger
@@ -658,6 +853,7 @@ For timing-sensitive changes, also verify interrupt priority and RTOS interactio
 
 - Trigger: any change that requires proving the `MDK-ARM` project still builds after source, group, include-path, or file-list updates
 - Trigger: any debugging session where Keil command-line output looks incomplete, stale, or does not clearly prove linker success
+- Trigger: deciding whether build verification is AI-owned or user-owned for the current session
 
 #### 2. Signatures
 
@@ -669,6 +865,8 @@ For timing-sensitive changes, also verify interrupt priority and RTOS interactio
   - `MDK-ARM/bisai_f407_project/bisai_f407_project.axf`
 - Secondary artifact:
   - `MDK-ARM/bisai_f407_project/bisai_f407_project.hex`
+- User-owned verification statement:
+  - if the user explicitly says they will compile in Keil and provide the result, do not run Keil CLI in that turn
 
 #### 3. Contracts
 
@@ -682,6 +880,10 @@ For timing-sensitive changes, also verify interrupt priority and RTOS interactio
   - `FromELF: creating hex file...`
   - `"bisai_f407_project\bisai_f407_project.axf" - 0 Error(s), 0 Warning(s).`
 - Terminal stdout alone is not a sufficient success contract when the CLI wrapper does not refresh output reliably.
+- Build ownership must respect the user's latest instruction:
+  - if the user asks the assistant to build, use the log/artifact contract above
+  - if the user says they will compile and send the result, do not run Keil CLI; report that build verification is pending user-provided evidence
+  - when the user later provides Keil output, evaluate that output against the same error/warning/log evidence instead of rerunning by default
 
 #### 4. Validation & Error Matrix
 
@@ -693,6 +895,7 @@ For timing-sensitive changes, also verify interrupt priority and RTOS interactio
 | log contains `.axf` with `0 Error(s), 0 Warning(s)` | present | linker may have failed or log is stale | treat build as failed or stale |
 | `.axf` timestamp | matches current rebuild window | previous binary is being reused as stale evidence | do not use it as proof |
 | `.hex` timestamp | updated with `.axf` | FromELF stage may not have completed | inspect build log and fix target settings |
+| User-owned build instruction | no assistant-run Keil command in that turn | assistant wastes time or conflicts with user's local workflow | wait for user-provided Keil output and evaluate it |
 
 #### 5. Good / Base / Bad Cases
 
@@ -704,11 +907,14 @@ For timing-sensitive changes, also verify interrupt priority and RTOS interactio
   - terminal output is short or looks incomplete
   - but `build_log.htm` is refreshed and contains complete success evidence
   - result may still be accepted
+  - user explicitly says they will compile and provide the result
+  - assistant records build verification as pending and does not invoke Keil
 - Bad:
   - only terminal text is checked
   - no refreshed `build_log.htm`
   - or `.axf` timestamp is old
   - or success claim is made without linker evidence
+  - user says not to compile, but assistant runs Keil anyway
 
 #### 6. Tests Required
 
@@ -723,6 +929,9 @@ For timing-sensitive changes, also verify interrupt priority and RTOS interactio
   - assert that `MDK-ARM/bisai_f407_project/bisai_f407_project.hex` is regenerated
 - Change-scope verification test:
   - when adding new user modules, assert that their corresponding `.o` files are regenerated in the same rebuild window
+- User-owned verification test:
+  - if the user says they will compile, assert that no Keil command is run by the assistant
+  - when the user provides the build output, assert that it contains `0 Error(s)` and inspect any warning count before claiming success
 
 #### 7. Wrong vs Correct
 
@@ -731,6 +940,7 @@ For timing-sensitive changes, also verify interrupt priority and RTOS interactio
 - Run a CLI build once, see partial terminal output, and immediately claim success.
 - Use an old `.axf` timestamp as proof after changing project files.
 - Treat `UV4.exe` terminal refresh behavior as authoritative evidence when the log file was not checked.
+- Run Keil after the user explicitly says they will compile and provide the result.
 
 ##### Correct
 
@@ -738,6 +948,7 @@ For timing-sensitive changes, also verify interrupt priority and RTOS interactio
 - Read `MDK-ARM/bisai_f407_project/bisai_f407_project.build_log.htm` as the primary build record.
 - Confirm current-run `.axf` and `.hex` timestamps before declaring the build passed.
 - When the terminal output is incomplete, trust refreshed artifacts and the build log, not the shell transcript.
+- When the user owns compilation for the session, wait for their Keil output and evaluate that evidence instead of rebuilding locally.
 
 ### Common Mistake: Treating terminal output as the only build evidence
 

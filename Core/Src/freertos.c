@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "conveyor_motor_service.h"
 #include "ldc1614_service.h"
+#include "robot_arm_service.h"
 #include "system_heartbeat_service.h"
 #include "weight_service.h"
 
@@ -69,20 +70,31 @@ static const osThreadAttr_t heartbeatTask_attributes = {
   .priority = (osPriority_t) osPriorityLow, /* 低优先级避免心跳显示影响称重、LDC 检测和电机控制等业务任务。 */
 };
 
+/* 机械臂转发任务句柄保留在用户区，负责把 USART1 收到的 LeArm 协议帧异步转发到 USART3。 */
+static osThreadId_t robotArmTaskHandle = NULL;
+
+/* 机械臂转发任务只处理短帧队列和 USART3 阻塞发送，USART3 当前按 9600 8N1 对接 ESP32 出厂固件 PC 模式。 */
+/* 栈和优先级保持在普通业务任务级别，避免机械臂短帧转发影响称重、电感检测等更高实时性路径。 */
+static const osThreadAttr_t robotArmTask_attributes = {
+  .name = "robotArmTask",                  /* 任务名称用于 RTOS 调试视图中识别机械臂 USART1->USART3 转发线程。 */
+  .stack_size = 256 * 4,                   /* 任务内含队列帧缓存和 HAL_UART_Transmit 调用链，预留 256 word 栈空间。 */
+  .priority = (osPriority_t) osPriorityNormal, /* 普通优先级保证机械臂命令及时转发，同时不压制更高实时性采样或中断回调。 */
+};
+
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
-  .name = "defaultTask",                   /* 默认任务名称，当前用于承载 WeightService_Task 的称重业务入口。 */
-  .stack_size = 128 * 4,                   /* 默认任务栈大小按字节配置，需覆盖称重服务入口的基础调用链。 */
-  .priority = (osPriority_t) osPriorityNormal, /* 普通优先级让称重业务与传送带控制处于同一调度层级。 */
+  .name = "defaultTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for ldc1614Task */
 osThreadId_t ldc1614TaskHandle;
 const osThreadAttr_t ldc1614Task_attributes = {
-  .name = "ldc1614Task",                   /* LDC1614 检测任务名称，用于调试器区分电感检测线程。 */
-  .stack_size = 256 * 4,                   /* LDC 检测包含采样、滤波和状态机处理，预留比默认任务更大的栈。 */
-  .priority = (osPriority_t) osPriorityBelowNormal, /* 低于普通业务优先级，避免连续检测逻辑影响称重和电机控制响应。 */
+  .name = "ldc1614Task",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityBelowNormal,
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -96,15 +108,9 @@ void StartLdc1614Task(void *argument);
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
 /**
-  * @brief  初始化 FreeRTOS 对象并创建本工程启动阶段需要运行的任务。
+  * @brief  FreeRTOS initialization
   * @param  None
   * @retval None
-  *
-  * 主要流程：
-  * 1. 保留 CubeMX 生成的互斥量、信号量、定时器和队列扩展区；
-  * 2. 创建默认任务和 LDC1614 任务；
-  * 3. 在用户区创建传送带电机任务和心跳灯任务；
-  * 4. 对关键任务创建失败路径调用 Error_Handler，避免系统以缺失任务的状态继续启动。
   */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
@@ -155,6 +161,26 @@ void MX_FREERTOS_Init(void) {
      * 心跳灯任务本身不参与业务控制，
      * 但它承担“调度器是否活着”的现场可视化观察职责。
      * 如果这里都创建失败，说明当前系统资源已经异常，仍然按致命错误处理。
+     */
+    Error_Handler();
+  }
+
+  /* 机械臂服务先创建队列，再启动转发任务，确保 USART1 收到 `55 55 ...` 帧后有可投递的目标。 */
+  if (RobotArmService_Init() == 0U)
+  {
+    /*
+     * 机械臂队列创建失败说明 FreeRTOS 堆空间不足。
+     * 此时即使 USART1 还能收到命令，也无法安全异步转发到 USART3，因此直接进入统一错误处理。
+     */
+    Error_Handler();
+  }
+
+  robotArmTaskHandle = osThreadNew(RobotArmService_Task, NULL, &robotArmTask_attributes);
+  if (robotArmTaskHandle == NULL)
+  {
+    /*
+     * 机械臂转发任务是 STM32 与 ESP32 机械臂控制链路的执行端。
+     * 若任务创建失败，机械臂命令会停留在队列中无法发送，所以按关键业务任务失败处理。
      */
     Error_Handler();
   }

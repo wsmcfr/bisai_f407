@@ -13,6 +13,28 @@
 #include <string.h>
 
 /**
+ * @brief LDC1614 串口标定命令速查。
+ *
+ * 通信入口：
+ * - 用户通过 USART1 发送 ASCII 文本命令；
+ * - `weight_service.c` 先完成统一接收和大小写规范化，再调用 `Ldc1614Service_HandleCommand()`；
+ * - 本文件不直接读取 USART1 DMA 缓存，避免和其它服务抢同一帧命令。
+ *
+ * 用户可发送的 LDC 命令：
+ * | 命令 | 参数含义 | 硬件效果 | 典型返回 |
+ * | --- | --- | --- | --- |
+ * | `LDCCAL CH1` | 标定通道 1，使用默认采样数 `LDC1614_SERVICE_CAL_DEFAULT_COUNT` | 不驱动机械结构；要求用户把工件放在 CH1 对应检测位置并保持不动 | `[OK][LDC] Calibration sampling armed...`，随后输出样本和 summary |
+ * | `LDCCAL CH2 20` | 标定通道 2，采集 20 个稳定样本 | 同上，目标为 CH2 | `[CAL][LDC] CH2 sample ...` 和 summary |
+ * | `LDCCAL 1 10` | 数字通道写法，等价于 CH1，采集 10 个稳定样本 | 同上 | 同上 |
+ * | `LDCSTOP` | 无参数，停止当前标定采样会话 | 不改变传感器配置，只取消当前软件会话 | `[OK][LDC] Calibration sampling stopped.` |
+ *
+ * 标定语义：
+ * - `N` 表示“一次稳定放置后采集 N 个样本”，不是让用户重复放置 N 次；
+ * - 如果采集过程中工件移开，本次会话不会发布错误参考值，用户应重新发送 `LDCCAL ...`；
+ * - 正常缺陷检测结果会在任务采样状态机中通过 `[RESULT][LDC] ... OK/DEFECT` 输出。
+ */
+
+/**
  * @brief 等待 LDC1614 INTB 事件的最长时间，单位毫秒。
  *
  * 该超时只是为了防止任务永久阻塞，不代表超时一定是硬件故障。
@@ -191,10 +213,10 @@
  */
 typedef enum
 {
-    LDC1614_SERVICE_STATE_IDLE = 0,
-    LDC1614_SERVICE_STATE_SETTLING,
-    LDC1614_SERVICE_STATE_MEASURING,
-    LDC1614_SERVICE_STATE_WAIT_REMOVE
+    LDC1614_SERVICE_STATE_IDLE = 0,   /* 空闲等待状态，持续监测基线变化，判断是否有工件进入。 */
+    LDC1614_SERVICE_STATE_SETTLING,   /* 放稳等待状态，检测到工件后先延时，避免机械晃动污染测量窗口。 */
+    LDC1614_SERVICE_STATE_MEASURING,  /* 稳定测量状态，连续采集窗口样本并计算平均/极差用于判定。 */
+    LDC1614_SERVICE_STATE_WAIT_REMOVE /* 结果已上报状态，等待工件移出检测区域后重新进入 IDLE。 */
 } LDC1614_ServiceState_t;
 
 /**
