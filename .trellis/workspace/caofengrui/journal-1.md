@@ -299,3 +299,43 @@ Fixed robot arm UART diagnostics after human testing: made ARMCC5-safe ASCII run
 ### Next Steps
 
 - None - task complete
+
+
+## Session 8: Robot arm MaixCAM2 vision and vacuum wiring plan
+
+**Date**: 2026-05-09
+**Task**: Robot arm MaixCAM2 vision and vacuum wiring plan
+**Branch**: `main`
+
+### Summary
+
+Documented the robot-arm end-effector architecture: F4 remains the high-level coordinator, ESP32 owns MaixCAM2 vision-result consumption, visual pick state, bus-servo motion, and PWM-controlled vacuum pump/release valve. Added wiring summary and updated frontend component code-spec with executable contracts, validation matrix, and test points.
+
+### Main Changes
+
+| Area | Details |
+|------|---------|
+| Wiring documentation | Added `docs/robot-arm-vision-vacuum-wiring.md` with F4-ESP32 J2 wiring, MaixCAM2 I2C path, suction pump and release valve PWM electronic-switch wiring, connector ownership, and power/common-ground requirements. |
+| Code-spec memory | Added the `End-Effector Vision and Vacuum Gripper Integration` scenario to `.trellis/spec/frontend/component-guidelines.md`, including controller ownership, payload fields, validation matrix, good/base/bad cases, and required tests. |
+| Architecture decision | Captured that STM32F407 remains the high-level coordinator while ESP32 owns MaixCAM2 result consumption, arm motion, vacuum pump control, release valve control, and pick-state progression. |
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `05fd1a5` | docs(arm): record vision vacuum wiring plan |
+
+### Testing
+
+- [OK] Reviewed `D:\机械臂\SCH_3in1 Servo Controller V3.1.pdf` and ESP32 `Config.h` to confirm J2, I2C, bus-servo, PWM-servo, and GPIO ownership.
+- [OK] Verified the committed diff only included the wiring document and frontend code-spec update.
+- [NO] No hardware wiring, firmware compile, or on-board pick test was performed in this documentation session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Implement the ESP32 MaixCAM2 I2C reader, visual pick state machine, and vacuum pump/release-valve control after hardware wiring is finalized.
+- Add STM32F407 `ARMGRAB/ARMSTOP/ARMSTATUS` commands only after the ESP32 command IDs and status frames are fixed.
