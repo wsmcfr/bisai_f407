@@ -68,7 +68,7 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin : LDC1614_INTB_Pin */
   GPIO_InitStruct.Pin = LDC1614_INTB_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(LDC1614_INTB_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PB0 */

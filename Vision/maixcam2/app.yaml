@@ -1,0 +1,45 @@
+id: test
+name: test
+version: 1.0.0
+author: cfr
+icon: ''
+desc: test
+files:
+  - reference\docs\robot-arm-vision-vacuum-wiring.md
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\src\buzzer\Buzzer.cpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\src\led\Led.cpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\src\PC_BLE\PC_BLE_CTL.cpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\src\PC_BLE\PC_BLE_CTL.hpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\src\robot_arm\Flash_ctl.cpp
+  - >-
+    reference\esp32_factory_base\LeArm_ESP32_Arduino\src\robot_arm\kinematics.cpp
+  - >-
+    reference\esp32_factory_base\LeArm_ESP32_Arduino\src\robot_arm\kinematics.hpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\src\robot_arm\Pwmservo.cpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\src\robot_arm\Robot_arm.cpp
+  - >-
+    reference\esp32_factory_base\LeArm_ESP32_Arduino\src\robot_arm\SerialServo.cpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\src\robot_arm\Servo.cpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\src\robot_arm\Servo.h
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\Config.h
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\Hiwonder.hpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\IIC.cpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\IIC.hpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\LeArm_ESP32_Arduino.ino
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\LeArm_Kinematics.hpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\Robot_arm.hpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\vision_i2c_link.cpp
+  - reference\esp32_factory_base\LeArm_ESP32_Arduino\vision_i2c_link.hpp
+  - reference\stm32_bridge\robot_arm_service.c
+  - reference\stm32_bridge\robot_arm_service.h
+  - reference\README.md
+  - tests\test_vision_core.py
+  - __init__.py
+  - app.yaml
+  - i2c_line_monitor.py
+  - i2c_probe_with_camera.py
+  - i2c_probe.py
+  - main.py
+  - README.md
+  - vision_core.py
+  - vision_settings.json

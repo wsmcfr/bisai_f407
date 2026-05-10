@@ -18,3 +18,10 @@ HX711相关资料/
 HAL_Emm_TTL/
 ldc1614电感检测模块/
 M144Z-M4最小系统板IO引脚分配表——STM32F407版.xlsx
+
+# Python 缓存和本地生成产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+tmp/
+Vision/maixcam2/dist/
