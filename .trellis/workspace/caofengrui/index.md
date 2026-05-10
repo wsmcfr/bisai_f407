@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 8
-- **Last Active**: 2026-05-09
+- **Total Sessions**: 9
+- **Last Active**: 2026-05-10
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~334 | Active |
+| `journal-1.md` | ~386 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 9 | 2026-05-10 | MaixCAM2视觉I2C联调与跟踪状态记录 | uncommitted | `main` |
 | 8 | 2026-05-09 | Robot arm MaixCAM2 vision and vacuum wiring plan | `05fd1a5` | `main` |
 | 7 | 2026-05-01 | Record robot arm UART recovery and diagnostics | `3b76725` | `main` |
 | 6 | 2026-05-01 | STM32 LeArm 串口桥接与协议注释沉淀 | `d092c0f` | `main` |

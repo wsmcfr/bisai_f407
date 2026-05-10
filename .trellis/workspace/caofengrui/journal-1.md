@@ -91,15 +91,20 @@ Implemented the FreeRTOS weight-query firmware changes, but this session did not
 
 ### Testing
 
-- [OK] (Add test results)
+- [OK] 记录此前已通过 `python -m unittest Vision.maixcam2.tests.test_vision_core`。
+- [OK] 记录此前 ESP32 Arduino 工程可编译通过。
+- [WARN] 当前未重新运行 Keil/MDK；STM32 工程改动等待用户在 Keil 中验证。
+- [WARN] 当前视觉跟踪控制效果未验收，后续仍需继续调试。
 
 ### Status
 
-[OK] **Completed**
+[WARN] **Session recorded; tracking control remains open**
 
 ### Next Steps
 
-- None - task complete
+- 固定 I2C6 A1/A0 与 ESP-IDF slave，不再重复改线或改回 Arduino Wire slave。
+- 采集 Maix `dx/dy/area` 与 ESP32 `[VISION_ARM]` 日志，先做 base-only 底座居中调试。
+- 底座跟踪流畅后，再低频加入伸缩、高度和抓取控制。
 
 
 ## Session 3: 仓库规范化与构建产物清理
@@ -339,3 +344,48 @@ Documented the robot-arm end-effector architecture: F4 remains the high-level co
 
 - Implement the ESP32 MaixCAM2 I2C reader, visual pick state machine, and vacuum pump/release-valve control after hardware wiring is finalized.
 - Add STM32F407 `ARMGRAB/ARMSTOP/ARMSTATUS` commands only after the ESP32 command IDs and status frames are fixed.
+
+
+## Session 9: MaixCAM2视觉I2C联调与跟踪状态记录
+
+**Date**: 2026-05-10
+**Task**: MaixCAM2视觉I2C联调与跟踪状态记录
+**Branch**: `main`
+
+### Summary
+
+记录 MaixCAM2 颜色识别、I2C6 到 ESP32 通讯打通、卡顿优化经验，以及当前视觉跟踪控制仍需继续优化的状态。
+
+### Main Changes
+
+| 模块 | 本次记录内容 |
+|------|--------------|
+| MaixCAM2视觉工程 | 创建 `Vision/maixcam2`，包含主程序、阈值设置、I2C探测脚本、README、测试和参考代码目录。 |
+| 颜色识别 | 默认追踪颜色切换为黄色，使用用户提供的 LAB 阈值 `L=55..100, A=-80..20, B=40..127`；阈值调节长按步进周期改为 100ms。 |
+| 触摸界面 | 保留二值化调参界面与追踪抓取界面，修正触摸点击和长按调节体验。 |
+| I2C链路 | 经过多轮排查，确定 MaixCAM2 使用 I2C6，`A1=SCL`、`A0=SDA`、50kHz；ESP32 使用 ESP-IDF 原生 I2C slave，`GPIO16=SCL`、`GPIO17=SDA`、地址 `0x42`。 |
+| 卡顿问题 | 记录经验：Maix 主循环不能直接阻塞式扫总线或写 I2C，I2C 操作必须放到 worker，失败后关闭 LINK，避免画面卡死。 |
+| ESP32机械臂程序 | 将机械臂相关源码复制到 `Vision/maixcam2/reference/esp32_factory_base/LeArm_ESP32_Arduino`，补齐 Arduino IDE 直接打开所需依赖，并加入视觉 I2C 接收逻辑。 |
+| 当前遗留问题 | 通讯层已经打通，但视觉跟踪控制效果仍未验收：目标偏离中心时动作小/停止，前端舵机抖动明显，后续应先采集 `dx/dy/area` 与 `[VISION_ARM]` 日志再调控制律。 |
+| 验证记录 | 已记录曾通过 `python -m unittest Vision.maixcam2.tests.test_vision_core`，以及 ESP32 Arduino 编译通过；当前会话未重新运行 Keil/MDK。 |
+
+**下一次继续建议**：固定 I2C 不再反复换线；先做 base-only 底座居中调试，确认 Maix 的 `dx/dy/area` 和 ESP32 日志方向一致，再低频加入伸缩和高度控制。
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `uncommitted` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
