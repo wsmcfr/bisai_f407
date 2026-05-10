@@ -376,7 +376,8 @@ Documented the robot-arm end-effector architecture: F4 remains the high-level co
 
 | Hash | Message |
 |------|---------|
-| `uncommitted` | (see git log) |
+| `997d194` | chore: record MaixCAM2 vision i2c session |
+| `b7a6b0c` | feat(vision): add MaixCAM2 color tracking link |
 
 ### Testing
 

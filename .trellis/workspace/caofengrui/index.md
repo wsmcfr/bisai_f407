@@ -29,7 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
-| 9 | 2026-05-10 | MaixCAM2视觉I2C联调与跟踪状态记录 | uncommitted | `main` |
+| 9 | 2026-05-10 | MaixCAM2视觉I2C联调与跟踪状态记录 | `997d194`, `b7a6b0c` | `main` |
 | 8 | 2026-05-09 | Robot arm MaixCAM2 vision and vacuum wiring plan | `05fd1a5` | `main` |
 | 7 | 2026-05-01 | Record robot arm UART recovery and diagnostics | `3b76725` | `main` |
 | 6 | 2026-05-01 | STM32 LeArm 串口桥接与协议注释沉淀 | `d092c0f` | `main` |
