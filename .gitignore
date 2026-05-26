@@ -19,6 +19,13 @@ HAL_Emm_TTL/
 ldc1614电感检测模块/
 M144Z-M4最小系统板IO引脚分配表——STM32F407版.xlsx
 
+# 本地 AI 工具配置与板级导出文件
+.claude/
+BOM_*.xlsx
+Gerber_*.zip
+Netlist_*.tel
+ProPrj_*.epro2
+
 # Python 缓存和本地生成产物
 __pycache__/
 *.py[cod]
