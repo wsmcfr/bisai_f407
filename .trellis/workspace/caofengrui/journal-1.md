@@ -390,3 +390,58 @@ Documented the robot-arm end-effector architecture: F4 remains the high-level co
 ### Next Steps
 
 - None - task complete
+
+
+## Session 10: STM32F407 peripheral DMA and serial link update
+
+**Date**: 2026-05-26
+**Task**: STM32F407 peripheral DMA and serial link update
+**Branch**: `main`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| 项目 | 本次记录 |
+|---|---|
+| 固件验证 | 用户在 Keil/MDK-ARM 编译通过：`0 Error(s), 0 Warning(s)`，生成 axf/hex。 |
+| Git 提交 | `e7d7ab4 feat(firmware): update peripheral links and DMA IO`，已推送到 `origin/main`。 |
+| LDC1614 I2C | I2C2 改为 PF0/PF1，INTB 改为 PF2 EXTI 下降沿；I2C2 RX/TX 启用 DMA；驱动读写改为 `HAL_I2C_Mem_Read_DMA` / `HAL_I2C_Mem_Write_DMA`，通过 FreeRTOS 静态二值信号量等待 DMA/I2C 回调完成。 |
+| 机械臂 ESP32 | USART3 与 ESP32 PA5/PA4 串口统一为 115200 8N1，源码、CubeMX `.ioc`、运行日志和参考文档均同步。 |
+| 传送带 Emm42 | 旧 USART2/PA2/PA3 链路迁移到 USART6/PC6/PC7；`ConveyorMotorService_Task()` 绑定 `huart6`，驱动注释、启动日志和 Emm42 代码指南同步更新。 |
+| MP157 心跳 | 新增 `User/App/mp157_f4_heartbeat.md` 记录 F407 USART1 `STATUS\r\n` 心跳协议和验证方式。 |
+| Vision/ESP32 参考 | MaixCAM2/ESP32 参考侧同步串口波特率和相关说明，避免后续资料回拷时恢复旧 9600。 |
+| 未纳入提交 | `.claude/`、BOM、Gerber、网表和 EasyEDA 工程导出文件仍保持未跟踪本地状态。 |
+
+**关键文件**：
+- `bisai_f407_project.ioc`
+- `Core/Src/i2c.c`
+- `Core/Src/usart.c`
+- `Core/Src/stm32f4xx_it.c`
+- `Core/Src/freertos.c`
+- `User/Driver/ldc1614.c`
+- `User/App/conveyor_motor_service.c`
+- `User/Driver/emm42_motor.c`
+- `User/App/robot_arm_service.c`
+- `Vision/maixcam2/reference/esp32_factory_base/LeArm_ESP32_Arduino/LeArm_ESP32_Arduino.ino`
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e7d7ab4` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
