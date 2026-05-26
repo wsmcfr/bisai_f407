@@ -15,6 +15,7 @@
  * 用户真正能从 USART1 发送的命令由上层服务解释，维护时必须按下面索引同步更新：
  * | 命令类型 | 示例 | 处理文件 | 主要效果 | 是否回包 |
  * | --- | --- | --- | --- | --- |
+ * | MP157 心跳命令 | `STATUS` | `weight_service.c` | 查询 STM32F407 主任务和 USART1 命令入口是否仍在线 | 是，返回 `[OK][F4] READY` |
  * | 称重文本命令 | `GET` / `TARE` / `CAL 1000` | `weight_service.c` | 查询重量、重新去皮、用已知砝码标定比例 | 是，返回 `[DATA]` / `[OK]` / `[ERROR]` 文本 |
  * | LDC 标定命令 | `LDCCAL CH1 20` / `LDCSTOP` | `ldc1614_service.c` | 启动或停止 LDC 单件稳定采样标定 | 是，返回 `[OK]` / `[INFO]` / `[ERROR]` 文本 |
  * | 传送带命令 | `BELTSCAN` / `BELTSTOP` / `BELTTRACK 80` / `BELTINFO` | `conveyor_motor_service.c` | 切换巡航、停止、按视觉误差跟踪或查询状态 | 部分命令立即回包，运动命令可用 `BELTINFO` 查询 |

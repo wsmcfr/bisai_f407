@@ -12,7 +12,7 @@ extern "C" {
  * @param argument FreeRTOS 任务参数，当前未使用。
  *
  * 该任务负责：
- * 1. 独占 `USART2` 作为 Emm42 TTL 控制口；
+ * 1. 独占 `USART6` 作为 Emm42 TTL 控制口，PC6(TX) 接 Emm42 RX、PC7(RX) 接 Emm42 TX；
  * 2. 初始化电机驱动，并在启动阶段恢复当前工程要求的控制模式；
  * 3. 使能电机并把电机拉回到已知静止态；
  * 4. 维护 `SCAN / TRACK / STOP` 三态控制；

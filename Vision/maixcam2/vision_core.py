@@ -352,6 +352,111 @@ def pick_largest_valid_blob(
     )
 
 
+def pick_best_blob_with_continuity(
+    blobs: Iterable[BlobCandidate],
+    min_pixels: int,
+    pickup_u: int,
+    pickup_v: int,
+    max_offset_px: int,
+    prev_cx: Optional[int] = None,
+    prev_cy: Optional[int] = None,
+    area_weight_num: int = 70,
+    distance_weight_num: int = 30,
+) -> Optional[VisionTarget]:
+    """从候选色块中按"面积 + 跨帧连续性"综合评分挑选目标。
+
+    参数：
+    - blobs：MaixPy `find_blobs` 结果转换出的候选目标序列；
+    - min_pixels：最小有效像素面积，小于该值视作噪声；
+    - pickup_u/pickup_v：抓取参考点像素坐标；
+    - max_offset_px：允许上报的最大偏差，超过该值认为目标偏离抓取区域；
+    - prev_cx/prev_cy：上一帧锁定目标的中心坐标，None 表示当前没有可参考位置；
+    - area_weight_num：面积分占比，0-100，70 表示 70% 权重；
+    - distance_weight_num：与上帧距离分占比，0-100，30 表示 30% 权重。
+
+    返回值：
+    - 找到有效目标时返回 `VisionTarget`；
+    - 没有满足面积/偏差要求的目标时返回 `None`。
+
+    设计原因：
+    - 单纯按面积选最大时，目标静止后只要背景里出现一帧更大的同色干扰，
+      上层平滑就被瞬间拉到错误位置；
+    - 引入"与上帧距离越近得分越高"的惩罚项，可以避免被远处碎片抢走；
+    - prev_cx/prev_cy 缺失时退化为按面积选最大，与 `pick_largest_valid_blob`
+      行为一致，便于首次锁定阶段直接复用。
+
+    副作用：无。该函数只做纯计算，不直接画框或发 I2C。
+    """
+    valid_blobs = []
+    for blob in blobs:
+        if blob.pixels < min_pixels:
+            continue
+
+        dx_px = blob.cx - pickup_u
+        dy_px = blob.cy - pickup_v
+        if (abs(dx_px) > max_offset_px) or (abs(dy_px) > max_offset_px):
+            continue
+
+        valid_blobs.append(blob)
+
+    if not valid_blobs:
+        return None
+
+    # 没有上帧位置时，退化为按面积选最大，保持与旧 pick_largest_valid_blob 一致的语义。
+    if (prev_cx is None) or (prev_cy is None):
+        best_blob = valid_blobs[0]
+        for blob in valid_blobs[1:]:
+            if blob.pixels > best_blob.pixels:
+                best_blob = blob
+    else:
+        # 计算面积分母时使用本帧最大像素数，保证分数都落在 0~100 区间。
+        max_pixels = max(blob.pixels for blob in valid_blobs)
+        if max_pixels <= 0:
+            max_pixels = 1
+
+        # 距离分使用 (max_offset_px * 2) 作为参考最大距离，避免溢出。
+        max_dist_sq = max(1, (2 * max_offset_px) * (2 * max_offset_px))
+        weight_den = max(1, area_weight_num + distance_weight_num)
+
+        best_blob = None
+        best_score = -1
+        for blob in valid_blobs:
+            area_score = (int(blob.pixels) * 100) // int(max_pixels)
+            ddx = int(blob.cx) - int(prev_cx)
+            ddy = int(blob.cy) - int(prev_cy)
+            dist_sq = ddx * ddx + ddy * ddy
+            distance_score = 100 - (dist_sq * 100) // max_dist_sq
+            if distance_score < 0:
+                distance_score = 0
+
+            total_score = (
+                area_score * area_weight_num + distance_score * distance_weight_num
+            ) // weight_den
+
+            if total_score > best_score:
+                best_score = total_score
+                best_blob = blob
+
+    if best_blob is None:
+        return None
+
+    dx_px = best_blob.cx - pickup_u
+    dy_px = best_blob.cy - pickup_v
+    return VisionTarget(
+        x=best_blob.x,
+        y=best_blob.y,
+        w=best_blob.w,
+        h=best_blob.h,
+        cx=best_blob.cx,
+        cy=best_blob.cy,
+        dx_px=dx_px,
+        dy_px=dy_px,
+        angle_deg=best_blob.angle_deg,
+        area=best_blob.pixels,
+        score=score_from_area(best_blob.pixels, min_pixels),
+    )
+
+
 def score_from_area(area: int, min_pixels: int) -> int:
     """根据目标面积生成 0-100 的粗略置信度。
 

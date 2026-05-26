@@ -65,12 +65,12 @@ typedef enum
  * 2. `address`：电机地址；
  * 3. `tx_timeout_ms`：阻塞发送超时时间。
  *
- * 当前项目约定由“传送带电机任务”独占 `USART2`，
+ * 当前项目约定由“传送带电机任务”独占 `USART6`，
  * 因此驱动层不再额外引入发送互斥锁。
  */
 typedef struct
 {
-    UART_HandleTypeDef *huart;  /* 电机 TTL 通信所绑定的 UART 句柄，当前由传送带电机任务独占 USART2。 */
+    UART_HandleTypeDef *huart;  /* 电机 TTL 通信所绑定的 UART 句柄，当前由传送带电机任务独占 USART6。 */
     uint8_t address;            /* Emm42 电机站号地址，范围由电机协议决定，默认使用地址 1。 */
     uint32_t tx_timeout_ms;     /* 阻塞发送单帧命令的超时时间，单位毫秒，用于限制串口异常时的等待时长。 */
 } EMM42_MotorHandle_t;

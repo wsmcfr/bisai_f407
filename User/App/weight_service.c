@@ -24,6 +24,7 @@
  * | 命令 | 作用 | 是否影响硬件动作 | 典型返回 |
  * | --- | --- | --- | --- |
  * | `GET` | 查询当前 HX711 重量；未标定时返回 raw/delta，已标定时返回 g | 否 | `[DATA][WEIGHT] ...` |
+ * | `STATUS` | 响应 STM32MP157 或串口助手的在线心跳查询 | 否 | `[OK][F4] READY` |
  * | `TARE` | 重新执行 10 次采样去皮，并刷新 offset | 否，但会改变重量零点 | `[OK][WEIGHT] Tare success...` 或错误 |
  * | `CAL <克重>` | 用当前带载值和已知砝码重量标定比例，例如 `CAL 1000` | 否，但会改变称重比例 | `[OK][WEIGHT] Calibration success...` 或拒绝原因 |
  * | `LDCCAL CH1 [N]` / `LDCCAL CH2 [N]` | 转交 LDC 服务，单次放置工件并采集 N 个稳定样本 | 否 | `[OK][LDC] Calibration sampling armed...` |
@@ -392,6 +393,7 @@ static void WeightService_ReportSample(const HX711_Handle_t *hx711,
  *
  * 当前支持以下命令：
  * - `GET`：返回当前重量或净计数差值
+ * - `STATUS`：返回 F4 在线握手状态，供 STM32MP157 判断下位机已接入
  * - `TARE`：重新执行一次去皮
  * - `CAL <克重>`：用当前带载值和已知砝码重量完成标定
  * - `LDCCAL CHx [N]`：启动 LDC 通道的稳定批量采样模式
@@ -451,6 +453,16 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
     if (strcmp(command_buffer, "GET") == 0)
     {
         WeightService_ReportSample(hx711, latest_status, latest_raw_value, *tare_ready);
+    }
+    else if (strcmp(command_buffer, "STATUS") == 0)
+    {
+        /*
+         * STATUS 是 STM32MP157 周期发送的健康探测命令。
+         * 回复中同时包含 OK、F4、READY 三个关键字，匹配 MP157 侧现有
+         * DeviceHealthController 的判断条件；该命令只证明 USART1 命令任务仍可调度，
+         * 不会触发称重去皮、LDC 标定、电机运动或机械臂动作。
+         */
+        my_printf(&huart1, "[OK][F4] READY\r\n");
     }
     else if (strcmp(command_buffer, "TARE") == 0)
     {
@@ -525,7 +537,7 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
          * 日志会被截断并和其它事件日志混在一起，反而更难看清。
          */
         my_printf(&huart1,
-                  "[ERROR][UART] Unknown cmd. Use GET/TARE/CAL/LDCCAL/LDCSTOP/BELTSCAN/BELTSTOP/BELTTRACK/BELTINFO.\r\n");
+                  "[ERROR][UART] Unknown cmd. Use STATUS/GET/TARE/CAL/LDCCAL/LDCSTOP/BELTSCAN/BELTSTOP/BELTTRACK/BELTINFO.\r\n");
     }
 }
 

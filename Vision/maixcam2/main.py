@@ -16,9 +16,11 @@ try:
         LongPressAdjustState,
         THRESHOLD_FIELDS,
         ThresholdConfig,
+        VisionTarget,
         consume_long_press_adjust_step,
         map_display_point_to_image,
         pack_i2c_result_frame,
+        pick_best_blob_with_continuity,
         pick_largest_valid_blob,
     )
 except ImportError:
@@ -28,9 +30,11 @@ except ImportError:
         LongPressAdjustState,
         THRESHOLD_FIELDS,
         ThresholdConfig,
+        VisionTarget,
         consume_long_press_adjust_step,
         map_display_point_to_image,
         pack_i2c_result_frame,
+        pick_best_blob_with_continuity,
         pick_largest_valid_blob,
     )
 
@@ -42,13 +46,31 @@ from maix import app, camera, display, image, time, touchscreen
 CONFIG_PATH = "vision_settings.json"
 CAMERA_WIDTH = 320
 CAMERA_HEIGHT = 240
-MIN_PIXELS = 120
-MAX_OFFSET_PX = 220
-TARGET_SMOOTH_ALPHA_NUM = 45
+# 最小有效色块面积。原值 120 在 320x240 下相当于 0.16% 面积，背景同色碎片很容易超过；
+# 提到 220 后基本能滤掉地面/桌面/墙面级别的低饱和干扰。
+MIN_PIXELS = 220
+# 允许上报的最大偏差。半屏宽 160px，140px 留约 20px 安全裕量；
+# 原值 220 大于半屏宽，导致这条限制对 320x240 图像几乎无效。
+MAX_OFFSET_PX = 140
+
+# 平滑 alpha 三段自适应：静止时极慢平滑用来压制 ±2 像素级别的底层噪声；
+# 慢动用常规平滑保证目标跟随；急动用高响应平滑保证大幅运动不落后。
 TARGET_SMOOTH_ALPHA_DEN = 100
-TARGET_FAST_SMOOTH_ALPHA_NUM = 82
-TARGET_FAST_MOVE_PX = 42
-TARGET_FAST_AREA_DELTA = 420
+TARGET_SMOOTH_ALPHA_STILL_NUM = 20
+TARGET_SMOOTH_ALPHA_SLOW_NUM = 55
+TARGET_SMOOTH_ALPHA_FAST_NUM = 85
+TARGET_MOTION_STILL_PX = 8
+TARGET_MOTION_SLOW_PX = 35
+
+# 跨帧锁定阈值。连续看到 N 帧才视为锁定并上报 found=True，避免单帧误识别让机械臂动作；
+# 丢失 M 帧之内仍按缓存输出虚拟目标，避免一帧丢失就跳一次。
+TARGET_LOCK_FRAMES = 2
+TARGET_LOST_HOLD_FRAMES = 3
+
+# 锁定后下一帧 ROI 半宽/半高，单位像素。覆盖目标本身 + 60% 余量，
+# 既能减少全图扫描带来的背景干扰，也能容忍目标快速横向移动。
+TARGET_ROI_HALF_PX = 60
+
 THRESHOLD_STEP = 1
 LONG_PRESS_REPEAT_MS = 100
 I2C_FREQ_HZ = 50000
@@ -139,17 +161,23 @@ class TargetSmoothState:
 
     说明：
     - MaixCAM2 的色块检测会受光照、反光和二值化边缘影响，同一个物体的中心点会轻微跳动；
-    - 这里对 `cx/cy/area` 做轻量指数平滑，既保留目标从左到右移动时的大幅偏差，
+    - 这里对 `cx/cy/area` 做三段自适应指数平滑，既保留目标从左到右移动时的大幅偏差，
       又避免单帧噪声让 ESP32 机械臂控制来回抖；
-    - 该状态只在主循环中读写，不跨线程共享，I2C 后台线程只拿最终打包后的二进制帧。
+    - 该状态只在主循环中读写，不跨线程共享，I2C 后台线程只拿最终打包后的二进制帧；
+    - `locked_streak` 用来要求"连续看到 N 帧才上报 found=True"，避免单帧误识别让机械臂动作；
+    - `lost_streak` 用来支持"丢失 M 帧内仍按上次平滑结果输出"，避免一帧丢失就跳一次。
     """
 
-    has_target: bool = False      # 是否已有可复用的上一帧平滑目标；目标丢失时置 False。
+    has_target: bool = False      # 是否已有可复用的上一帧平滑目标；目标丢失超过保持窗口时置 False。
     cx: int = 0                   # 平滑后的目标中心 X 坐标，单位像素。
     cy: int = 0                   # 平滑后的目标中心 Y 坐标，单位像素。
     area: int = 0                 # 平滑后的目标面积，单位像素。
     dx_px: int = 0                # 平滑后的 X 偏差，右正左负，单位像素。
     dy_px: int = 0                # 平滑后的 Y 偏差，下正上负，单位像素。
+    last_w: int = 20              # 最近一次实际看到目标时的外接矩形宽度，仅用于丢失保持时还原 VisionTarget。
+    last_h: int = 20              # 最近一次实际看到目标时的外接矩形高度。
+    locked_streak: int = 0        # 当前已连续看到目标的帧数；用于满足 TARGET_LOCK_FRAMES 才视为锁定。
+    lost_streak: int = 0          # 当前已连续丢失目标的帧数；用于决定是否仍在丢失保持窗口内。
 
 
 def point_in_rect(x_pos, y_pos, rect):
@@ -833,17 +861,49 @@ def smooth_target_for_control(target, smooth_state, pickup_u, pickup_v):
     - pickup_u/pickup_v：抓取参考点像素坐标。
 
     返回值：
-    - 识别到目标时返回新的 `VisionTarget`，其中 `cx/cy/dx/dy/area/score` 已经平滑；
-    - 未识别到目标时返回 None，并清空平滑状态。
+    - 识别到目标，或处于丢失保持窗口内时返回 `VisionTarget`，其中 `cx/cy/dx/dy/area/score` 已经平滑；
+    - 已经超出丢失保持窗口时返回 None，调用方应据此清零下游控制量。
 
     设计原因：
     - 原始 `find_blobs()` 每帧会有少量像素级跳动，直接发给机械臂会造成舵机抖动；
-    - 平滑只作用于发送给 ESP32 的控制量和显示文本，不改变阈值调参逻辑；
+    - 静止时 alpha 设到 0.20，让 ±2 像素级别的底层噪声基本不会传到 ESP32；
+    - 急动时 alpha 设到 0.85，让大幅运动不至于被平滑硬拖在后面；
+    - 丢失 1~3 帧时仍按上次平滑结果继续输出，避免单帧误判让机械臂瞬间归零；
     - 使用整数指数平滑，避免在 MaixCAM2 上引入额外浮点开销。
+
+    副作用：
+    - 会原地更新 `smooth_state` 的所有字段，包括锁定计数和丢失计数；
+    - 只读取 pickup_u/pickup_v，不会修改抓取参考点。
     """
     if target is None:
+        # 本帧未识别到目标：在丢失保持窗口内仍输出最后一次平滑结果；超出后才真正放手。
+        smooth_state.locked_streak = 0
+        smooth_state.lost_streak += 1
+        if smooth_state.has_target and (smooth_state.lost_streak <= TARGET_LOST_HOLD_FRAMES):
+            return VisionTarget(
+                x=max(0, smooth_state.cx - smooth_state.last_w // 2),
+                y=max(0, smooth_state.cy - smooth_state.last_h // 2),
+                w=smooth_state.last_w,
+                h=smooth_state.last_h,
+                cx=smooth_state.cx,
+                cy=smooth_state.cy,
+                dx_px=smooth_state.dx_px,
+                dy_px=smooth_state.dy_px,
+                angle_deg=0,
+                area=smooth_state.area,
+                score=0,
+            )
+
         smooth_state.has_target = False
+        smooth_state.lost_streak = 0
         return None
+
+    smooth_state.lost_streak = 0
+    if smooth_state.locked_streak < 0xFFFF:
+        smooth_state.locked_streak += 1
+
+    smooth_state.last_w = max(1, int(target.w))
+    smooth_state.last_h = max(1, int(target.h))
 
     if not smooth_state.has_target:
         smooth_state.has_target = True
@@ -851,13 +911,17 @@ def smooth_target_for_control(target, smooth_state, pickup_u, pickup_v):
         smooth_state.cy = int(target.cy)
         smooth_state.area = int(target.area)
     else:
-        move_px = max(abs(int(target.cx) - smooth_state.cx), abs(int(target.cy) - smooth_state.cy))
-        area_delta = abs(int(target.area) - smooth_state.area)
-        alpha_num = (
-            TARGET_FAST_SMOOTH_ALPHA_NUM
-            if (move_px >= TARGET_FAST_MOVE_PX) or (area_delta >= TARGET_FAST_AREA_DELTA)
-            else TARGET_SMOOTH_ALPHA_NUM
+        move_px = max(
+            abs(int(target.cx) - smooth_state.cx),
+            abs(int(target.cy) - smooth_state.cy),
         )
+        if move_px <= TARGET_MOTION_STILL_PX:
+            alpha_num = TARGET_SMOOTH_ALPHA_STILL_NUM
+        elif move_px <= TARGET_MOTION_SLOW_PX:
+            alpha_num = TARGET_SMOOTH_ALPHA_SLOW_NUM
+        else:
+            alpha_num = TARGET_SMOOTH_ALPHA_FAST_NUM
+
         old_weight = TARGET_SMOOTH_ALPHA_DEN - alpha_num
         smooth_state.cx = int(
             (smooth_state.cx * old_weight + int(target.cx) * alpha_num)
@@ -890,47 +954,119 @@ def smooth_target_for_control(target, smooth_state, pickup_u, pickup_v):
     )
 
 
-def find_target(img, config, pickup_u, pickup_v):
+def compute_tracking_roi(smooth_state):
+    """根据上一帧锁定结果计算下一帧的 ROI。
+
+    参数：
+    - smooth_state：当前的 `TargetSmoothState`，用于读取上一帧目标位置。
+
+    返回值：
+    - 已锁定且未丢失时返回 `(x, y, w, h)`，限制在图像边界内；
+    - 否则返回 None，表示本帧需要全图搜索。
+
+    设计原因：
+    - 锁定后只搜目标周围区域，可以有效屏蔽背景里突然出现的同色干扰；
+    - 丢失保持期内不缩 ROI，给目标重新进入画面留出余量；
+    - 半宽/半高写在常量里，便于现场根据目标尺寸调整。
+    """
+    if (not smooth_state.has_target) or (smooth_state.lost_streak > 0):
+        return None
+
+    half_px = TARGET_ROI_HALF_PX
+    x0 = max(0, int(smooth_state.cx) - half_px)
+    y0 = max(0, int(smooth_state.cy) - half_px)
+    x1 = min(CAMERA_WIDTH, int(smooth_state.cx) + half_px)
+    y1 = min(CAMERA_HEIGHT, int(smooth_state.cy) + half_px)
+    if (x1 - x0 <= 0) or (y1 - y0 <= 0):
+        return None
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def call_find_blobs(img, threshold_tuple, roi):
+    """调用 MaixPy `find_blobs` 并按当前固件能力降级参数。
+
+    参数：
+    - img：摄像头当前帧；
+    - threshold_tuple：六通道 LAB 阈值元组；
+    - roi：`(x, y, w, h)` ROI 元组；None 表示全图搜索。
+
+    返回值：
+    - 调用成功返回原始 blob 列表；
+    - 调用失败或固件不支持时返回 `[]`，避免主循环崩溃。
+
+    设计原因：
+    - 不同 MaixPy 固件版本对 `merge/margin/roi` 参数支持不一致；
+    - 用层层降级而不是直接 raise，确保现场某个固件参数缺失时仍能识别出目标。
+
+    副作用：无。该函数只做调用兼容封装。
+    """
+    base_kwargs = {
+        "pixels_threshold": MIN_PIXELS,
+        "area_threshold": MIN_PIXELS,
+        "merge": True,
+        "margin": 8,
+    }
+
+    try:
+        if roi is not None:
+            try:
+                return img.find_blobs([threshold_tuple], roi=roi, **base_kwargs)
+            except TypeError:
+                # 当前固件 find_blobs 不支持 roi 参数，退回全图搜索。
+                pass
+        return img.find_blobs([threshold_tuple], **base_kwargs)
+    except TypeError:
+        # 退回最基础参数集合，兼容旧固件。
+        try:
+            return img.find_blobs(
+                [threshold_tuple],
+                pixels_threshold=MIN_PIXELS,
+                area_threshold=MIN_PIXELS,
+            )
+        except Exception as exc:
+            print("[VISION] find_blobs fallback failed:", exc)
+            return []
+    except Exception as exc:
+        print("[VISION] find_blobs failed:", exc)
+        return []
+
+
+def find_target(img, config, pickup_u, pickup_v, smooth_state):
     """使用当前阈值在图像中寻找可追踪色块。
 
     参数：
     - img：摄像头拍到的原始图像；
     - config：LAB 阈值配置；
-    - pickup_u/pickup_v：抓取参考点像素坐标。
+    - pickup_u/pickup_v：抓取参考点像素坐标；
+    - smooth_state：上一帧平滑状态，用于跨帧选目标和 ROI 跟踪。
 
     返回值：
     - 找到目标时返回 `VisionTarget`；
     - 未找到目标或 MaixPy 查找失败时返回 None。
 
+    主要流程：
+    1. 已锁定时优先用 ROI 限制搜索区域，减少背景干扰；
+    2. 通过兼容封装调用 `find_blobs`，对不同固件版本降级参数；
+    3. 把候选色块交给跨帧连续性筛选，避免被瞬间干扰抢走。
+
     副作用：无。图像绘制和 I2C 输出由调用者完成。
     """
-    try:
-        raw_blobs = img.find_blobs(
-            [config.as_tuple()],
-            pixels_threshold=MIN_PIXELS,
-            area_threshold=MIN_PIXELS,
-            merge=True,
-            margin=8,
-        )
-    except TypeError:
-        # 部分 MaixPy 固件的 `find_blobs()` 参数集较旧，不支持 `merge/margin`。
-        # 退回基础参数仍能工作，只是目标边缘碎片较多时稳定性会差一些。
-        try:
-            raw_blobs = img.find_blobs([config.as_tuple()], pixels_threshold=MIN_PIXELS, area_threshold=MIN_PIXELS)
-        except Exception as exc:
-            print("[VISION] find_blobs fallback failed:", exc)
-            return None
-    except Exception as exc:
-        print("[VISION] find_blobs failed:", exc)
-        return None
+    roi = compute_tracking_roi(smooth_state)
+    raw_blobs = call_find_blobs(img, config.as_tuple(), roi)
 
     candidates = [blob_to_candidate(raw_blob) for raw_blob in raw_blobs]
-    return pick_largest_valid_blob(
+
+    prev_cx = int(smooth_state.cx) if smooth_state.has_target else None
+    prev_cy = int(smooth_state.cy) if smooth_state.has_target else None
+
+    return pick_best_blob_with_continuity(
         candidates,
         min_pixels=MIN_PIXELS,
         pickup_u=pickup_u,
         pickup_v=pickup_v,
         max_offset_px=MAX_OFFSET_PX,
+        prev_cx=prev_cx,
+        prev_cy=prev_cy,
     )
 
 
@@ -1218,10 +1354,17 @@ def main():
             show_img = build_binary_view(frame, config)
             draw_tune_overlay(show_img, config, selected_field)
         else:
-            raw_target = find_target(frame, config, pickup_u, pickup_v)
+            raw_target = find_target(frame, config, pickup_u, pickup_v, target_smooth_state)
             target = smooth_target_for_control(raw_target, target_smooth_state, pickup_u, pickup_v)
             frame_id = (frame_id + 1) & 0xFFFF
-            if target is None:
+
+            # 只有连续看到目标超过锁定阈值，才把 found 标记为 True 让 ESP32 真的去动；
+            # 否则即便平滑层缓存到了目标，也按 "found=False" 上报，避免单帧误识别让机械臂瞬间转向。
+            target_locked = (target is not None) and (
+                target_smooth_state.locked_streak >= TARGET_LOCK_FRAMES
+            )
+
+            if (target is None) or (not target_locked):
                 result_frame = pack_i2c_result_frame(frame_id, False, 0, 0, 0, 0, 0)
             else:
                 result_frame = pack_i2c_result_frame(

@@ -11,7 +11,7 @@
 
 | 文件 | 角色 | 你最该关注的内容 |
 | --- | --- | --- |
-| `Core/Src/usart.c` | `USART1/USART2` 外设初始化 | `huart2` 有没有真正初始化成 Emm42 需要的串口口子 |
+| `Core/Src/usart.c` | `USART1/USART6` 外设初始化 | `huart6` 有没有真正初始化成 Emm42 需要的串口口子 |
 | `Core/Src/gpio.c` | GPIO 初始化 | `PF9` 心跳灯和 `PB0/PB2` 等外设引脚是否由 CubeMX 正确初始化 |
 | `Core/Src/freertos.c` | 任务启动胶水 | 电机任务有没有真正被创建 |
 | `User/App/uart_command.c` | `USART1` 命令接收与线程安全打印 | `DMA + 空闲中断` 怎么把命令交给任务 |
@@ -34,8 +34,8 @@
 | 3 | `User/App/weight_service.c` | `WeightService_ProcessCommand()`，371 行 | 当前由称重任务统一做串口命令分发 |
 | 4 | `User/App/conveyor_motor_service.c` | `ConveyorMotorService_HandleCommand()`，983 行 | 识别 `BELTSCAN/BELTSTOP/BELTTRACK/BELTCAM/BELTENABLE/BELTINFO` |
 | 5 | `User/App/conveyor_motor_service.c` | `ConveyorMotorService_PostCommand()`，394 行 | 把命令投递到电机任务队列 |
-| 6 | `User/App/conveyor_motor_service.c` | `ConveyorMotorService_Task()`，1080 行 | 电机任务独占 `USART2`，周期推进状态机 |
-| 7 | `User/Driver/emm42_motor.c` | `EMM42_MotorSetVelocity()` 等，179/219 行 | 组织 Emm42 TTL 协议帧并通过 `USART2` 发送 |
+| 6 | `User/App/conveyor_motor_service.c` | `ConveyorMotorService_Task()`，1080 行 | 电机任务独占 `USART6`，周期推进状态机 |
+| 7 | `User/Driver/emm42_motor.c` | `EMM42_MotorSetVelocity()` 等，179/219 行 | 组织 Emm42 TTL 协议帧并通过 `USART6` 发送 |
 | 8 | `Core/Src/freertos.c` | `osThreadNew(ConveyorMotorService_Task, ...)`，132 行 | 真正把电机任务挂进 FreeRTOS 调度器 |
 
 ## 3. Why It Was “Not Rotating”
@@ -83,9 +83,9 @@
 | 行号 | 代码段 | 作用 | 关键点 |
 | --- | --- | --- | --- |
 | 1 行 | `#include "emm42_motor.h"` | 引入本模块声明 | 标准入口 |
-| 16-34 | `EMM42_MotorTransmitFrame()` | 统一发一帧 TTL 协议 | 当前项目约定电机任务独占 `USART2`，所以直接阻塞发送 |
+| 16-34 | `EMM42_MotorTransmitFrame()` | 统一发一帧 TTL 协议 | 当前项目约定电机任务独占 `USART6`，所以直接阻塞发送 |
 | 20-23 | 参数判空 | 防止空句柄、空帧、零长度 | 出错直接返回 `INVALID_PARAM` |
-| 25-31 | `HAL_UART_Transmit()` | 真正把字节送到 `USART2` | 如果这里失败，上层只会看到一个统一状态码 |
+| 25-31 | `HAL_UART_Transmit()` | 真正把字节送到 `USART6` | 如果这里失败，上层只会看到一个统一状态码 |
 | 41-51 | `EMM42_MotorLoadDefaultConfig()` | 写句柄默认值 | 只改内存，不访问硬件 |
 | 58-66 | `EMM42_MotorInit()` | 校验句柄 | 当前没做额外寄存器初始化，主要是防呆 |
 | 75-98 | `EMM42_MotorSetEnable()` | 组织 `[addr F3 AB state sync 6B]` 帧 | 这是例程原始使能协议 |
@@ -108,7 +108,7 @@
 | --- | --- | --- |
 | 1-13 | 头文件保护 + `stdint.h` | 保证接口自洽 |
 | 21 行 | `ConveyorMotorService_Task()` | FreeRTOS 任务入口，电机任务真正从这里跑起来 |
-| 23-38 | 任务职责注释 | 交代这个任务独占 `USART2`、维护三态、根据误差调速 |
+| 23-38 | 任务职责注释 | 交代这个任务独占 `USART6`、维护三态、根据误差调速 |
 | 39 行 | `ConveyorMotorService_HandleCommand()` | 串口命令分发入口，当前由称重任务调用它 |
 
 ## 7. `User/App/conveyor_motor_service.c`
@@ -152,7 +152,7 @@
 | 行号 | 代码段 | 具体在干什么 |
 | --- | --- | --- |
 | 1102-1115 | 创建命令队列 | 如果队列建不出来，任务直接报错并停在原地 |
-| 1117 行 | `EMM42_MotorLoadDefaultConfig(&motor, &huart2)` | 把电机驱动绑定到 `USART2` |
+| 1117 行 | `EMM42_MotorLoadDefaultConfig(&motor, &huart6)` | 把电机驱动绑定到 `USART6` |
 | 1119-1152 | 初始化重试循环 | 依次做 `Init -> StartupConfig -> Enable -> StopNow`，任何一步失败都打印阶段名并重试 |
 | 1125-1126 | `ConveyorMotorService_ApplyStartupConfig()` | 真正执行“恢复模式” |
 | 1131-1132 | `EMM42_MotorSetEnable()` | 让电机进入可响应命令状态 |
@@ -238,7 +238,7 @@
 如果这里只有 `conveyor_motor_service.c` 文件，但 `freertos.c` 没有创建任务，那么：
 
 1. 电机任务根本不会启动。
-2. `USART2` 不会被这个模块真正占用。
+2. `USART6` 不会被这个模块真正占用。
 3. `BELTSCAN/BELTTRACK` 命令只会显示 “service not ready” 或完全没效果。
 
 ## 11. What You Should Check First on Hardware
@@ -258,7 +258,7 @@
 
 | 顺序 | 代码位置 | 动作 |
 | --- | --- | --- |
-| 1 | `conveyor_motor_service.c:1117` | 把驱动句柄绑定到 `huart2` |
+| 1 | `conveyor_motor_service.c:1117` | 把驱动句柄绑定到 `huart6` |
 | 2 | `conveyor_motor_service.c:1122` | 校验驱动句柄 |
 | 3 | `conveyor_motor_service.c:1125-1126` | 执行启动修复配置 |
 | 4 | `conveyor_motor_service.c:1131-1132` | 发送使能命令 |
@@ -301,19 +301,19 @@
 
 ### 15.1 这个文件在 Emm42 链路里的作用
 
-这个文件不写业务逻辑，但它决定了 `huart2` 这个句柄是不是一个可用的 Emm42 串口口。  
+这个文件不写业务逻辑，但它决定了 `huart6` 这个句柄是不是一个可用的 Emm42 串口口。  
 如果这里没初始化对，`conveyor_motor_service.c` 再正确也发不出有效速度命令。
 
 ### 15.2 你最该看的代码段
 
 | 行号 | 代码段 | 作用 | 你应该怎么理解 |
 | --- | --- | --- | --- |
-| 28 行 | `UART_HandleTypeDef huart2;` | `USART2` 的全局 HAL 句柄 | 电机驱动里最终就是拿这个句柄发 TTL 命令 |
-| 63-87 | `MX_USART2_UART_Init()` | 初始化 `USART2` 基本参数 | 当前配置是 `115200 8N1`，与你现在的电机协议一致 |
-| 73-80 | `huart2.Init...` | 波特率、数据位、停止位、收发模式 | 这里一旦改错，最直接表现就是“任务在跑，但电机没响应” |
-| 81-84 | `HAL_UART_Init(&huart2)` | 真正把参数下发到硬件 | 如果这里失败，会直接进 `Error_Handler()` |
-| 141-182 | `HAL_UART_MspInit()` 里的 `USART2` 分支 | GPIO、DMA、中断绑定 | 这里说明了 `PA2=TX`、`PA3=RX`，也是你接线要对照的底层来源 |
-| 150-158 | `PA2/PA3` 复用配置 | 把 GPIO 切到 `GPIO_AF7_USART2` | 不做这一步，`PA2/PA3` 只是普通 GPIO，不是串口 |
+| 28 行 | `UART_HandleTypeDef huart6;` | `USART6` 的全局 HAL 句柄 | 电机驱动里最终就是拿这个句柄发 TTL 命令 |
+| 63-87 | `MX_USART6_UART_Init()` | 初始化 `USART6` 基本参数 | 当前配置是 `115200 8N1`，与你现在的电机协议一致 |
+| 73-80 | `huart6.Init...` | 波特率、数据位、停止位、收发模式 | 这里一旦改错，最直接表现就是“任务在跑，但电机没响应” |
+| 81-84 | `HAL_UART_Init(&huart6)` | 真正把参数下发到硬件 | 如果这里失败，会直接进 `Error_Handler()` |
+| 141-182 | `HAL_UART_MspInit()` 里的 `USART6` 分支 | GPIO、DMA、中断绑定 | 这里说明了 `PC6=TX`、`PC7=RX`，也是你接线要对照的底层来源 |
+| 150-158 | `PC6/PC7` 复用配置 | 把 GPIO 切到 `GPIO_AF8_USART6` | 不做这一步，`PC6/PC7` 只是普通 GPIO，不是串口 |
 
 ## 16. `User/App/system_heartbeat_service.h`
 
@@ -373,5 +373,5 @@
 | 上电后电机还是不转 | 3、7.4、10、15 |
 | `BELTSCAN` 发了没反应 | 2、7.5、10、15 |
 | 想知道启动到底给电机发了什么修复命令 | 4、5、7.3、12 |
-| 想查 `USART2` 到底绑在哪两个引脚 | 15 |
+| 想查 `USART6` 到底绑在哪两个引脚 | 15 |
 | 想确认心跳灯为什么能判断系统是否卡死 | 16、17、18 |

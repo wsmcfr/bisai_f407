@@ -13,8 +13,8 @@
  *
  * 通信链路：
  * 1. 上位机/MP157/串口助手 -> STM32 USART1：115200 8N1，用于输入命令和查看 `[ARM]` 日志；
- * 2. STM32 USART3 -> ESP32 LeArm：9600 8N1，PD8(TX) 接 ESP32 PA5(GPIO33/RX)，PD9(RX) 接 ESP32 PA4(GPIO32/TX)，两板必须共地；
- * 3. ESP32 固件必须使用 `Serial.begin(9600, SERIAL_8N1, PA5, PA4)`，否则 Type-C 能通信不代表 STM32 外部串口能通信。
+ * 2. STM32 USART3 -> ESP32 LeArm：115200 8N1，PD8(TX) 接 ESP32 PA5(GPIO33/RX)，PD9(RX) 接 ESP32 PA4(GPIO32/TX)，两板必须共地；
+ * 3. ESP32 固件必须使用 `Serial.begin(115200, SERIAL_8N1, PA5, PA4)`，否则 Type-C 能通信不代表 STM32 外部串口能通信。
  *
  * 帧格式：
  * - 固定格式：`55 55 Length CMD Params...`
@@ -48,7 +48,7 @@
 /**
  * @brief USART3 单帧发送超时时间，单位为毫秒。
  *
- * LeArm 动作组控制帧通常只有数个字节，200ms 对当前 9600 波特率已经非常宽裕。
+ * LeArm 动作组控制帧通常只有数个字节，200ms 对当前 115200 波特率已经非常宽裕。
  * 若超过该时间仍未发送完成，通常说明串口状态异常，应丢弃本帧并等待下一帧。
  */
 #define ROBOT_ARM_SERVICE_TX_TIMEOUT_MS      (200U)
@@ -457,7 +457,7 @@ static void RobotArmService_ReportReply(uint8_t command,
     if ((reply_buffer == NULL) || (reply_length == 0U))
     {
         my_printf(&huart1,
-                  "[ARM] No ESP32 reply: sent '%s'(0x%02X). Burn updated ESP32 firmware first; then check PD8->PA5, PD9<-PA4, common GND, 9600 baud.\r\n",
+                  "[ARM] No ESP32 reply: sent '%s'(0x%02X). Burn updated ESP32 firmware first; then check PD8->PA5, PD9<-PA4, common GND, 115200 baud.\r\n",
                   RobotArmService_GetCommandDescription(command),
                   (unsigned int)command);
         return;
@@ -738,7 +738,7 @@ void RobotArmService_Task(void *argument)
         if (xQueueReceive(g_robot_arm_frame_queue, &frame, portMAX_DELAY) == pdTRUE)
         {
             /*
-             * USART3 已在 CubeMX 中配置为 9600 8N1，需要和 ESP32 出厂固件 PC 模式串口波特率保持一致。
+             * USART3 已在 CubeMX 中配置为 115200 8N1，需要和 ESP32 当前 PA5/PA4 串口波特率保持一致。
              * 当前链路对接 ESP32 的 PA5/PA4 扩展串口；如果 ESP32 后续再次改动波特率，这里和 CubeMX 配置也要同步调整。
              * 这里按原始字节发送，确保 `55 55 ...` 二进制协议不被字符串处理破坏。
              */

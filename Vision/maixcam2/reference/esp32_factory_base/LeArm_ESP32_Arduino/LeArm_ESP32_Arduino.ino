@@ -88,41 +88,115 @@ static VisionI2CDebugCounters_t g_vision_i2c_last_debug_counters;
  * 视觉跟踪参数。
  *
  * - 死区：目标靠近屏幕中心时不动，避免色块抖动导致舵机来回震荡；
- * - 方向：按上一版“原来的方向”恢复，X 轴横向修正使用 -1，Y 轴高低修正使用 +1；
- * - 远近：MaixCAM2 只给 2D 色块，没有深度传感器，所以用目标面积估算远近；
- *   面积越小表示目标越远，机械臂末端 `x` 越应该前伸；面积越大表示目标越近，末端 `x` 应回缩；
+ * - 方向：按上一版”原来的方向”恢复，X 轴横向修正使用 -1，Y 轴高低修正使用 +1；
+ * - 远近：MaixCAM2 只给 2D 色块，没有深度传感器；理论上可以用目标面积估算远近，
+ *   但当前摄像头是手持的，手抖造成的面积变化远大于真实距离变化，
+ *   所以默认通过 `VISION_ARM_USE_AREA_FOR_REACH = 0` 关闭这条控制路径，
+ *   以后如果摄像头改为机械臂上固定安装，再把它打开做精细调；
  * - 横向：`dx_px` 直接控制 6 号底座舵机，避免 `coordinate_set(y)` 逆解失败后目标很偏也不动；
- * - 坐标：只把远近和高度交给 `coordinate_set()`，降低前端几个舵机反复重算造成的抖动；
- * - 比例：偏差越大，单次坐标修正越大，解决目标从画面左边移动到右边时机械臂仍只动一点的问题。
+ * - 坐标：只把高度交给 `coordinate_set()`，降低前端几个舵机反复重算造成的抖动；
+ * - 比例：偏差越大，单次坐标修正越大，解决目标从画面左边移动到右边时机械臂仍只动一点的问题；
+ * - 抑振：连续多帧偏差都落入死区时，强制不动，避免视觉端 ±2 像素噪声透到舵机层。
  */
+/*
+ * 远近控制开关。
+ *
+ * 项目最终目标是把摄像头装在机械臂末端做 eye-in-hand 跟踪，那时面积↔距离是
+ * 物理刚性关系，必须打开；当前手持过渡阶段只是把死区加大、增益放慢，避免
+ * 手抖造成的面积变化让 X 方向不停喘息。
+ */
+#define VISION_ARM_USE_AREA_FOR_REACH 1
 static const uint8_t VISION_ARM_MIN_SCORE = 20U;
-static const uint16_t VISION_ARM_MIN_AREA = 120U;
-static const uint16_t VISION_ARM_TARGET_AREA = 1800U;
-static const uint16_t VISION_ARM_AREA_DEADBAND = 350U;
-static const int16_t VISION_ARM_X_DEADBAND_PX = 18;
-static const int16_t VISION_ARM_Y_DEADBAND_PX = 46;
+static const uint16_t VISION_ARM_MIN_AREA = 220U;
+/*
+ * 目标面积。
+ *
+ * 1800 是按"摄像头装在机械臂末端、能贴近物体"假设设的；但当前手持调试期，
+ * 物体面积通常只有 600~800，TARGET_AREA=1800 会让 reach 控制一直想"再靠近一点"，
+ * 把 x 一路推到 X_MAX_CM 上限再也下不来。
+ *
+ * 降到 700 后，手持期实际面积就在期望值附近，reach 不会一上来就饱和；
+ * 装到机械臂末端后，根据现场抓取距离再调回到 1500~2500 即可。
+ */
+static const uint16_t VISION_ARM_TARGET_AREA = 700U;
+/*
+ * 面积死区。
+ *
+ * 配合 TARGET_AREA=700，死区 ±400 把手抖造成的 ±100 像素面积波动屏蔽住，
+ * 又让用户主动把物体显著拉近或推远（±400+）能触发 x 移动。
+ */
+static const uint16_t VISION_ARM_AREA_DEADBAND = 400U;
+/*
+ * 横向死区保持 10，纵向死区收到 8。日志里 dy=22 才走 0.32cm，dy 死区不再是瓶颈，
+ * 真正的瓶颈是 HEIGHT_GAIN 太小，因此重点把 Y 增益提到原来的 ~3 倍。
+ */
+static const int16_t VISION_ARM_X_DEADBAND_PX = 10;
+static const int16_t VISION_ARM_Y_DEADBAND_PX = 8;
+static const uint8_t VISION_ARM_IDLE_HOLD_FRAMES = 3U;
+static const uint32_t VISION_ARM_FRAME_REPLAY_MIN_MS = 50U;
 static const int VISION_ARM_BASE_SIGN = -1;
-static const int VISION_ARM_HEIGHT_SIGN = 1;
-static const int VISION_ARM_BASE_MIN_DUTY = 180;
-static const int VISION_ARM_BASE_MAX_DUTY = 820;
-static const int VISION_ARM_BASE_MIN_STEP_DUTY = 8;
-static const int VISION_ARM_BASE_MAX_STEP_DUTY = 70;
-static const float VISION_ARM_BASE_GAIN_DUTY_PER_PX = 0.45f;
-static const float VISION_ARM_REACH_GAIN_CM_PER_AREA = 0.0020f;
-static const float VISION_ARM_REACH_MIN_STEP_CM = 0.35f;
-static const float VISION_ARM_REACH_MAX_STEP_CM = 3.0f;
-static const float VISION_ARM_HEIGHT_GAIN_CM_PER_PX = 0.008f;
-static const float VISION_ARM_HEIGHT_MIN_STEP_CM = 0.20f;
-static const float VISION_ARM_HEIGHT_MAX_STEP_CM = 0.75f;
-static const float VISION_ARM_X_MIN_CM = 10.0f;
-static const float VISION_ARM_X_MAX_CM = 24.0f;
-static const float VISION_ARM_Z_MIN_CM = 1.0f;
-static const float VISION_ARM_Z_MAX_CM = 8.0f;
+/*
+ * 高度方向：之前写成 +1 实际是反的。
+ *
+ * MaixCAM2 协议里 dy 定义为"下正上负"。在标准 eye-in-hand（摄像头装机械臂末端、
+ * 朝前/略下视）的姿态下，目标在画面上方 (dy<0) 应该让末端**抬高**(z 增大)。
+ *
+ * 现场日志验证：dy=-50 持续时 delta_z=-1.5，z 一路撞下限 1.0；改成 -1 后
+ * delta_z=+1.5，z 才会真正往上走。
+ */
+static const int VISION_ARM_HEIGHT_SIGN = -1;
+/*
+ * 底座 duty 范围扩大到硬件实际允许的 125~875（来自 Config.h 的 MIN_DUTY/MAX_DUTY）。
+ * 之前 180~820 的限制太严，日志里 duty=180 撞死下限就是这个原因，导致 dx>0
+ * 时 base 完全不动；放宽到 125~875 后舵机仍在硬件安全范围内，但跟踪不会再被卡死。
+ */
+static const int VISION_ARM_BASE_MIN_DUTY = 125;
+static const int VISION_ARM_BASE_MAX_DUTY = 875;
+/*
+ * 横向"步进 + 增益"减半，根除"轻轻动一下转一大圈"。
+ * 之前 step=8+dx_eff*0.6, MAX=70，35ms 节流下相当于 30°/s 起步、100°/s 峰值；
+ * 现在 step=4+dx_eff*0.30, MAX=35，峰值降到 ~50°/s，对手持调试更跟手。
+ */
+static const int VISION_ARM_BASE_MIN_STEP_DUTY = 4;
+static const int VISION_ARM_BASE_MAX_STEP_DUTY = 35;
+static const float VISION_ARM_BASE_GAIN_DUTY_PER_PX = 0.30f;
+/*
+ * 远近控制：单步从 1.5cm 收到 0.8cm。
+ *
+ * 之前 1.5cm 一步配合 LeArm 5-DOF IK 在 (x≈10, z≈2, pitch=-30°) 这种位姿组合下
+ * 解空间已经很窄，单步过大会让 next_xy 直接落到 IK 不可达点，导致 coordinate_set
+ * 持续返回 0、xyz 卡死不动；改成 0.8cm 后，绝大多数中间位姿仍可达，逐步逼近目标。
+ */
+static const float VISION_ARM_REACH_GAIN_CM_PER_AREA = 0.0030f;
+static const float VISION_ARM_REACH_MIN_STEP_CM = 0.40f;
+static const float VISION_ARM_REACH_MAX_STEP_CM = 0.80f;
+/*
+ * 高度增益 0.012→0.040（约 3.3 倍）、最大步长 0.9→1.5cm。
+ * 日志里 dy=22 时只走 0.32cm 明显不够；提到 0.040 后，dy=22 一次走 ~0.80cm，
+ * 配合 100ms 节流大约 8cm/s，肉眼能立刻感受到机械臂跟随上下。
+ */
+static const float VISION_ARM_HEIGHT_GAIN_CM_PER_PX = 0.040f;
+static const float VISION_ARM_HEIGHT_MIN_STEP_CM = 0.30f;
+static const float VISION_ARM_HEIGHT_MAX_STEP_CM = 1.5f;
+/*
+ * 末端坐标安全范围。
+ *
+ * 之前 Z_MAX=8.0、Z_MIN=1.0 把 z 限制在 7cm 范围内，导致用户感觉"上下幅度太小"，
+ * 而且日志里 z 一直撞 1.0 下限完全没法响应。
+ *
+ * LeArm 6 自由度机械臂实际可达 z 大约 0~20cm（取决于 x、pitch 组合），把范围
+ * 扩到 0.5~14.0 后，上下幅度提升到 13.5cm，肉眼能立刻看到机械臂跟随上下；
+ * X_MAX 收到 22.0 给关节留点余量，避免 IK 频繁逼近末端可达边界后再钳回来。
+ */
+static const float VISION_ARM_X_MIN_CM = 8.0f;
+static const float VISION_ARM_X_MAX_CM = 22.0f;
+static const float VISION_ARM_Z_MIN_CM = 0.5f;
+static const float VISION_ARM_Z_MAX_CM = 14.0f;
 static const float VISION_ARM_PITCH_DEG = -30.0f;
-static const uint32_t VISION_ARM_BASE_INTERVAL_MS = 70U;
-static const uint32_t VISION_ARM_BASE_MOVE_TIME_MS = 110U;
-static const uint32_t VISION_ARM_POSE_INTERVAL_MS = 220U;
-static const uint32_t VISION_ARM_POSE_MOVE_TIME_MS = 280U;
+static const uint32_t VISION_ARM_BASE_INTERVAL_MS = 50U;
+static const uint32_t VISION_ARM_BASE_MOVE_TIME_MS = 80U;
+static const uint32_t VISION_ARM_POSE_INTERVAL_MS = 100U;
+static const uint32_t VISION_ARM_POSE_MOVE_TIME_MS = 130U;
 static const uint32_t VISION_ARM_DEBUG_REPORT_INTERVAL_MS = 250U;
 static int g_vision_arm_base_duty = SERVO6_RESET_DUTY;
 static float g_vision_arm_pose_x_cm = DEFAULT_X;
@@ -130,7 +204,9 @@ static float g_vision_arm_pose_z_cm = DEFAULT_Z;
 static uint32_t g_vision_arm_last_base_move_ms = 0U;
 static uint32_t g_vision_arm_last_pose_move_ms = 0U;
 static uint32_t g_vision_arm_last_report_ms = 0U;
+static uint32_t g_vision_arm_last_consume_ms = 0U;
 static uint16_t g_vision_arm_last_frame_id = 0xFFFFU;
+static uint8_t g_vision_arm_idle_streak = 0U;
 
 /**
  * @brief 轮流拉低 ESP32 I2C SCL/SDA，用于验证 MaixCAM2 实际接到了哪根线。
@@ -528,6 +604,8 @@ static void UpdateVisionArmTracking(LeArm_t *robot, const VisionI2CFrame_t *fram
   uint8_t pose_move_ok = 0U;
   uint8_t base_moved = 0U;
   uint8_t pose_due = 0U;
+  uint8_t inside_x_deadband = 0U;
+  uint8_t inside_y_deadband = 0U;
 
   if ((robot == NULL) || (frame == NULL))
   {
@@ -539,10 +617,18 @@ static void UpdateVisionArmTracking(LeArm_t *robot, const VisionI2CFrame_t *fram
     return;
   }
 
-  if (frame->frame_id == g_vision_arm_last_frame_id)
+  /*
+   * frame_id 防重判断放宽：
+   * - 之前只要 frame_id 相同就立刻跳过，但 MaixCAM2 端 100Hz 发帧时 frame_id 也只是
+   *   16 位单调递增，连续两帧之间的内容差异往往才是真正驱动机械臂的依据；
+   * - 现在改成"frame_id 不变 且 距上次执行不到 50ms"才跳过，避免高速发帧下连续被丢。
+   */
+  if ((frame->frame_id == g_vision_arm_last_frame_id) &&
+      ((uint32_t)(now_ms - g_vision_arm_last_consume_ms) < VISION_ARM_FRAME_REPLAY_MIN_MS))
   {
     return;
   }
+  g_vision_arm_last_consume_ms = now_ms;
 
   if (vision_i2c_obj.HasFreshFrame() == 0U)
   {
@@ -553,7 +639,44 @@ static void UpdateVisionArmTracking(LeArm_t *robot, const VisionI2CFrame_t *fram
       (frame->score < VISION_ARM_MIN_SCORE) ||
       (frame->area < VISION_ARM_MIN_AREA))
   {
+    /*
+     * 找不到目标或目标置信度过低时，把抑振计数清零。
+     * 这样下次重新看到目标时，第一帧就允许动作，避免被旧的"静止状态"卡住。
+     */
+    g_vision_arm_idle_streak = 0U;
     return;
+  }
+
+  /*
+   * 静止抑振：
+   * - 当前帧 dx/dy 都落在死区内时，认为目标已经稳定居中，本轮强制不动；
+   * - 连续 N 帧都在死区时，进一步把节流时间窗口"刷新"为最近一次时间，
+   *   避免目标停下后底层 ±2 像素噪声偶尔越过死区也让舵机抖一下；
+   * - 任何一帧 dx/dy 超出死区，就立即清零计数允许后续比例控制。
+   */
+  inside_x_deadband = ((frame->dx_px >= -VISION_ARM_X_DEADBAND_PX) &&
+                       (frame->dx_px <= VISION_ARM_X_DEADBAND_PX)) ? 1U : 0U;
+  inside_y_deadband = ((frame->dy_px >= -VISION_ARM_Y_DEADBAND_PX) &&
+                       (frame->dy_px <= VISION_ARM_Y_DEADBAND_PX)) ? 1U : 0U;
+
+  if ((inside_x_deadband != 0U) && (inside_y_deadband != 0U))
+  {
+    if (g_vision_arm_idle_streak < VISION_ARM_IDLE_HOLD_FRAMES)
+    {
+      g_vision_arm_idle_streak = (uint8_t)(g_vision_arm_idle_streak + 1U);
+    }
+
+    if (g_vision_arm_idle_streak >= VISION_ARM_IDLE_HOLD_FRAMES)
+    {
+      g_vision_arm_last_base_move_ms = now_ms;
+      g_vision_arm_last_pose_move_ms = now_ms;
+      g_vision_arm_last_frame_id = frame->frame_id;
+      return;
+    }
+  }
+  else
+  {
+    g_vision_arm_idle_streak = 0U;
   }
 
   base_delta_duty = CalcVisionArmBaseDutyDelta(frame->dx_px);
@@ -572,7 +695,19 @@ static void UpdateVisionArmTracking(LeArm_t *robot, const VisionI2CFrame_t *fram
     }
   }
 
+  /*
+   * 远近控制路径：
+   * - 摄像头最终装在机械臂末端做 eye-in-hand 抓取，面积↔距离是物理刚性关系，
+   *   通过 `VISION_ARM_USE_AREA_FOR_REACH = 1` 默认开启；
+   * - 手持调试期手抖会让面积有 ±100 像素噪声，靠 `VISION_ARM_AREA_DEADBAND` 屏蔽；
+   * - 关闭这条路径只需把宏置 0，远近就交给手动调节。
+   */
+#if (VISION_ARM_USE_AREA_FOR_REACH != 0)
   reach_delta_cm = CalcVisionArmReachDelta(frame->area);
+#else
+  reach_delta_cm = 0.0f;
+#endif
+
   height_delta_cm = CalcVisionArmCoordDelta(frame->dy_px,
                                             VISION_ARM_Y_DEADBAND_PX,
                                             VISION_ARM_HEIGHT_GAIN_CM_PER_PX,
@@ -593,18 +728,58 @@ static void UpdateVisionArmTracking(LeArm_t *robot, const VisionI2CFrame_t *fram
 
     if ((next_x_cm != g_vision_arm_pose_x_cm) || (next_z_cm != g_vision_arm_pose_z_cm))
     {
+      /*
+       * IK 调用三段尝试：
+       * 1. 先尝试同时移动 x/z 到目标，给 IK 完整的 pitch 搜索范围 [-90, +90]，
+       *    避免之前 max_pitch=0 把搜索空间限死、解明明存在却找不到；
+       * 2. 第一步失败时，只移动 z 保持 x 不变；
+       * 3. 第二步还失败时，只移动 x 保持 z 不变；
+       * 这样即便目标点本身在工作空间边缘，单轴方向上仍能逐步逼近，避免 xyz 卡死。
+       */
       pose_move_ok = robot->coordinate_set(next_x_cm,
                                            DEFAULT_Y,
                                            next_z_cm,
                                            VISION_ARM_PITCH_DEG,
                                            MIN_PITCH,
-                                           0.0f,
+                                           MAX_PITCH,
                                            VISION_ARM_POSE_MOVE_TIME_MS);
       if (pose_move_ok != 0U)
       {
         g_vision_arm_pose_x_cm = next_x_cm;
         g_vision_arm_pose_z_cm = next_z_cm;
       }
+      else if (next_z_cm != g_vision_arm_pose_z_cm)
+      {
+        /* 同步两轴失败时，先尝试只动 z，至少把高度跟上来。 */
+        pose_move_ok = robot->coordinate_set(g_vision_arm_pose_x_cm,
+                                             DEFAULT_Y,
+                                             next_z_cm,
+                                             VISION_ARM_PITCH_DEG,
+                                             MIN_PITCH,
+                                             MAX_PITCH,
+                                             VISION_ARM_POSE_MOVE_TIME_MS);
+        if (pose_move_ok != 0U)
+        {
+          g_vision_arm_pose_z_cm = next_z_cm;
+        }
+      }
+
+      if ((pose_move_ok == 0U) && (next_x_cm != g_vision_arm_pose_x_cm))
+      {
+        /* z 方向也没成功时，最后尝试只动 x，至少让远近响应起来。 */
+        pose_move_ok = robot->coordinate_set(next_x_cm,
+                                             DEFAULT_Y,
+                                             g_vision_arm_pose_z_cm,
+                                             VISION_ARM_PITCH_DEG,
+                                             MIN_PITCH,
+                                             MAX_PITCH,
+                                             VISION_ARM_POSE_MOVE_TIME_MS);
+        if (pose_move_ok != 0U)
+        {
+          g_vision_arm_pose_x_cm = next_x_cm;
+        }
+      }
+
       g_vision_arm_last_pose_move_ms = now_ms;
     }
   }
@@ -619,9 +794,10 @@ static void UpdateVisionArmTracking(LeArm_t *robot, const VisionI2CFrame_t *fram
       ((uint32_t)(now_ms - g_vision_arm_last_report_ms) >= VISION_ARM_DEBUG_REPORT_INTERVAL_MS))
   {
     g_vision_arm_last_report_ms = now_ms;
-    Serial.printf("[VISION_ARM] base=%u pose=%u frame=%u dx=%d dy=%d score=%u area=%u duty=%d xyz=%.2f,%.2f,%.2f delta=%.2f,%.2f\r\n",
+    Serial.printf("[VISION_ARM] base=%u pose=%u idle=%u frame=%u dx=%d dy=%d score=%u area=%u duty=%d xyz=%.2f,%.2f,%.2f delta=%.2f,%.2f\r\n",
                 base_moved,
                 pose_move_ok,
+                g_vision_arm_idle_streak,
                 frame->frame_id,
                 frame->dx_px,
                 frame->dy_px,

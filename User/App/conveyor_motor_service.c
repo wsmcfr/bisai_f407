@@ -16,7 +16,7 @@
  * 通信链路：
  * 1. 用户/MP157 通过 USART1 发送 ASCII 文本命令，命令先由 `weight_service.c` 统一取出并规范化；
  * 2. 本文件只处理 `BELT...` 前缀命令，不直接读取 USART1 DMA 缓存；
- * 3. 传送带任务独占 USART2，PA2(TX)/PA3(RX)，115200 8N1，用 Emm42 TTL 协议控制电机。
+ * 3. 传送带任务独占 USART6，PC6(TX) 接 Emm42 RX、PC7(RX) 接 Emm42 TX，115200 8N1，必须共地。
  *
  * 用户可发送的 BELT 命令：
  * | 命令 | 参数含义 | 电机效果 | 典型返回/观察方式 |
@@ -820,7 +820,7 @@ static EMM42_MotorStatus_t ConveyorMotorService_ApplyStartupConfig(const EMM42_M
 static void ConveyorMotorService_ReportReady(void)
 {
     my_printf(&huart1,
-              "[OK][BELT] Emm42 conveyor service started. USART2=PA2/PA3, addr=%u, mode=velocity, ctrl=%s\r\n",
+              "[OK][BELT] Emm42 conveyor service started. USART6=PC6/PC7, addr=%u, mode=velocity, ctrl=%s\r\n",
               (unsigned int)EMM42_MOTOR_DEFAULT_ADDRESS,
               ConveyorMotorService_GetControlModeName(CONVEYOR_MOTOR_STARTUP_CTRL_MODE));
     my_printf(&huart1,
@@ -1099,7 +1099,7 @@ uint8_t ConveyorMotorService_HandleCommand(const char *command_buffer)
  *
  * 任务职责：
  * 1. 初始化队列和电机驱动；
- * 2. 独占 `USART2` 发送运动命令；
+ * 2. 独占 `USART6` 发送运动命令；
  * 3. 执行三态控制逻辑；
  * 4. 周期性同步运行时快照，供 `BELTINFO` 查询。
  */
@@ -1140,7 +1140,7 @@ void ConveyorMotorService_Task(void *argument)
         }
     }
 
-    EMM42_MotorLoadDefaultConfig(&motor, &huart2);
+    EMM42_MotorLoadDefaultConfig(&motor, &huart6);
 
     for (;;)
     {

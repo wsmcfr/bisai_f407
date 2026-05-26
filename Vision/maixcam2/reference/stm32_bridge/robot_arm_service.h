@@ -62,7 +62,7 @@ uint8_t RobotArmService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_
  * 主要流程：
  * 1. 阻塞等待 USART1 命令分发层投递机械臂协议帧；
  * 2. 从队列中取出完整帧；
- * 3. 使用 USART3 以 9600 8N1 原样发送到 ESP32，波特率必须和 ESP32 出厂固件 PC 模式保持一致；
+ * 3. 使用 USART3 以 115200 8N1 原样发送到 ESP32，波特率必须和 ESP32 PA5/PA4 串口保持一致；
  * 4. 发送失败时丢弃当前帧，等待下一帧，避免任务卡死。
  */
 void RobotArmService_Task(void *argument);

@@ -23,5 +23,6 @@ M144Z-M4最小系统板IO引脚分配表——STM32F407版.xlsx
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.spec-workflow/
 tmp/
 Vision/maixcam2/dist/

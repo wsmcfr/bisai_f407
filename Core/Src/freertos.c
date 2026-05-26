@@ -73,7 +73,7 @@ static const osThreadAttr_t heartbeatTask_attributes = {
 /* 机械臂转发任务句柄保留在用户区，负责把 USART1 收到的 LeArm 协议帧异步转发到 USART3。 */
 static osThreadId_t robotArmTaskHandle = NULL;
 
-/* 机械臂转发任务只处理短帧队列和 USART3 阻塞发送，USART3 当前按 9600 8N1 对接 ESP32 出厂固件 PC 模式。 */
+/* 机械臂转发任务只处理短帧队列和 USART3 阻塞发送，USART3 当前按 115200 8N1 对接 ESP32 PA5/PA4 串口。 */
 /* 栈和优先级保持在普通业务任务级别，避免机械臂短帧转发影响称重、电感检测等更高实时性路径。 */
 static const osThreadAttr_t robotArmTask_attributes = {
   .name = "robotArmTask",                  /* 任务名称用于 RTOS 调试视图中识别机械臂 USART1->USART3 转发线程。 */

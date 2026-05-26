@@ -1297,7 +1297,7 @@ static void Ldc1614Service_ReportReady(const LDC1614_ChannelContext_t *channel_c
         return;
     }
 
-    my_printf(&huart1, "[OK][LDC] Defect inspection task started. I2C2=PB10/PB11\r\n");
+    my_printf(&huart1, "[OK][LDC] Defect inspection task started. I2C2=PF0/PF1, INTB=PF2, dma=on\r\n");
     for (index = 0U; index < channel_count; ++index)
     {
         my_printf(&huart1,
