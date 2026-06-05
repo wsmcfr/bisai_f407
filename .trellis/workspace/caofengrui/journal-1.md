@@ -445,3 +445,43 @@ Documented the robot-arm end-effector architecture: F4 remains the high-level co
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: Conveyor dual stepper and power PCB review record
+
+**Date**: 2026-06-05
+**Task**: Conveyor dual stepper and power PCB review record
+**Branch**: `main`
+
+### Summary
+
+Recorded the conveyor dual-stepper hardware plan and the EasyEDA/AP63205 power-layout review notes.
+
+### Main Changes
+
+| 项目 | 本次记录 |
+|---|---|
+| 嘉立创EDA电源设计 | 复查 3S 锂电输入、自恢复保险丝、TVS、P-MOS 防反接、Gate 下拉、G-S 稳压和 AP63205 降压布局；确认 GND 过孔到底层可用，SW/BST 节点不建议打到底层。 |
+| AP63205 PCB 布局 | 多轮检查 `U3/C2/C3/C7/L1/C5/C6` 位置，建议输入/输出电容贴近芯片和电感，`SW` 回路短粗，GND 多过孔回到底层。 |
+| 传送带步进电机 | 记录新增步进电机属于传送带；传送带机构现在按两个步进电机设计，不归机械臂、称重或 LDC 模块。 |
+| 固件边界 | 当前固件文档仍说明单 Emm42 电机链路；第二个传送带电机后续接入前，需要单独规划地址、串口共享或新增串口、同步控制策略。 |
+| 记录文件 | 更新 `User/App/emm42_conveyor_code_guide.md`，并追加本次 Trellis 会话记录。 |
+
+**注意**：本次只做文档和会话记录，不修改嘉立创EDA工程文件，也不提交当前工作区里已有的固件/IOC/PDF未提交改动。
+
+
+### Git Commits
+
+(No commits - planning session)
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

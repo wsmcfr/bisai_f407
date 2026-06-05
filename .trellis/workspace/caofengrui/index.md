@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 10
-- **Last Active**: 2026-05-26
+- **Total Sessions**: 11
+- **Last Active**: 2026-06-05
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~447 | Active |
+| `journal-1.md` | ~487 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 11 | 2026-06-05 | Conveyor dual stepper and power PCB review record | - | `main` |
 | 10 | 2026-05-26 | STM32F407 peripheral DMA and serial link update | `e7d7ab4` | `main` |
 | 9 | 2026-05-10 | MaixCAM2视觉I2C联调与跟踪状态记录 | `997d194`, `b7a6b0c` | `main` |
 | 8 | 2026-05-09 | Robot arm MaixCAM2 vision and vacuum wiring plan | `05fd1a5` | `main` |
