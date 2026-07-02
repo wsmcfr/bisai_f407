@@ -1,5 +1,6 @@
 #include "robot_arm_service.h"
 
+#include "binary_protocol_service.h"
 #include "FreeRTOS.h"
 #include "queue.h"
 #include "task.h"
@@ -456,6 +457,12 @@ static void RobotArmService_ReportReply(uint8_t command,
 {
     if ((reply_buffer == NULL) || (reply_length == 0U))
     {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_ReportFault((uint16_t)command,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          0,
+                                          0U);
         my_printf(&huart1,
                   "[ARM] No ESP32 reply: sent '%s'(0x%02X). Burn updated ESP32 firmware first; then check PD8->PA5, PD9<-PA4, common GND, 115200 baud.\r\n",
                   RobotArmService_GetCommandDescription(command),
@@ -469,6 +476,7 @@ static void RobotArmService_ReportReply(uint8_t command,
         (reply_buffer[3] == ROBOT_ARM_SERVICE_CMD_STM32_LINK_MODE) &&
         (reply_buffer[4] == 0U))
     {
+        BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
         my_printf(&huart1,
                   "[ARM] Link mode ready: ESP32 left PS2/offline mode. STM32 can now send arm commands on USART3.\r\n");
         return;
@@ -479,6 +487,7 @@ static void RobotArmService_ReportReply(uint8_t command,
         (reply_buffer[1] == ROBOT_ARM_SERVICE_FRAME_HEADER) &&
         (reply_buffer[3] == ROBOT_ARM_SERVICE_CMD_VERSION_QUERY))
     {
+        BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
         my_printf(&huart1,
                   "[ARM] Link OK: ESP32 version reply. len=%u, servo=%s(%u), fw=%u. You can send motion commands now.\r\n",
                   (unsigned int)reply_length,
@@ -498,6 +507,7 @@ static void RobotArmService_ReportReply(uint8_t command,
               (reply_length > 3U) ? reply_buffer[3] : 0U,
               (reply_length > 4U) ? reply_buffer[4] : 0U,
               (reply_length > 5U) ? reply_buffer[5] : 0U);
+    BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
 }
 
 /**
@@ -584,6 +594,12 @@ static void RobotArmService_TransmitFrame(const uint8_t *frame_data,
     }
     else
     {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_ReportFault((uint16_t)tx_status,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)tx_status,
+                                          0U);
         my_printf(&huart1,
                   "[ARM] Send failed: '%s' did not leave USART3. HAL=%d, len=%u, cmd=0x%02X. Check USART3 wiring or pin conflict.\r\n",
                   RobotArmService_GetCommandDescription(command),
@@ -662,6 +678,12 @@ uint8_t RobotArmService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_
 
     if ((g_robot_arm_frame_queue == NULL) && (RobotArmService_Init() == 0U))
     {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_ReportFault((uint16_t)frame_buffer[3],
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          0,
+                                          0U);
         my_printf(&huart1,
                   "[ARM] Queue create failed: '%s'(0x%02X) was not sent. Check FreeRTOS heap.\r\n",
                   RobotArmService_GetCommandDescription(frame_buffer[3]),
@@ -689,6 +711,12 @@ uint8_t RobotArmService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_
     }
     else
     {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_ReportFault((uint16_t)queued_frame.data[3],
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)protocol_length,
+                                          0U);
         my_printf(&huart1,
                   "[ARM] Command queue is busy: '%s' was dropped. Retry after the previous arm log ends. len=%u, cmd=0x%02X.\r\n",
                   RobotArmService_GetCommandDescription(queued_frame.data[3]),
@@ -714,6 +742,12 @@ void RobotArmService_Task(void *argument)
 
     if (RobotArmService_Init() == 0U)
     {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_ReportFault(1U,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          0,
+                                          0U);
         for (;;)
         {
             vTaskDelay(pdMS_TO_TICKS(1000U));

@@ -1,5 +1,6 @@
 #include "ldc1614_service.h"
 
+#include "binary_protocol_service.h"
 #include "FreeRTOS.h"
 #include "cmsis_os.h"
 #include "i2c.h"
@@ -1689,6 +1690,8 @@ void Ldc1614Service_Task(void *argument)
     uint32_t updated_mask;
     uint32_t consecutive_error_count = 0U;
     LDC1614_Status_t status;
+    LDC1614_Status_t last_startup_fault_status = LDC1614_STATUS_OK;
+    uint8_t startup_fault_reported = 0U;
     uint8_t index;
 
     (void)argument;
@@ -1709,11 +1712,29 @@ void Ldc1614Service_Task(void *argument)
 
         if (status == LDC1614_STATUS_OK)
         {
+            BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_LDC_NOT_READY);
             Ldc1614Service_ReportReady(channel_contexts, LDC1614_SERVICE_CHANNEL_COUNT);
             break;
         }
 
-        my_printf(&huart1, "[ERROR][LDC] Dual-channel init failed, status=%d\r\n", (int)status);
+        /*
+         * MP157-F4 主链路不再返回文本错误。
+         * LDC 未接入或初始化失败时，持续保留二进制故障位。
+         * FAULT_REPORT 只在第一次失败或底层状态变化时发送，
+         * 避免未接 LDC 的调试阶段每 1 秒刷一帧故障，占用 USART1 主链路。
+         * 这样 MP157 能结构化展示“电感模块未接入”，不会再被 `[ERROR][LDC]...` 文本污染协议解析。
+         */
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_LDC_NOT_READY);
+        if ((startup_fault_reported == 0U) || (last_startup_fault_status != status))
+        {
+            BinaryProtocolService_ReportFault((uint16_t)status,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_LDC,
+                                              BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                              (int32_t)status,
+                                              0U);
+            startup_fault_reported = 1U;
+            last_startup_fault_status = status;
+        }
         osDelay(1000U);
     }
 

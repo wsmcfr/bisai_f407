@@ -15,20 +15,22 @@
  * 用户真正能从 USART1 发送的命令由上层服务解释，维护时必须按下面索引同步更新：
  * | 命令类型 | 示例 | 处理文件 | 主要效果 | 是否回包 |
  * | --- | --- | --- | --- | --- |
- * | MP157 心跳命令 | `STATUS` | `weight_service.c` | 查询 STM32F407 主任务和 USART1 命令入口是否仍在线 | 是，返回 `[OK][F4] READY` |
- * | 称重文本命令 | `GET` / `TARE` / `CAL 1000` | `weight_service.c` | 查询重量、重新去皮、用已知砝码标定比例 | 是，返回 `[DATA]` / `[OK]` / `[ERROR]` 文本 |
- * | LDC 标定命令 | `LDCCAL CH1 20` / `LDCSTOP` | `ldc1614_service.c` | 启动或停止 LDC 单件稳定采样标定 | 是，返回 `[OK]` / `[INFO]` / `[ERROR]` 文本 |
- * | 传送带命令 | `BELTSCAN` / `BELTSTOP` / `BELTTRACK 80` / `BELTINFO` | `conveyor_motor_service.c` | 切换巡航、停止、按视觉误差跟踪或查询状态 | 部分命令立即回包，运动命令可用 `BELTINFO` 查询 |
+ * | MP157 心跳命令 | 二进制 `HEARTBEAT` | `binary_protocol_service.c` | 查询 STM32F407 主任务和 USART1 二进制协议入口是否在线 | 返回二进制 `ACK` 或 `NACK` |
+ * | 自动检测 HEX 帧 | `A5 5A 01 10 ... 6B` | `binary_protocol_service.c` | MP157 控制自动检测流程，例如开始、暂停、继续、停止和视觉坐标闭环 | 正确返回 `ACK/STATUS_REPORT`，错误返回 `NACK/FAULT_REPORT` |
+ * | 称重调试入口 | `GET` / `TARE` / `CAL 1000` | `weight_service.c` | 仅作为串口助手维护入口；MP157 主链路不再等待文本回包 | USART1 文本默认静默，正式联调需补二进制命令 |
+ * | LDC 标定入口 | `LDCCAL CH1 20` / `LDCSTOP` | `ldc1614_service.c` | 仅作为串口助手维护入口；自动流程故障走 `FAULT_REPORT` | USART1 文本默认静默 |
+ * | 传送带调试入口 | 二进制 `BELT_MANUAL_CONTROL` / `QUERY_STATUS` | `binary_protocol_service.c` | 切换巡航、停止或查询结构化状态 | 正确返回 `ACK/STATUS_REPORT`，错误返回 `NACK/FAULT_REPORT` |
+ * | 摄像头电机维护入口 | `CAMINFO` / `CAMSTOP` / `CAMFWD FORWARD 30` / `CAMZ UP 30` | `camera_motor_service.c` | 调试摄像头前后轴和上下轴，两个电机共用 USART6 但地址不同 | USART1 文本默认静默，自动流程后续需补二进制命令 |
  * | 机械臂 HEX 帧 | `55 55 02 01` / `55 55 05 06 03 01 00` | `robot_arm_service.c` | 透传到 USART3/ESP32，查询或执行 LeArm 动作 | 查询类有 `[ARM] RX...` 日志，运动类通常看机械臂动作 |
  *
  * 串口链路：
  * - USART1：115200 8N1，PA9(TX)/PA10(RX)，面向串口助手、MP157 或其它上位机；
  * - 本文件使用 `HAL_UARTEx_ReceiveToIdle_DMA()` 接收，空闲中断认为“一帧命令结束”；
- * - 文本命令通过 `UartCommand_Fetch()` 取出并补 `\0`，二进制机械臂帧通过
+ * - 文本命令通过 `UartCommand_Fetch()` 取出并补 `\0`，自动检测二进制帧和机械臂二进制帧通过
  *   `UartCommand_FetchRaw()` 取出，避免帧内 `0x00` 被字符串逻辑截断。
  *
  * 维护要求：
- * 1. 后续新增 USART1 可发送命令时，必须在本注释表和具体处理文件的命令表里同时写清楚“能发什么、有什么效果、是否回包”；
+ * 1. 后续新增 USART1 可发送命令时，必须在本注释表和具体处理文件的命令表里同时写清楚“能发什么、有什么效果、正确帧和错误帧分别是什么”；
  * 2. 本文件只允许做接收缓存、ISR 到任务通知、串口打印互斥，不把业务状态机塞进串口底座；
  * 3. HAL 回调中只复制数据和释放信号量，禁止在中断上下文解析命令或格式化打印。
  */
@@ -40,6 +42,19 @@
  * 若后续扩展复杂协议，再统一调整，不在本轮提前放大。
  */
 #define UART_COMMAND_RX_DMA_BUFFER_SIZE   (64U)
+
+/**
+ * @brief USART1 文本输出总开关。
+ *
+ * 当前 USART1 是 STM32MP157 与 F407 的主控制链路。
+ * 自动检测阶段只允许 ACK/NACK/STATUS_REPORT/FAULT_REPORT 等二进制帧返回，
+ * 所以默认关闭 `my_printf(&huart1, ...)` 的文本发送，防止 `[OK]`、`[ERROR]`
+ * 这类人工调试日志混入 MP157 的二进制解析窗口。
+ *
+ * 若后续需要用 Windows 串口助手临时看文本日志，可以在现场调试固件中改为 1U；
+ * 正式接 MP157 时必须保持 0U。
+ */
+#define UART_COMMAND_USART1_TEXT_ENABLE    (0U)
 
 /**
  * @brief 串口发送格式化缓存区大小。
@@ -270,6 +285,16 @@ int my_printf(UART_HandleTypeDef *huart, const char *format, ...)
     }
 
     /*
+     * USART1 面向 MP157 时只允许二进制协议帧返回。
+     * 这里直接丢弃 USART1 文本日志，但保留返回 0，表示调用者无需因为“调试文本未发送”
+     * 改变业务状态；其它串口如果复用 my_printf，仍按原逻辑输出。
+     */
+    if ((huart == &huart1) && (UART_COMMAND_USART1_TEXT_ENABLE == 0U))
+    {
+        return 0;
+    }
+
+    /*
      * 项目里已经出现多个任务共用同一串口打印，
      * 因此这里补一层惰性初始化，避免某个任务首次打印早于
      * `UartCommand_StartReceive()` 执行，从而丢失发送互斥保护。
@@ -311,6 +336,55 @@ int my_printf(UART_HandleTypeDef *huart, const char *format, ...)
     }
 
     return text_length;
+}
+
+/**
+ * @brief 串口线程安全原始字节发送。
+ * @param huart 目标串口句柄，不能为空。
+ * @param data 待发送的原始字节缓存，不能为 NULL。
+ * @param length 待发送字节数，必须大于 0。
+ * @param timeout_ms HAL_UART_Transmit 的阻塞发送超时时间，单位毫秒。
+ * @return HAL_StatusTypeDef HAL 串口发送结果。
+ *
+ * 设计原因：
+ * 1. 二进制 ACK/NACK 帧中可能包含 `0x00`，不能使用 `printf` 风格字符串发送；
+ * 2. USART1 同时会输出文本调试日志，必须和 `my_printf()` 使用同一把互斥锁；
+ * 3. 该函数只负责“原样发送字节”，不解释协议，也不追加 `\r\n`。
+ */
+HAL_StatusTypeDef UartCommand_SendRaw(UART_HandleTypeDef *huart,
+                                      const uint8_t *data,
+                                      uint16_t length,
+                                      uint32_t timeout_ms)
+{
+    HAL_StatusTypeDef status;
+
+    if ((huart == NULL) || (data == NULL) || (length == 0U))
+    {
+        return HAL_ERROR;
+    }
+
+    /*
+     * 和 my_printf() 保持同样的惰性初始化策略。
+     * 这样即使二进制协议早于文本日志发送，也能获得互斥保护。
+     */
+    if (g_uart_tx_mutex == NULL)
+    {
+        UartCommand_InitSyncObjects();
+    }
+
+    if (g_uart_tx_mutex != NULL)
+    {
+        (void)xSemaphoreTake(g_uart_tx_mutex, portMAX_DELAY);
+    }
+
+    status = HAL_UART_Transmit(huart, (uint8_t *)data, length, timeout_ms);
+
+    if (g_uart_tx_mutex != NULL)
+    {
+        (void)xSemaphoreGive(g_uart_tx_mutex);
+    }
+
+    return status;
 }
 
 /**

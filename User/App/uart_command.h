@@ -57,6 +57,22 @@ uint8_t UartCommand_FetchRaw(uint8_t *frame_buffer,
  */
 int my_printf(UART_HandleTypeDef *huart, const char *format, ...);
 
+/**
+ * @brief 串口线程安全原始字节发送。
+ * @param huart 目标串口句柄，不能为空。
+ * @param data 待发送的原始字节缓存，不能为 NULL。
+ * @param length 待发送字节数，必须大于 0。
+ * @param timeout_ms HAL_UART_Transmit 的阻塞发送超时时间，单位毫秒。
+ * @return HAL_StatusTypeDef HAL 串口发送结果。
+ *
+ * 该接口用于二进制协议 ACK/NACK 等不能经过 `printf` 字符串格式化的帧。
+ * 它和 `my_printf()` 共用同一把发送互斥锁，避免文本日志和二进制帧在 USART1 上交叉。
+ */
+HAL_StatusTypeDef UartCommand_SendRaw(UART_HandleTypeDef *huart,
+                                      const uint8_t *data,
+                                      uint16_t length,
+                                      uint32_t timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,433 @@
+#ifndef USER_APP_BINARY_PROTOCOL_SERVICE_H
+#define USER_APP_BINARY_PROTOCOL_SERVICE_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdint.h>
+
+/**
+ * @brief STM32MP157 与 STM32F407 自动检测二进制协议速查。
+ *
+ * 通信链路：
+ * - MP157 通过串口连接 F4 USART1，参数为 115200 8N1，PA9(TX)/PA10(RX)，两端必须共地；
+ * - 本协议用于 MP157-F4 正式主链路，正确返回只允许 `ACK/STATUS_REPORT` 二进制帧；
+ * - 本协议用于 MP157-F4 正式主链路，错误返回只允许 `NACK/FAULT_REPORT` 二进制帧；
+ * - 现有 `STATUS/GET/BELT...` ASCII 文本命令只保留作为断开 MP157 后的现场维护入口；
+ * - 正式接 MP157 时，USART1 文本输出默认静默，不能用 `[OK]`、`[ERROR]`、`READY` 判断成功失败；
+ * - F4 收到 USART1 原始帧后，应先判断是否为 `A5 5A ... 6B` 二进制帧，再回退到机械臂 `55 55 ...` 或 ASCII 文本命令。
+ *
+ * 帧格式：
+ * | 字段 | 字节数 | 说明 |
+ * | --- | --- | --- |
+ * | SOF0 | 1 | 固定 `0xA5`。 |
+ * | SOF1 | 1 | 固定 `0x5A`。 |
+ * | VER | 1 | 首版固定 `0x01`。 |
+ * | CMD | 1 | 命令字，例如 `START_CYCLE`、`VISION_POS`。 |
+ * | LEN | 1 | PAYLOAD 字节数，首版最大 48 字节。 |
+ * | SEQ_L/SEQ_H | 2 | 小端序帧序号，用于 ACK/NACK 对应。 |
+ * | PAYLOAD | N | 命令负载，多字节整数均为小端序。 |
+ * | CRC_L/CRC_H | 2 | CRC16-CCITT-FALSE，覆盖 `VER~PAYLOAD`。 |
+ * | EOF | 1 | 固定 `0x6B`。 |
+ *
+ * 当前已实现的首轮联调命令：
+ * | CMD | 名称 | 方向 | F4 动作 |
+ * | --- | --- | --- | --- |
+ * | `0x01` | HELLO | MP157 -> F4 | 校验协议链路并回 ACK。 |
+ * | `0x02` | HEARTBEAT | MP157 -> F4 | 回 ACK，证明二进制链路可用。 |
+ * | `0x10` | START_CYCLE | MP157 -> F4 | 进入本轮 cycle，并让传送带进入扫描。 |
+ * | `0x11` | PAUSE_CYCLE | MP157 -> F4 | 停止传送带，保存暂停前状态。 |
+ * | `0x12` | RESUME_CYCLE | MP157 -> F4 | 继续同一 cycle，扫描阶段回扫描，跟踪阶段等待新视觉坐标。 |
+ * | `0x13` | STOP_CYCLE | MP157 -> F4 | 停止传送带，并清除当前 cycle。 |
+ * | `0x20` | VISION_POS | MP157 -> F4 | 解出 `axis_px-target_px`，转成传送带视觉跟踪误差，成功回 ACK。 |
+ * | `0x21` | VISION_LOST | MP157 -> F4 | 按原因回到扫描或停止，成功回 ACK。 |
+ * | `0x22` | BELT_STOP_CENTERED | MP157 -> F4 | 停止传送带，表示零件已进入中心 ROI。 |
+ * | `0x40` | QUERY_STATUS | MP157 -> F4 | 查询 F4 协议状态和传送带状态，成功回 STATUS_REPORT。 |
+ * | `0x41` | BELT_MANUAL_CONTROL | MP157 -> F4 | 手动调试传送带扫描/停止，成功回 ACK。 |
+ * | `0x80` | ACK | F4 -> MP157 | 确认命令被接受。 |
+ * | `0x81` | NACK | F4 -> MP157 | 拒绝命令并返回错误码。 |
+ * | `0x82` | STATUS_REPORT | F4 -> MP157 | 查询成功后的结构化状态回包。 |
+ *
+ * 副作用：
+ * - `START_CYCLE` 会让传送带开始巡航扫描；
+ * - `PAUSE_CYCLE` 会让传送带停止，并保留当前 `cycle_id` 和暂停前状态；
+ * - `RESUME_CYCLE` 会继续同一个 `cycle_id`，如果暂停前在跟踪阶段，则等待 MP157 发新的 `VISION_POS`；
+ * - `VISION_POS` 会让传送带按视觉误差运动；
+ * - `STOP_CYCLE` 和 `BELT_STOP_CENTERED` 会下发传送带停止命令；
+ * - CRC 错误、长度错误、状态不允许等情况不会触发硬件动作。
+ */
+
+/**
+ * @brief 固定帧头第 1 字节。
+ */
+#define BINARY_PROTOCOL_SOF0                         (0xA5U)
+
+/**
+ * @brief 固定帧头第 2 字节。
+ */
+#define BINARY_PROTOCOL_SOF1                         (0x5AU)
+
+/**
+ * @brief 首版协议版本。
+ */
+#define BINARY_PROTOCOL_VERSION                      (0x01U)
+
+/**
+ * @brief 固定帧尾。
+ */
+#define BINARY_PROTOCOL_EOF                          (0x6BU)
+
+/**
+ * @brief 首版允许的最大负载长度，单位字节。
+ *
+ * 当前 USART1 DMA 单帧缓存为 64 字节，扣除帧头、版本、命令、长度、序号、CRC 和帧尾后，
+ * 48 字节能保证整帧不超过 58 字节，给字符串结束符和边界处理留下空间。
+ */
+#define BINARY_PROTOCOL_MAX_PAYLOAD_LENGTH           (48U)
+
+/**
+ * @brief 协议最短帧长度，单位字节。
+ *
+ * 最短帧表示没有 PAYLOAD 的命令，即 `A5 5A VER CMD 00 SEQ_L SEQ_H CRC_L CRC_H 6B`。
+ */
+#define BINARY_PROTOCOL_MIN_FRAME_LENGTH             (10U)
+
+/**
+ * @brief 协议最大帧长度，单位字节。
+ */
+#define BINARY_PROTOCOL_MAX_FRAME_LENGTH             (BINARY_PROTOCOL_MIN_FRAME_LENGTH + BINARY_PROTOCOL_MAX_PAYLOAD_LENGTH)
+
+/**
+ * @brief `VISION_POS` 命令负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_VISION_POS_PAYLOAD_LENGTH    (28U)
+
+/**
+ * @brief `START_CYCLE` 命令负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_START_CYCLE_PAYLOAD_LENGTH   (6U)
+
+/**
+ * @brief `PAUSE_CYCLE` 命令负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_PAUSE_CYCLE_PAYLOAD_LENGTH   (4U)
+
+/**
+ * @brief `RESUME_CYCLE` 命令负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_RESUME_CYCLE_PAYLOAD_LENGTH  (3U)
+
+/**
+ * @brief `STOP_CYCLE` 命令负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_STOP_CYCLE_PAYLOAD_LENGTH    (4U)
+
+/**
+ * @brief `VISION_LOST` 命令负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_VISION_LOST_PAYLOAD_LENGTH   (8U)
+
+/**
+ * @brief `BELT_STOP_CENTERED` 命令负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_BELT_CENTERED_PAYLOAD_LENGTH (8U)
+
+/**
+ * @brief `QUERY_STATUS` 命令负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_QUERY_STATUS_PAYLOAD_LENGTH (3U)
+
+/**
+ * @brief `BELT_MANUAL_CONTROL` 命令负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_BELT_MANUAL_PAYLOAD_LENGTH  (4U)
+
+/**
+ * @brief `ACK` 命令负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_ACK_PAYLOAD_LENGTH           (7U)
+
+/**
+ * @brief `NACK` 命令负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_NACK_PAYLOAD_LENGTH          (9U)
+
+/**
+ * @brief `STATUS_REPORT` 回包负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_STATUS_REPORT_PAYLOAD_LENGTH (24U)
+
+/**
+ * @brief `FAULT_REPORT` 回包负载长度，单位字节。
+ */
+#define BINARY_PROTOCOL_FAULT_REPORT_PAYLOAD_LENGTH  (16U)
+
+/**
+ * @brief 二进制协议命令字。
+ */
+typedef enum
+{
+    BINARY_PROTOCOL_CMD_HELLO = 0x01U,              /* 上电握手命令，用于确认协议版本和串口链路。 */
+    BINARY_PROTOCOL_CMD_HEARTBEAT = 0x02U,          /* 二进制心跳命令，用于 MP157 周期确认 F4 在线。 */
+    BINARY_PROTOCOL_CMD_START_CYCLE = 0x10U,        /* 开始一轮自动检测，F4 进入传送带扫描状态。 */
+    BINARY_PROTOCOL_CMD_PAUSE_CYCLE = 0x11U,        /* 暂停当前检测流程，F4 停传送带并保存暂停前状态。 */
+    BINARY_PROTOCOL_CMD_RESUME_CYCLE = 0x12U,       /* 继续当前检测流程，F4 按暂停前状态恢复或等待新视觉坐标。 */
+    BINARY_PROTOCOL_CMD_STOP_CYCLE = 0x13U,         /* 停止当前检测流程，并停止传送带。 */
+    BINARY_PROTOCOL_CMD_VISION_POS = 0x20U,         /* 视觉坐标命令，F4 根据坐标误差控制传送带。 */
+    BINARY_PROTOCOL_CMD_VISION_LOST = 0x21U,        /* 视觉丢失命令，F4 根据原因回扫描或停机。 */
+    BINARY_PROTOCOL_CMD_BELT_STOP_CENTERED = 0x22U, /* 零件已进中心 ROI，要求 F4 停止传送带。 */
+    BINARY_PROTOCOL_CMD_MODEL_READY = 0x30U,        /* 模型检测完成，首轮仅保留命令字。 */
+    BINARY_PROTOCOL_CMD_ARM_JOB_START = 0x31U,      /* 机械臂任务开始，首轮仅保留命令字。 */
+    BINARY_PROTOCOL_CMD_QUERY_STATUS = 0x40U,       /* 查询 F4 和传送带结构化状态，成功返回 STATUS_REPORT。 */
+    BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL = 0x41U, /* 手动调试传送带扫描/停止，成功返回 ACK。 */
+    BINARY_PROTOCOL_CMD_ACK = 0x80U,                /* ACK 回包，表示命令已被接受。 */
+    BINARY_PROTOCOL_CMD_NACK = 0x81U,               /* NACK 回包，表示命令被拒绝并携带错误码。 */
+    BINARY_PROTOCOL_CMD_STATUS_REPORT = 0x82U,      /* 状态上报，首轮保留给 MP157 查询和 UI 展示。 */
+    BINARY_PROTOCOL_CMD_EVENT_REPORT = 0x83U,       /* 事件上报，首轮保留。 */
+    BINARY_PROTOCOL_CMD_WEIGHT_RESULT = 0x84U,      /* 称重结果上报，首轮保留。 */
+    BINARY_PROTOCOL_CMD_LDC_RESULT = 0x85U,         /* 电感结果上报，首轮保留。 */
+    BINARY_PROTOCOL_CMD_CYCLE_DONE = 0x86U,         /* 整轮 F4 侧动作完成，首轮保留。 */
+    BINARY_PROTOCOL_CMD_FAULT_REPORT = 0x87U        /* 故障上报，首轮保留。 */
+} BinaryProtocol_Command_t;
+
+/**
+ * @brief 解析一帧二进制协议时可能返回的状态。
+ */
+typedef enum
+{
+    BINARY_PROTOCOL_PARSE_OK = 0,              /* 帧格式、长度、版本、CRC 和帧尾全部正确。 */
+    BINARY_PROTOCOL_PARSE_NOT_BINARY,          /* 不是 `A5 5A` 开头的二进制协议帧，应继续交给其它协议解析。 */
+    BINARY_PROTOCOL_PARSE_TOO_SHORT,           /* 数据长度小于最短帧长度。 */
+    BINARY_PROTOCOL_PARSE_TOO_LONG,            /* 数据长度超过首版协议最大帧长。 */
+    BINARY_PROTOCOL_PARSE_VERSION_ERROR,       /* 版本号不是当前 F4 支持的版本。 */
+    BINARY_PROTOCOL_PARSE_LENGTH_ERROR,        /* LEN 字段和实际帧长度不匹配，或负载长度超过上限。 */
+    BINARY_PROTOCOL_PARSE_EOF_ERROR,           /* 帧尾不是固定 `0x6B`。 */
+    BINARY_PROTOCOL_PARSE_CRC_ERROR,           /* CRC16 校验失败。 */
+    BINARY_PROTOCOL_PARSE_PARAM_ERROR          /* 调用参数为空或输出缓存非法。 */
+} BinaryProtocol_ParseStatus_t;
+
+/**
+ * @brief 协议层 NACK 错误码。
+ */
+typedef enum
+{
+    BINARY_PROTOCOL_ERROR_CRC = 1U,             /* CRC 错误。 */
+    BINARY_PROTOCOL_ERROR_FRAME_LENGTH = 2U,    /* 总帧长错误。 */
+    BINARY_PROTOCOL_ERROR_CMD_UNKNOWN = 3U,     /* 命令不支持。 */
+    BINARY_PROTOCOL_ERROR_PAYLOAD_LENGTH = 4U,  /* 命令负载长度不符合定义。 */
+    BINARY_PROTOCOL_ERROR_FIELD_RANGE = 5U,     /* 字段值越界。 */
+    BINARY_PROTOCOL_ERROR_STATE_NOT_ALLOWED = 6U, /* 当前状态不允许执行该命令。 */
+    BINARY_PROTOCOL_ERROR_BUSY = 7U,            /* 下位机忙，暂时不接受该命令。 */
+    BINARY_PROTOCOL_ERROR_CYCLE_MISMATCH = 8U,  /* cycle_id 不匹配。 */
+    BINARY_PROTOCOL_ERROR_TIMEOUT = 9U,         /* 等待硬件或子模块超时。 */
+    BINARY_PROTOCOL_ERROR_HARDWARE_FAULT = 10U  /* 底层硬件故障。 */
+} BinaryProtocol_ErrorCode_t;
+
+/**
+ * @brief 二进制故障来源编号。
+ */
+typedef enum
+{
+    BINARY_PROTOCOL_FAULT_SOURCE_UART = 1U,        /* USART1 或协议解析相关故障。 */
+    BINARY_PROTOCOL_FAULT_SOURCE_CONVEYOR = 2U,    /* 传送带 Emm42 或 UART4 控制故障。 */
+    BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR = 3U, /* 摄像头运动电机或 USART6 控制故障。 */
+    BINARY_PROTOCOL_FAULT_SOURCE_ARM = 4U,         /* ESP32 机械臂桥接故障。 */
+    BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT = 5U,      /* HX711 称重故障。 */
+    BINARY_PROTOCOL_FAULT_SOURCE_LDC = 6U          /* LDC1614 电感检测故障。 */
+} BinaryProtocol_FaultSource_t;
+
+/**
+ * @brief 二进制故障严重等级。
+ */
+typedef enum
+{
+    BINARY_PROTOCOL_FAULT_SEVERITY_INFO = 1U,      /* 提示级故障，不影响当前已接模块调试。 */
+    BINARY_PROTOCOL_FAULT_SEVERITY_WARNING = 2U,   /* 告警级故障，需要在界面提示人工处理。 */
+    BINARY_PROTOCOL_FAULT_SEVERITY_STOP = 3U       /* 停机级故障，F4 应停止可停止执行器。 */
+} BinaryProtocol_FaultSeverity_t;
+
+/**
+ * @brief F4 状态故障位。
+ */
+typedef enum
+{
+    BINARY_PROTOCOL_FAULT_BIT_CONVEYOR_NOT_READY = 0x0001U, /* 传送带状态不可读或任务未就绪。 */
+    BINARY_PROTOCOL_FAULT_BIT_LDC_NOT_READY = 0x0002U,      /* LDC1614 未初始化成功或当前未接入。 */
+    BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY = 0x0004U,   /* HX711 未初始化成功或称重无效。 */
+    BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR = 0x0008U,       /* 摄像头运动电机服务故障。 */
+    BINARY_PROTOCOL_FAULT_BIT_ARM_LINK = 0x0010U            /* ESP32 机械臂链路故障。 */
+} BinaryProtocol_FaultBit_t;
+
+/**
+ * @brief 已解析的一帧协议数据。
+ *
+ * 该结构体只保存指向原始负载的指针，不复制负载内容。
+ * 调用者必须保证 `payload` 指向的原始帧缓存，在业务处理期间仍然有效。
+ */
+typedef struct
+{
+    uint8_t version;                              /* 协议版本号，首版应为 `0x01`。 */
+    uint8_t command;                              /* 命令字，取值见 BinaryProtocol_Command_t。 */
+    uint8_t payload_length;                       /* 负载长度，单位字节，范围 0~48。 */
+    uint16_t sequence;                            /* 发送方帧序号，小端解析后保存，用于 ACK/NACK 对应。 */
+    const uint8_t *payload;                       /* 指向原始帧中 PAYLOAD 首字节，没有负载时为 NULL。 */
+} BinaryProtocol_Frame_t;
+
+/**
+ * @brief `VISION_POS` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前检测流程 ID，由 MP157 在 START_CYCLE 时分配。 */
+    uint16_t frame_id;                            /* MP157 视觉帧编号，用于排查旧坐标和掉帧。 */
+    uint8_t flags;                                /* 视觉标志位，bit0=坐标有效，bit1=进入 ROI，bit2=分类有效。 */
+    uint8_t part_type;                            /* 零件类型枚举，F4 首轮只保存和回显，不参与分类决策。 */
+    int16_t axis_px;                              /* 沿传送带运动方向的当前坐标，单位像素。 */
+    int16_t target_px;                            /* 希望对准的目标线坐标，单位像素。 */
+    int16_t center_x_px;                          /* 原图中心 X 坐标，单位像素，用于调试记录。 */
+    int16_t center_y_px;                          /* 原图中心 Y 坐标，单位像素，用于调试记录。 */
+    int16_t bbox_x_px;                            /* 视觉检测框左上角 X，单位像素。 */
+    int16_t bbox_y_px;                            /* 视觉检测框左上角 Y，单位像素。 */
+    int16_t bbox_w_px;                            /* 视觉检测框宽度，单位像素。 */
+    int16_t bbox_h_px;                            /* 视觉检测框高度，单位像素。 */
+    uint8_t confidence;                           /* 视觉定位或综合置信度，范围 0~100。 */
+    uint8_t reserved;                             /* 保留字段，首版要求 MP157 填 0。 */
+    uint32_t capture_ms;                          /* MP157 采集该帧时的毫秒计数，用于排查延迟。 */
+} BinaryProtocol_VisionPosPayload_t;
+
+/**
+ * @brief `START_CYCLE` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 本轮检测流程 ID。 */
+    uint8_t mode;                                 /* 启动模式，0=完整自动检测，1=只跑传送带居中。 */
+    uint16_t option_bits;                         /* 启用项位图，bit0=称重，bit1=电感，bit2=分拣。 */
+    uint8_t camera_profile;                       /* 摄像头位置方案编号，调试阶段通常为 0。 */
+} BinaryProtocol_StartCyclePayload_t;
+
+/**
+ * @brief `PAUSE_CYCLE` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 要暂停的检测流程 ID。 */
+    uint8_t pause_reason;                         /* 暂停原因，0=用户按下暂停，1=视觉不稳定，2=上位机调试。 */
+    uint8_t pause_mode;                           /* 暂停方式，0=安全点暂停，1=立即停止可停止的执行器。 */
+} BinaryProtocol_PauseCyclePayload_t;
+
+/**
+ * @brief `RESUME_CYCLE` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 要继续的检测流程 ID。 */
+    uint8_t resume_mode;                          /* 继续方式，0=从暂停点继续，1=回到扫描阶段继续。 */
+} BinaryProtocol_ResumeCyclePayload_t;
+
+/**
+ * @brief `STOP_CYCLE` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 要停止的检测流程 ID。 */
+    uint8_t stop_reason;                          /* 停止原因，0=用户停止，1=视觉异常，2=上位机取消，3=安全故障。 */
+    uint8_t stop_level;                           /* 停止等级，0=普通停止，1=急停级停止。 */
+} BinaryProtocol_StopCyclePayload_t;
+
+/**
+ * @brief `VISION_LOST` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前检测流程 ID。 */
+    uint16_t frame_id;                            /* MP157 视觉帧编号。 */
+    uint8_t reason;                               /* 丢失原因，1=未找到目标，2=多目标，3=置信度低，4=相机离线。 */
+    uint8_t confidence;                           /* 当前置信度，范围 0~100。 */
+    uint16_t ms_since_seen;                       /* 距离上次看到目标的时间，单位毫秒。 */
+} BinaryProtocol_VisionLostPayload_t;
+
+/**
+ * @brief `BELT_STOP_CENTERED` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前检测流程 ID。 */
+    uint16_t frame_id;                            /* 触发停止的视觉帧编号。 */
+    uint8_t reason;                               /* 停止原因，0=进入中心 ROI，1=MP157 主动要求停机拍照。 */
+    uint16_t hold_ms;                             /* 建议保持静止等待时间，单位毫秒。 */
+    uint8_t reserved;                             /* 保留字段，首版填 0。 */
+} BinaryProtocol_BeltCenteredPayload_t;
+
+/**
+ * @brief `QUERY_STATUS` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* MP157 当前关注的流程 ID，0 表示只查询设备整体状态。 */
+    uint8_t query_mask;                           /* 查询掩码，bit0=协议状态，bit1=传送带状态。 */
+} BinaryProtocol_QueryStatusPayload_t;
+
+/**
+ * @brief `BELT_MANUAL_CONTROL` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 手动调试流程 ID，当前可为 0。 */
+    uint8_t action;                               /* 手动动作，0=STOP，1=SCAN。 */
+    uint8_t flags;                                /* 标志位，首版填 0。 */
+} BinaryProtocol_BeltManualPayload_t;
+
+uint8_t BinaryProtocolService_IsBinaryFrame(const uint8_t *frame_buffer, uint16_t frame_length);
+uint16_t BinaryProtocolService_Crc16CcittFalse(const uint8_t *data, uint16_t length);
+BinaryProtocol_ParseStatus_t BinaryProtocolService_ParseFrame(const uint8_t *frame_buffer,
+                                                              uint16_t frame_length,
+                                                              BinaryProtocol_Frame_t *parsed_frame);
+uint16_t BinaryProtocolService_BuildFrame(uint8_t command,
+                                          uint16_t sequence,
+                                          const uint8_t *payload,
+                                          uint8_t payload_length,
+                                          uint8_t *output_buffer,
+                                          uint16_t output_size);
+uint8_t BinaryProtocolService_DecodeStartCycle(const uint8_t *payload,
+                                               uint8_t payload_length,
+                                               BinaryProtocol_StartCyclePayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodePauseCycle(const uint8_t *payload,
+                                               uint8_t payload_length,
+                                               BinaryProtocol_PauseCyclePayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeResumeCycle(const uint8_t *payload,
+                                                uint8_t payload_length,
+                                                BinaryProtocol_ResumeCyclePayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeStopCycle(const uint8_t *payload,
+                                              uint8_t payload_length,
+                                              BinaryProtocol_StopCyclePayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeVisionPos(const uint8_t *payload,
+                                              uint8_t payload_length,
+                                              BinaryProtocol_VisionPosPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeVisionLost(const uint8_t *payload,
+                                               uint8_t payload_length,
+                                               BinaryProtocol_VisionLostPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeBeltCentered(const uint8_t *payload,
+                                                 uint8_t payload_length,
+                                                 BinaryProtocol_BeltCenteredPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeQueryStatus(const uint8_t *payload,
+                                                uint8_t payload_length,
+                                                BinaryProtocol_QueryStatusPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeBeltManual(const uint8_t *payload,
+                                               uint8_t payload_length,
+                                               BinaryProtocol_BeltManualPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_length);
+void BinaryProtocolService_SetFaultBit(uint16_t fault_bit);
+void BinaryProtocolService_ClearFaultBit(uint16_t fault_bit);
+void BinaryProtocolService_ReportFault(uint16_t fault_code,
+                                       uint8_t fault_source,
+                                       uint8_t severity,
+                                       int32_t detail_i32,
+                                       uint16_t related_seq);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

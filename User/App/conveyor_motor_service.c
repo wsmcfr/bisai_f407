@@ -16,7 +16,8 @@
  * 通信链路：
  * 1. 用户/MP157 通过 USART1 发送 ASCII 文本命令，命令先由 `weight_service.c` 统一取出并规范化；
  * 2. 本文件只处理 `BELT...` 前缀命令，不直接读取 USART1 DMA 缓存；
- * 3. 传送带任务独占 USART6，PC6(TX) 接 Emm42 RX、PC7(RX) 接 Emm42 TX，115200 8N1，必须共地。
+ * 3. 传送带任务独占 UART4，PC10(TX) 接传送带 Emm42 RX、PC11(RX) 接传送带 Emm42 TX，115200 8N1，必须共地；
+ * 4. 摄像头前进/后退和上下两个 Emm42 电机共用 USART6，不能再让传送带占用 USART6。
  *
  * 用户可发送的 BELT 命令：
  * | 命令 | 参数含义 | 电机效果 | 典型返回/观察方式 |
@@ -46,6 +47,19 @@
 #define CONVEYOR_MOTOR_CONTROL_PERIOD_MS            (20U)
 
 /**
+ * @brief 传送带 Emm42 电机地址。
+ *
+ * 当前硬件分配：
+ * - 传送带电机：UART4 PC10/PC11，地址 0x01；
+ * - 摄像头前进/后退电机：USART6 PC6/PC7，地址 0x02；
+ * - 摄像头上下电机：USART6 PC6/PC7，地址 0x03。
+ *
+ * 传送带电机虽然独占 UART4，但仍明确写出地址，
+ * 方便以后通过串口日志核对现场电机 ID 是否设置正确。
+ */
+#define CONVEYOR_MOTOR_ADDRESS                      (1U)
+
+/**
  * @brief 主机在跟踪模式下的坐标更新超时时间，单位毫秒。
  *
  * 如果主机长时间不再发送坐标，而电机仍保持上一次速度继续运动，
@@ -59,7 +73,7 @@
  * 用户要求“自己匀速转动，不需要太快”，
  * 因此这里默认给一个偏低的保守值。
  */
-#define CONVEYOR_MOTOR_SCAN_SPEED_RPM               (60U)
+#define CONVEYOR_MOTOR_SCAN_SPEED_RPM               (300U)
 
 /**
  * @brief 跟踪模式最小转速，单位 RPM。
@@ -180,11 +194,11 @@
 /**
  * @brief 是否在任务启动后默认进入巡航模式。
  *
- * 用户当前目标是“坐标未使能时自己匀速转动”，
- * 因此初版默认直接进入 SCAN。
- * 若后续希望上电先静止，再等待主机命令，只需改成 0。
+ * 当前自动检测流程要求 MP157 首页按“开始”后才启动传送带，
+ * 因此默认上电保持静止，等待二进制 `START_CYCLE` 或调试命令 `BELTSCAN`。
+ * 这样可以避免 F4 一上电就把零件送进相机视野，导致 MP157 还没准备好就开始运动。
  */
-#define CONVEYOR_MOTOR_STARTUP_SCAN_ENABLE          (1U)
+#define CONVEYOR_MOTOR_STARTUP_SCAN_ENABLE          (0U)
 
 /**
  * @brief 命令队列长度。
@@ -425,6 +439,91 @@ static uint8_t ConveyorMotorService_PostCommand(const ConveyorMotor_Command_t *c
     }
 
     (void)xQueueOverwrite(g_conveyor_motor_command_queue, command);
+    return 1U;
+}
+
+/**
+ * @brief 请求传送带进入低速扫描模式。
+ * @return uint8_t 1 表示请求已投递，0 表示传送带任务尚未就绪。
+ *
+ * 该函数是二进制协议层调用传送带服务的公共入口。
+ * 它只投递内部队列命令，不直接碰 Emm42 串口，确保 USART1 命令分发路径保持轻量。
+ */
+uint8_t ConveyorMotorService_RequestScan(void)
+{
+    ConveyorMotor_Command_t command;
+
+    command.type = CONVEYOR_MOTOR_COMMAND_SCAN;
+    command.error_px = 0;
+    return ConveyorMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 请求传送带立即停止。
+ * @return uint8_t 1 表示请求已投递，0 表示传送带任务尚未就绪。
+ *
+ * 该函数复用传送带任务已有 STOP 状态机，
+ * 避免二进制协议层绕过任务队列直接操作电机导致并发问题。
+ */
+uint8_t ConveyorMotorService_RequestStop(void)
+{
+    ConveyorMotor_Command_t command;
+
+    command.type = CONVEYOR_MOTOR_COMMAND_STOP;
+    command.error_px = 0;
+    return ConveyorMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 请求传送带按照视觉误差进入跟踪模式。
+ * @param error_px 视觉目标相对中心的带符号像素误差，单位像素。
+ * @return uint8_t 1 表示请求已投递，0 表示传送带任务尚未就绪。
+ *
+ * 二进制协议中的 `VISION_POS` 会先计算 `axis_px - target_px`，
+ * 再通过本函数把误差投递给传送带任务。
+ */
+uint8_t ConveyorMotorService_RequestTrack(int32_t error_px)
+{
+    ConveyorMotor_Command_t command;
+
+    command.type = CONVEYOR_MOTOR_COMMAND_TRACK;
+    command.error_px = error_px;
+    return ConveyorMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 读取传送带服务当前状态快照。
+ * @param status 状态输出结构体，不能为空。
+ * @return uint8_t 1 表示读取成功，0 表示参数为空或传送带任务尚未创建队列。
+ *
+ * 该函数只做一次受临界区保护的内存拷贝，不访问 Emm42 串口，
+ * 因此可以被二进制协议层在 USART1 命令处理上下文中快速调用。
+ */
+uint8_t ConveyorMotorService_GetStatus(ConveyorMotor_Status_t *status)
+{
+    ConveyorMotor_RuntimeSnapshot_t snapshot;
+
+    if (status == NULL)
+    {
+        return 0U;
+    }
+
+    if (g_conveyor_motor_command_queue == NULL)
+    {
+        return 0U;
+    }
+
+    taskENTER_CRITICAL();
+    snapshot = g_conveyor_motor_runtime_snapshot;
+    taskEXIT_CRITICAL();
+
+    status->desired_mode = (uint8_t)snapshot.desired_mode;
+    status->applied_mode = (uint8_t)snapshot.applied_mode;
+    status->latest_error_px = snapshot.latest_error_px;
+    status->speed_rpm = snapshot.applied_speed_rpm;
+    status->direction = (snapshot.applied_direction == EMM42_MOTOR_DIRECTION_CCW) ? 1U : 0U;
+    status->stable_count = snapshot.center_stable_count;
+    status->centered = snapshot.centered_flag;
     return 1U;
 }
 
@@ -820,8 +919,8 @@ static EMM42_MotorStatus_t ConveyorMotorService_ApplyStartupConfig(const EMM42_M
 static void ConveyorMotorService_ReportReady(void)
 {
     my_printf(&huart1,
-              "[OK][BELT] Emm42 conveyor service started. USART6=PC6/PC7, addr=%u, mode=velocity, ctrl=%s\r\n",
-              (unsigned int)EMM42_MOTOR_DEFAULT_ADDRESS,
+              "[OK][BELT] Emm42 conveyor service started. UART4=PC10/PC11, addr=%u, mode=velocity, ctrl=%s\r\n",
+              (unsigned int)CONVEYOR_MOTOR_ADDRESS,
               ConveyorMotorService_GetControlModeName(CONVEYOR_MOTOR_STARTUP_CTRL_MODE));
     my_printf(&huart1,
               "[INFO][BELT] scan=%u rpm, track=%u~%u rpm, crawl<=%u px, deadband=%d px, stable=%u, timeout=%u ms\r\n",
@@ -1008,7 +1107,6 @@ static void ConveyorMotorService_ControlStep(const EMM42_MotorHandle_t *motor,
  */
 uint8_t ConveyorMotorService_HandleCommand(const char *command_buffer)
 {
-    ConveyorMotor_Command_t command;
     ConveyorMotor_RuntimeSnapshot_t snapshot;
     int32_t error_px = 0;
     uint8_t enable_flag = 0U;
@@ -1020,9 +1118,7 @@ uint8_t ConveyorMotorService_HandleCommand(const char *command_buffer)
 
     if (strcmp(command_buffer, "BELTSTOP") == 0)
     {
-        command.type = CONVEYOR_MOTOR_COMMAND_STOP;
-        command.error_px = 0;
-        if (ConveyorMotorService_PostCommand(&command) != 0U)
+        if (ConveyorMotorService_RequestStop() != 0U)
         {
             my_printf(&huart1, "[OK][BELT] Mode set to STOP.\r\n");
         }
@@ -1035,9 +1131,7 @@ uint8_t ConveyorMotorService_HandleCommand(const char *command_buffer)
 
     if (strcmp(command_buffer, "BELTSCAN") == 0)
     {
-        command.type = CONVEYOR_MOTOR_COMMAND_SCAN;
-        command.error_px = 0;
-        if (ConveyorMotorService_PostCommand(&command) != 0U)
+        if (ConveyorMotorService_RequestScan() != 0U)
         {
             my_printf(&huart1, "[OK][BELT] Mode set to SCAN.\r\n");
         }
@@ -1068,25 +1162,33 @@ uint8_t ConveyorMotorService_HandleCommand(const char *command_buffer)
 
     if (ConveyorMotorService_ParseTrackCommand(command_buffer, &error_px) != 0U)
     {
-        command.type = CONVEYOR_MOTOR_COMMAND_TRACK;
-        command.error_px = error_px;
-        (void)ConveyorMotorService_PostCommand(&command);
+        (void)ConveyorMotorService_RequestTrack(error_px);
         return 1U;
     }
 
     if (ConveyorMotorService_ParseEnableCommand(command_buffer, &enable_flag, &error_px) != 0U)
     {
-        command.type = (enable_flag == 0U) ? CONVEYOR_MOTOR_COMMAND_SCAN : CONVEYOR_MOTOR_COMMAND_TRACK;
-        command.error_px = error_px;
-        (void)ConveyorMotorService_PostCommand(&command);
+        if (enable_flag == 0U)
+        {
+            (void)ConveyorMotorService_RequestScan();
+        }
+        else
+        {
+            (void)ConveyorMotorService_RequestTrack(error_px);
+        }
         return 1U;
     }
 
     if (ConveyorMotorService_ParseCameraCommand(command_buffer, &enable_flag, &error_px) != 0U)
     {
-        command.type = (enable_flag == 0U) ? CONVEYOR_MOTOR_COMMAND_SCAN : CONVEYOR_MOTOR_COMMAND_TRACK;
-        command.error_px = error_px;
-        (void)ConveyorMotorService_PostCommand(&command);
+        if (enable_flag == 0U)
+        {
+            (void)ConveyorMotorService_RequestScan();
+        }
+        else
+        {
+            (void)ConveyorMotorService_RequestTrack(error_px);
+        }
         return 1U;
     }
 
@@ -1099,7 +1201,7 @@ uint8_t ConveyorMotorService_HandleCommand(const char *command_buffer)
  *
  * 任务职责：
  * 1. 初始化队列和电机驱动；
- * 2. 独占 `USART6` 发送运动命令；
+ * 2. 独占 `UART4` 发送传送带运动命令，避免和 USART6 上的两个摄像头运动电机冲突；
  * 3. 执行三态控制逻辑；
  * 4. 周期性同步运行时快照，供 `BELTINFO` 查询。
  */
@@ -1140,7 +1242,8 @@ void ConveyorMotorService_Task(void *argument)
         }
     }
 
-    EMM42_MotorLoadDefaultConfig(&motor, &huart6);
+    EMM42_MotorLoadDefaultConfig(&motor, &huart4);
+    motor.address = CONVEYOR_MOTOR_ADDRESS;
 
     for (;;)
     {

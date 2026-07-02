@@ -25,6 +25,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "camera_motor_service.h"
 #include "conveyor_motor_service.h"
 #include "ldc1614_service.h"
 #include "robot_arm_service.h"
@@ -58,6 +59,16 @@ static const osThreadAttr_t conveyorMotorTask_attributes = {
   .name = "conveyorMotorTask",             /* 任务名称用于 RTOS 调试视图识别传送带电机服务线程。 */
   .stack_size = 256 * 4,                   /* 任务栈大小按字节配置，用于容纳电机状态机、串口发送和局部变量开销。 */
   .priority = (osPriority_t) osPriorityNormal, /* 普通优先级保证电机控制能及时运行，同时不压制更高实时性采样任务。 */
+};
+
+/* 摄像头运动电机任务句柄保留在用户区，负责 USART6 上两个 Emm42 电机的串行控制。 */
+static osThreadId_t cameraMotorTaskHandle = NULL;
+
+/* 摄像头运动电机任务只响应点动/停止命令，优先级保持在普通业务级，避免阻塞称重和 LDC 采样。 */
+static const osThreadAttr_t cameraMotorTask_attributes = {
+  .name = "cameraMotorTask",               /* 任务名称用于 RTOS 调试视图识别摄像头运动电机服务线程。 */
+  .stack_size = 256 * 4,                   /* 任务内含两个 Emm42 句柄、队列命令和串口日志，预留 256 word 栈空间。 */
+  .priority = (osPriority_t) osPriorityNormal, /* 普通优先级保证点动命令能及时执行，同时不压制更高实时性采样任务。 */
 };
 
 /* 心跳灯任务句柄保留在用户区，避免后续 CubeMX 重新生成时被覆盖。 */
@@ -149,6 +160,17 @@ void MX_FREERTOS_Init(void) {
      * 传送带任务属于关键业务任务。
      * 若这里创建失败，后续串口命令虽然还能收发，但电机功能不会真正运行，
      * 因此直接进入统一错误处理，避免系统带着“半残状态”继续启动。
+     */
+    Error_Handler();
+  }
+
+  /* 摄像头运动电机任务独立创建，负责 USART6 PC6/PC7 上地址 0x02 和 0x03 两个 Emm42 电机。 */
+  cameraMotorTaskHandle = osThreadNew(CameraMotorService_Task, NULL, &cameraMotorTask_attributes);
+  if (cameraMotorTaskHandle == NULL)
+  {
+    /*
+     * 摄像头电机任务创建失败时，后续 `CAMFWD/CAMZ/CAMSTOP` 命令无法执行，
+     * 自动视觉微调也无法工作，因此按关键业务任务失败处理。
      */
     Error_Handler();
   }

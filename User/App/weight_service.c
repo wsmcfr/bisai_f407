@@ -1,5 +1,7 @@
 #include "weight_service.h"
 
+#include "binary_protocol_service.h"
+#include "camera_motor_service.h"
 #include "cmsis_os.h"
 #include "conveyor_motor_service.h"
 #include "hx711.h"
@@ -17,28 +19,27 @@
  * 通信入口：
  * - USART1：115200 8N1，PA9(TX)/PA10(RX)，由串口助手、MP157 或其它上位机发送命令；
  * - 本文件的 `WeightService_ProcessCommand()` 是当前 USART1 命令的唯一任务级消费者；
+ * - 自动检测二进制帧会先走 `BinaryProtocolService_HandleFrame()`，识别成功后不会继续按文本命令解析；
  * - 机械臂二进制帧会先走 `RobotArmService_HandleFrame()`，识别成功后直接转发到 USART3，不再按文本命令解析；
  * - 文本命令会去掉首尾空白并转成大写，因此 `get`、`GET\r\n`、`Get` 都等价于 `GET`。
  *
- * 用户可从 USART1 直接发送的文本命令：
- * | 命令 | 作用 | 是否影响硬件动作 | 典型返回 |
+ * MP157 主链路当前只允许发送自动检测二进制帧：
+ * | 命令类型 | 作用 | 正确返回 | 错误返回 |
  * | --- | --- | --- | --- |
- * | `GET` | 查询当前 HX711 重量；未标定时返回 raw/delta，已标定时返回 g | 否 | `[DATA][WEIGHT] ...` |
- * | `STATUS` | 响应 STM32MP157 或串口助手的在线心跳查询 | 否 | `[OK][F4] READY` |
- * | `TARE` | 重新执行 10 次采样去皮，并刷新 offset | 否，但会改变重量零点 | `[OK][WEIGHT] Tare success...` 或错误 |
- * | `CAL <克重>` | 用当前带载值和已知砝码重量标定比例，例如 `CAL 1000` | 否，但会改变称重比例 | `[OK][WEIGHT] Calibration success...` 或拒绝原因 |
- * | `LDCCAL CH1 [N]` / `LDCCAL CH2 [N]` | 转交 LDC 服务，单次放置工件并采集 N 个稳定样本 | 否 | `[OK][LDC] Calibration sampling armed...` |
- * | `LDCSTOP` | 转交 LDC 服务，停止当前 LDC 标定采样 | 否 | `[OK][LDC] Calibration sampling stopped.` |
- * | `BELTSTOP` | 转交传送带服务，停止 Emm42 电机 | 是，传送带停止 | `[OK][BELT] Mode set to STOP.` |
- * | `BELTSCAN` | 转交传送带服务，进入巡航扫描 | 是，传送带低速匀速运行 | `[OK][BELT] Mode set to SCAN.` |
- * | `BELTINFO` | 转交传送带服务，查询期望模式、实际速度、方向和对中状态 | 否 | `[INFO][BELT] desired=...` |
- * | `BELTTRACK <error>` | 转交传送带服务，用像素误差进入视觉跟踪，例如 `BELTTRACK 80` | 是，按误差方向/大小调速 | 无固定成功回包，状态可用 `BELTINFO` 查 |
- * | `BELTENABLE <0|1> [error]` | `0` 回巡航，`1` 按 error 跟踪 | 是 | 无固定成功回包 |
- * | `BELTCAM <enable> <current_x> <center_x>` | 下位机计算 `error=current_x-center_x` 后控制传送带 | 是 | 无固定成功回包 |
+ * | `HEARTBEAT` | 查询 F4 二进制协议入口是否在线 | `ACK` | `NACK` |
+ * | `START/PAUSE/RESUME/STOP/VISION/BELT` | 控制传送带和自动检测状态机 | `ACK` 或 `STATUS_REPORT` | `NACK` 或 `FAULT_REPORT` |
+ *
+ * 旧的 `GET/STATUS/TARE/CAL/LDCCAL/BELTSCAN/CAM...` 文本命令只作为断开 MP157 后的串口助手维护入口。
+ * USART1 文本输出默认静默，因此 MP157 不再依赖 `[OK]`、`[ERROR]` 或 `[INFO]` 文本判断成功失败。
  *
  * 用户可从 USART1 直接发送的机械臂二进制帧：
  * - 例如 `55 55 02 01` 查询 ESP32 版本，`55 55 05 06 03 01 00` 运行 3 号动作组 1 次；
  * - 详细帧表和接线要求在 `User/App/robot_arm_service.c` 顶部维护。
+ *
+ * 用户可从 USART1 直接发送的自动检测二进制帧：
+ * - 帧头固定 `A5 5A`，帧尾固定 `6B`，CRC16 覆盖 `VER~PAYLOAD`；
+ * - 首轮已接入 `START_CYCLE`、`PAUSE_CYCLE`、`RESUME_CYCLE`、`STOP_CYCLE`、`VISION_POS`、`VISION_LOST` 和 `BELT_STOP_CENTERED`；
+ * - 详细帧格式、命令字和负载字段在 `User/App/binary_protocol_service.h` 顶部维护。
  */
 
 /**
@@ -341,6 +342,12 @@ static void WeightService_ReportSample(const HX711_Handle_t *hx711,
 
     if (status != HX711_STATUS_OK)
     {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+        BinaryProtocolService_ReportFault((uint16_t)status,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)status,
+                                          0U);
         my_printf(&huart1, "[ERROR][WEIGHT] HX711 read failed, status=%d\r\n", (int)status);
         return;
     }
@@ -351,9 +358,17 @@ static void WeightService_ReportSample(const HX711_Handle_t *hx711,
          * 去皮尚未成功时，绝不把结果解释成重量。
          * 这样可以避免用户看到一个“看似正常”的假克重。
          */
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+        BinaryProtocolService_ReportFault((uint16_t)HX711_STATUS_INVALID_PARAM,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          raw_value,
+                                          0U);
         my_printf(&huart1, "[ERROR][WEIGHT] Tare not ready. raw=%ld\r\n", (long)raw_value);
         return;
     }
+
+    BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
 
     if (HX711_IsCalibrated(hx711) == 0U)
     {
@@ -391,14 +406,9 @@ static void WeightService_ReportSample(const HX711_Handle_t *hx711,
  * @param tare_ready 去皮状态指针，不能为空。
  * @param filter 滤波器对象，供重新去皮后复位窗口。
  *
- * 当前支持以下命令：
- * - `GET`：返回当前重量或净计数差值
- * - `STATUS`：返回 F4 在线握手状态，供 STM32MP157 判断下位机已接入
- * - `TARE`：重新执行一次去皮
- * - `CAL <克重>`：用当前带载值和已知砝码重量完成标定
- * - `LDCCAL CHx [N]`：启动 LDC 通道的稳定批量采样模式
- * - `LDCSTOP`：停止当前 LDC 标定采样会话
- * - `BELTSCAN / BELTSTOP / BELTTRACK <error> / BELTCAM ...`：传送带电机控制
+ * 当前支持以下输入：
+ * - `A5 5A ... 6B`：MP157 主链路二进制协议帧，先交给 BinaryProtocolService 处理；
+ * - 旧文本命令：仅作为串口助手维护入口，USART1 面向 MP157 时文本输出默认静默。
  */
 static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
                                          HX711_Status_t latest_status,
@@ -423,6 +433,16 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
                              &raw_frame_length,
                              WEIGHT_SERVICE_COMMAND_WAIT_MS) == 0U)
     {
+        return;
+    }
+
+    if (BinaryProtocolService_HandleFrame(raw_frame, raw_frame_length) != 0U)
+    {
+        /*
+         * 自动检测二进制协议使用 `A5 5A` 帧头和 CRC 校验。
+         * 不管业务命令最终 ACK 还是 NACK，只要识别为本协议帧，就不能再落入机械臂或文本命令解析分支，
+         * 否则 CRC 错帧可能被误当作乱码文本处理，现场排查会更混乱。
+         */
         return;
     }
 
@@ -469,10 +489,17 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
         status = WeightService_ExecuteTare(hx711, tare_ready, filter);
         if (status == HX711_STATUS_OK)
         {
+            BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
             my_printf(&huart1, "[OK][WEIGHT] Tare success. offset=%ld\r\n", (long)hx711->offset);
         }
         else
         {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+            BinaryProtocolService_ReportFault((uint16_t)status,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
+                                              BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                              (int32_t)status,
+                                              0U);
             my_printf(&huart1, "[ERROR][WEIGHT] Tare failed, status=%d\r\n", (int)status);
         }
     }
@@ -490,6 +517,12 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
         }
         else if (latest_status != HX711_STATUS_OK)
         {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+            BinaryProtocolService_ReportFault((uint16_t)latest_status,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
+                                              BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                              (int32_t)latest_status,
+                                              0U);
             my_printf(&huart1,
                       "[ERROR][WEIGHT] CAL rejected. Latest sample invalid, status=%d\r\n",
                       (int)latest_status);
@@ -502,6 +535,7 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
                 int32_t scale_x100;
                 int32_t scale_fraction;
 
+                BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
                 scale_x100 = (int32_t)(hx711->scale_counts_per_g * 100.0f);
                 scale_fraction = scale_x100 % 100;
                 if (scale_fraction < 0)
@@ -517,6 +551,12 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
             }
             else
             {
+                BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+                BinaryProtocolService_ReportFault((uint16_t)status,
+                                                  BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
+                                                  BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                                  (int32_t)status,
+                                                  0U);
                 my_printf(&huart1, "[ERROR][WEIGHT] Calibration failed, status=%d\r\n", (int)status);
             }
         }
@@ -529,6 +569,10 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
     {
         /* 传送带电机命令已由对应模块接管，这里不再重复输出。 */
     }
+    else if (CameraMotorService_HandleCommand(command_buffer) != 0U)
+    {
+        /* 摄像头运动电机命令已由对应模块接管，这里不再重复输出。 */
+    }
     else
     {
         /*
@@ -537,7 +581,7 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
          * 日志会被截断并和其它事件日志混在一起，反而更难看清。
          */
         my_printf(&huart1,
-                  "[ERROR][UART] Unknown cmd. Use STATUS/GET/TARE/CAL/LDCCAL/LDCSTOP/BELTSCAN/BELTSTOP/BELTTRACK/BELTINFO.\r\n");
+                  "[ERROR][UART] Unknown cmd. Use STATUS/GET/TARE/CAL/LDCCAL/LDCSTOP/BELTSCAN/BELTSTOP/BELTTRACK/BELTINFO/CAMINFO/CAMSTOP/CAMFWD/CAMZ.\r\n");
     }
 }
 
@@ -559,6 +603,8 @@ void WeightService_Task(void *argument)
     HX711_Status_t latest_status;
     int32_t latest_raw_value = 0;
     uint8_t tare_ready = 0U;
+    uint8_t hx711_ready = 0U;
+    uint8_t weight_fault_reported = 0U;
 
     (void)argument;
 
@@ -569,33 +615,54 @@ void WeightService_Task(void *argument)
     latest_status = HX711_Init(&hx711);
     if (latest_status != HX711_STATUS_OK)
     {
+        /*
+         * HX711 没接或 GPIO 初始化异常时，不能让任务停在死循环。
+         * WeightService_Task 同时是 USART1 命令消费者；如果这里阻塞，
+         * MP157 的 START_CYCLE/HEARTBEAT 二进制帧也会没人处理，传送带调试会被称重模块牵连。
+         * 因此只置位称重故障并继续跑主循环，让 MP157 通过 STATUS_REPORT/FAULT_REPORT 得到结构化错误。
+         */
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+        BinaryProtocolService_ReportFault((uint16_t)latest_status,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)latest_status,
+                                          0U);
+        weight_fault_reported = 1U;
         my_printf(&huart1, "[ERROR][WEIGHT] HX711 init failed.\r\n");
-        for (;;)
-        {
-            osDelay(1000U);
-        }
-    }
-
-    /*
-     * 启动阶段先尝试一次自动去皮。
-     * 若此时失败，不再像之前那样静默继续，而是保留错误状态并允许用户稍后手动发送 TARE。
-     */
-    latest_status = WeightService_ExecuteTare(&hx711, &tare_ready, &filter);
-    if (latest_status == HX711_STATUS_OK)
-    {
-        my_printf(&huart1, "[OK][WEIGHT] Startup tare success. offset=%ld\r\n", (long)hx711.offset);
     }
     else
     {
-        my_printf(&huart1,
-                  "[ERROR][WEIGHT] Startup tare failed, status=%d. Use TARE after checking wiring.\r\n",
-                  (int)latest_status);
-    }
+        hx711_ready = 1U;
 
-    my_printf(&huart1,
-              "[INFO][WEIGHT] HX711 ready. DOUT=PB0, SCK=PB2, capacity=%ld g, default CAL=%u g\r\n",
-              (long)hx711.rated_capacity_g,
-              (unsigned int)WEIGHT_SERVICE_DEFAULT_CAL_WEIGHT_G);
+        /*
+         * 启动阶段先尝试一次自动去皮。
+         * 若此时失败，不再像之前那样静默继续，而是保留错误状态并允许用户稍后手动发送 TARE。
+         */
+        latest_status = WeightService_ExecuteTare(&hx711, &tare_ready, &filter);
+        if (latest_status == HX711_STATUS_OK)
+        {
+            BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+            my_printf(&huart1, "[OK][WEIGHT] Startup tare success. offset=%ld\r\n", (long)hx711.offset);
+        }
+        else
+        {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+            BinaryProtocolService_ReportFault((uint16_t)latest_status,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
+                                              BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                              (int32_t)latest_status,
+                                              0U);
+            weight_fault_reported = 1U;
+            my_printf(&huart1,
+                      "[ERROR][WEIGHT] Startup tare failed, status=%d. Use TARE after checking wiring.\r\n",
+                      (int)latest_status);
+        }
+
+        my_printf(&huart1,
+                  "[INFO][WEIGHT] HX711 ready. DOUT=PB0, SCK=PB2, capacity=%ld g, default CAL=%u g\r\n",
+                  (long)hx711.rated_capacity_g,
+                  (unsigned int)WEIGHT_SERVICE_DEFAULT_CAL_WEIGHT_G);
+    }
 
     for (;;)
     {
@@ -603,10 +670,35 @@ void WeightService_Task(void *argument)
          * 主循环只负责持续刷新“最近一次滤波后采样值”，
          * 不主动周期上报。
          */
-        latest_status = HX711_ReadRaw(&hx711, &latest_raw_value, WEIGHT_SERVICE_READ_TIMEOUT_MS);
-        if (latest_status == HX711_STATUS_OK)
+        if (hx711_ready != 0U)
         {
-            latest_raw_value = WeightService_FilterPush(&filter, latest_raw_value);
+            latest_status = HX711_ReadRaw(&hx711, &latest_raw_value, WEIGHT_SERVICE_READ_TIMEOUT_MS);
+            if (latest_status == HX711_STATUS_OK)
+            {
+                latest_raw_value = WeightService_FilterPush(&filter, latest_raw_value);
+                if (tare_ready != 0U)
+                {
+                    BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+                    weight_fault_reported = 0U;
+                }
+            }
+            else
+            {
+                BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+                if (weight_fault_reported == 0U)
+                {
+                    BinaryProtocolService_ReportFault((uint16_t)latest_status,
+                                                      BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
+                                                      BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                                      (int32_t)latest_status,
+                                                      0U);
+                    weight_fault_reported = 1U;
+                }
+            }
+        }
+        else
+        {
+            latest_status = HX711_STATUS_TIMEOUT;
         }
 
         WeightService_ProcessCommand(&hx711,

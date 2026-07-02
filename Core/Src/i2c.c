@@ -102,7 +102,7 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
     __HAL_LINKDMA(i2cHandle,hdmatx,hdma_i2c2_tx);
 
     /* I2C2_RX Init */
-    hdma_i2c2_rx.Instance = DMA1_Stream2;
+    hdma_i2c2_rx.Instance = DMA1_Stream3;
     hdma_i2c2_rx.Init.Channel = DMA_CHANNEL_7;
     hdma_i2c2_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;
     hdma_i2c2_rx.Init.PeriphInc = DMA_PINC_DISABLE;
