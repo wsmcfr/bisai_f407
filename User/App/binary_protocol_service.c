@@ -5,6 +5,7 @@
 #include "conveyor_motor_service.h"
 #include "uart_command.h"
 #include "usart.h"
+#include "weight_service.h"
 #endif
 
 #include <string.h>
@@ -598,6 +599,34 @@ uint8_t BinaryProtocolService_DecodeStepperParam(const uint8_t *payload,
         decoded_payload->motors[index].direction = (int8_t)payload[offset + 6U];
     }
 
+    return 1U;
+}
+
+/**
+ * @brief 解码 WEIGHT_CALIBRATE 负载。
+ * @param payload 原始负载。
+ * @param payload_length 原始负载长度。
+ * @param decoded_payload 解码输出对象。
+ * @return uint8_t 1 表示解码成功，0 表示长度或参数非法。
+ *
+ * 负载固定 5 字节：
+ * cycle_id:u16、known_weight_g:u16、flags:u8。
+ */
+uint8_t BinaryProtocolService_DecodeWeightCalibration(const uint8_t *payload,
+                                                      uint8_t payload_length,
+                                                      BinaryProtocol_WeightCalibrationPayload_t *decoded_payload)
+{
+    if ((payload == NULL) ||
+        (decoded_payload == NULL) ||
+        (payload_length != BINARY_PROTOCOL_WEIGHT_CALIBRATION_PAYLOAD_LENGTH))
+    {
+        return 0U;
+    }
+
+    (void)memset(decoded_payload, 0, sizeof(*decoded_payload));
+    decoded_payload->cycle_id = BinaryProtocolService_ReadU16Le(&payload[0]);
+    decoded_payload->known_weight_g = BinaryProtocolService_ReadU16Le(&payload[2]);
+    decoded_payload->flags = payload[4];
     return 1U;
 }
 
@@ -1610,6 +1639,95 @@ static void BinaryProtocolService_HandleStepperParam(const BinaryProtocol_Frame_
 }
 
 /**
+ * @brief 把称重服务标定结果映射成二进制协议 NACK 错误码。
+ * @param result 称重服务返回的标定业务结果。
+ * @return BinaryProtocol_ErrorCode_t 协议层错误码。
+ *
+ * 映射原则：
+ * - 克重字段非法属于 FIELD_RANGE；
+ * - 未去皮或上下文未就绪属于 STATE_NOT_ALLOWED；
+ * - 最近采样失败或 HX711 标定函数失败属于 HARDWARE_FAULT。
+ */
+static BinaryProtocol_ErrorCode_t BinaryProtocolService_MapWeightCalibrationError(WeightService_CalibrationResult_t result)
+{
+    if (result == WEIGHT_SERVICE_CALIBRATION_WEIGHT_RANGE)
+    {
+        return BINARY_PROTOCOL_ERROR_FIELD_RANGE;
+    }
+
+    if ((result == WEIGHT_SERVICE_CALIBRATION_NO_CONTEXT) ||
+        (result == WEIGHT_SERVICE_CALIBRATION_TARE_NOT_READY))
+    {
+        return BINARY_PROTOCOL_ERROR_STATE_NOT_ALLOWED;
+    }
+
+    return BINARY_PROTOCOL_ERROR_HARDWARE_FAULT;
+}
+
+/**
+ * @brief 处理 WEIGHT_CALIBRATE。
+ * @param frame 已解析帧。
+ *
+ * 首版称重标定策略：
+ * 1. 负载必须是 5 字节；
+ * 2. cycle_id 必须为 0，表示人工维护命令，不绑定自动检测流程；
+ * 3. flags 必须为 0，避免 MP157 误以为当前支持自动去皮、保存 Flash 或其它扩展动作；
+ * 4. 克重字段交给称重服务按 HX711 额定量程和最近采样状态校验；
+ * 5. 成功只回 ACK，失败只回 NACK，USART1 不再输出文本作为 MP157 判断依据。
+ */
+static void BinaryProtocolService_HandleWeightCalibration(const BinaryProtocol_Frame_t *frame)
+{
+    BinaryProtocol_WeightCalibrationPayload_t payload;
+    WeightService_CalibrationResult_t calibration_result;
+    uint16_t detail = 0U;
+
+    if (BinaryProtocolService_DecodeWeightCalibration(frame->payload,
+                                                      frame->payload_length,
+                                                      &payload) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_PAYLOAD_LENGTH,
+                                       frame->payload_length);
+        return;
+    }
+
+    if (payload.cycle_id != 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.cycle_id);
+        return;
+    }
+
+    if (payload.flags != 0U)
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.flags);
+        return;
+    }
+
+    calibration_result = WeightService_RequestCalibration(payload.known_weight_g, &detail);
+    if (calibration_result == WEIGHT_SERVICE_CALIBRATION_OK)
+    {
+        BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U);
+        return;
+    }
+
+    BinaryProtocolService_SendNack(payload.cycle_id,
+                                   frame->sequence,
+                                   frame->command,
+                                   BinaryProtocolService_MapWeightCalibrationError(calibration_result),
+                                   detail);
+}
+
+/**
  * @brief 处理一帧来自 USART1 的二进制协议。
  * @param frame_buffer 原始帧缓存。
  * @param frame_length 原始帧长度。
@@ -1675,6 +1793,10 @@ uint8_t BinaryProtocolService_HandleFrame(const uint8_t *frame_buffer, uint16_t 
 
         case BINARY_PROTOCOL_CMD_BELT_STOP_CENTERED:
             BinaryProtocolService_HandleBeltCentered(&frame);
+            break;
+
+        case BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE:
+            BinaryProtocolService_HandleWeightCalibration(&frame);
             break;
 
         case BINARY_PROTOCOL_CMD_QUERY_STATUS:

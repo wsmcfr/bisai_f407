@@ -153,6 +153,14 @@ extern "C" {
 #define BINARY_PROTOCOL_STEPPER_PARAM_PAYLOAD_LENGTH (25U)
 
 /**
+ * @brief `WEIGHT_CALIBRATE` 命令负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、known_weight_g:u16、flags:u8。
+ * 当前称重标定是人工维护动作，不绑定自动检测流程，所以 cycle_id 固定为 0。
+ */
+#define BINARY_PROTOCOL_WEIGHT_CALIBRATION_PAYLOAD_LENGTH (5U)
+
+/**
  * @brief `ACK` 命令负载长度，单位字节。
  */
 #define BINARY_PROTOCOL_ACK_PAYLOAD_LENGTH           (7U)
@@ -186,7 +194,8 @@ typedef enum
     BINARY_PROTOCOL_CMD_VISION_POS = 0x20U,         /* 视觉坐标命令，F4 根据坐标误差控制传送带。 */
     BINARY_PROTOCOL_CMD_VISION_LOST = 0x21U,        /* 视觉丢失命令，F4 根据原因回扫描或停机。 */
     BINARY_PROTOCOL_CMD_BELT_STOP_CENTERED = 0x22U, /* 零件已进中心 ROI，要求 F4 停止传送带。 */
-    BINARY_PROTOCOL_CMD_MODEL_READY = 0x30U,        /* 模型检测完成，首轮仅保留命令字。 */
+    BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE = 0x30U,   /* 称重标定命令，使用已知砝码更新 HX711 运行时比例系数。 */
+    BINARY_PROTOCOL_CMD_MODEL_READY = BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE, /* 历史名称兼容：旧 MP157 曾临时用 0x30 做占位。 */
     BINARY_PROTOCOL_CMD_ARM_JOB_START = 0x31U,      /* 机械臂任务开始，首轮仅保留命令字。 */
     BINARY_PROTOCOL_CMD_QUERY_STATUS = 0x40U,       /* 查询 F4 和传送带结构化状态，成功返回 STATUS_REPORT。 */
     BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL = 0x41U, /* 手动调试传送带扫描/停止，成功返回 ACK。 */
@@ -412,6 +421,16 @@ typedef struct
     BinaryProtocol_StepperMotorConfig_t motors[3]; /* 三台电机参数，按 role_id 识别业务角色。 */
 } BinaryProtocol_StepperParamPayload_t;
 
+/**
+ * @brief `WEIGHT_CALIBRATE` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前人工标定不绑定自动检测流程，首版固定填 0。 */
+    uint16_t known_weight_g;                      /* 已知砝码重量，单位克，F4 按当前 HX711 量程校验。 */
+    uint8_t flags;                                /* 保留标志位，首版固定填 0，不能表示自动去皮或持久化。 */
+} BinaryProtocol_WeightCalibrationPayload_t;
+
 uint8_t BinaryProtocolService_IsBinaryFrame(const uint8_t *frame_buffer, uint16_t frame_length);
 uint16_t BinaryProtocolService_Crc16CcittFalse(const uint8_t *data, uint16_t length);
 BinaryProtocol_ParseStatus_t BinaryProtocolService_ParseFrame(const uint8_t *frame_buffer,
@@ -453,6 +472,9 @@ uint8_t BinaryProtocolService_DecodeBeltManual(const uint8_t *payload,
 uint8_t BinaryProtocolService_DecodeStepperParam(const uint8_t *payload,
                                                  uint8_t payload_length,
                                                  BinaryProtocol_StepperParamPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeWeightCalibration(const uint8_t *payload,
+                                                      uint8_t payload_length,
+                                                      BinaryProtocol_WeightCalibrationPayload_t *decoded_payload);
 uint8_t BinaryProtocolService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_length);
 void BinaryProtocolService_SetFaultBit(uint16_t fault_bit);
 void BinaryProtocolService_ClearFaultBit(uint16_t fault_bit);

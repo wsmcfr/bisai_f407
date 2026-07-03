@@ -102,6 +102,33 @@ typedef struct
 } WeightService_Filter_t;
 
 /**
+ * @brief 二进制标定入口使用的称重运行上下文。
+ *
+ * USART1 二进制协议由 WeightService_Task 消费，所以协议处理函数和 HX711 状态天然处于同一个任务调用链。
+ * 这里保存指针和最近一次采样快照，让 binary_protocol_service.c 能通过公开函数请求标定，
+ * 但仍不直接访问 weight_service.c 内部的静态局部变量。
+ */
+typedef struct
+{
+    HX711_Handle_t *hx711;              /* 当前称重任务持有的 HX711 句柄，标定时写入 scale_counts_per_g。 */
+    HX711_Status_t latest_status;       /* 最近一次 HX711 采样状态，用于拒绝超时或参数错误的样本。 */
+    int32_t latest_raw_value;           /* 最近一次中值滤波后的原始计数，单位为 HX711 ADC counts。 */
+    uint8_t *tare_ready;                /* 指向称重任务去皮完成标志，1 表示 offset 可用于标定。 */
+} WeightService_BinaryContext_t;
+
+/**
+ * @brief 保存最近一次可供二进制协议使用的称重上下文。
+ *
+ * 该变量只在 WeightService_Task 所在线程更新和读取；当前没有跨任务并发写入。
+ */
+static WeightService_BinaryContext_t g_weight_service_binary_context = {
+    (HX711_Handle_t *)0,
+    HX711_STATUS_INVALID_PARAM,
+    0,
+    (uint8_t *)0
+};
+
+/**
  * @brief 复位滤波器状态。
  * @param filter 滤波器对象指针，不能为空。
  *
@@ -323,6 +350,137 @@ static HX711_Status_t WeightService_ExecuteTare(HX711_Handle_t *hx711,
 }
 
 /**
+ * @brief 更新二进制协议标定所需的称重快照。
+ * @param hx711 HX711 句柄指针，不能为空。
+ * @param latest_status 最近一次采样状态。
+ * @param latest_raw_value 最近一次滤波后的原始计数。
+ * @param tare_ready 去皮状态指针，不能为空。
+ *
+ * 每次从 USART1 取到命令后、进入二进制协议分发前调用本函数，
+ * 让协议层回调 WeightService_RequestCalibration() 时能拿到同一轮任务中的最新状态。
+ */
+static void WeightService_UpdateBinaryContext(HX711_Handle_t *hx711,
+                                              HX711_Status_t latest_status,
+                                              int32_t latest_raw_value,
+                                              uint8_t *tare_ready)
+{
+    g_weight_service_binary_context.hx711 = hx711;
+    g_weight_service_binary_context.latest_status = latest_status;
+    g_weight_service_binary_context.latest_raw_value = latest_raw_value;
+    g_weight_service_binary_context.tare_ready = tare_ready;
+}
+
+/**
+ * @brief 使用指定称重快照执行一次标定。
+ * @param hx711 HX711 句柄指针，不能为空。
+ * @param latest_status 最近一次采样状态。
+ * @param latest_raw_value 最近一次滤波后的原始计数。
+ * @param tare_ready 去皮状态，1 表示可以标定。
+ * @param known_weight_g 已知砝码重量，单位克。
+ * @param detail 输出失败细节或 0，不能为空。
+ * @return WeightService_CalibrationResult_t 标定业务结果。
+ *
+ * 该函数是文本 `CAL <克重>` 和二进制 `WEIGHT_CALIBRATE` 的共同实现：
+ * 1. 先检查去皮状态，避免用未定义 offset 计算比例；
+ * 2. 再检查克重是否落在 HX711 量程内；
+ * 3. 再检查最近一次采样是否有效；
+ * 4. 最后调用 HX711_CalibrateByKnownWeight() 写入运行时比例系数。
+ */
+static WeightService_CalibrationResult_t WeightService_ExecuteCalibration(HX711_Handle_t *hx711,
+                                                                          HX711_Status_t latest_status,
+                                                                          int32_t latest_raw_value,
+                                                                          uint8_t tare_ready,
+                                                                          uint16_t known_weight_g,
+                                                                          uint16_t *detail)
+{
+    HX711_Status_t status;
+
+    if (detail == NULL)
+    {
+        return WEIGHT_SERVICE_CALIBRATION_NO_CONTEXT;
+    }
+
+    *detail = 0U;
+    if (hx711 == NULL)
+    {
+        *detail = 0U;
+        return WEIGHT_SERVICE_CALIBRATION_NO_CONTEXT;
+    }
+
+    if (tare_ready == 0U)
+    {
+        *detail = 0U;
+        return WEIGHT_SERVICE_CALIBRATION_TARE_NOT_READY;
+    }
+
+    if ((known_weight_g == 0U) || ((float)known_weight_g > hx711->rated_capacity_g))
+    {
+        *detail = known_weight_g;
+        return WEIGHT_SERVICE_CALIBRATION_WEIGHT_RANGE;
+    }
+
+    if (latest_status != HX711_STATUS_OK)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+        BinaryProtocolService_ReportFault((uint16_t)latest_status,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)latest_status,
+                                          0U);
+        *detail = (uint16_t)latest_status;
+        return WEIGHT_SERVICE_CALIBRATION_SAMPLE_INVALID;
+    }
+
+    status = HX711_CalibrateByKnownWeight(hx711, latest_raw_value, (float)known_weight_g);
+    if (status == HX711_STATUS_OK)
+    {
+        BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+        *detail = 0U;
+        return WEIGHT_SERVICE_CALIBRATION_OK;
+    }
+
+    BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+    BinaryProtocolService_ReportFault((uint16_t)status,
+                                      BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
+                                      BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                      (int32_t)status,
+                                      0U);
+    *detail = (uint16_t)status;
+    return WEIGHT_SERVICE_CALIBRATION_HARDWARE_ERROR;
+}
+
+/**
+ * @brief 执行一次由 MP157 二进制协议触发的称重标定。
+ * @param known_weight_g 已知砝码重量，单位克。
+ * @param detail 输出失败细节或 0，不能为空。
+ * @return WeightService_CalibrationResult_t 标定业务结果。
+ *
+ * 二进制协议处理函数不拥有 HX711 句柄，也不读取称重任务局部变量。
+ * 它只调用本函数，由称重服务使用最近一次快照完成校验和标定。
+ */
+WeightService_CalibrationResult_t WeightService_RequestCalibration(uint16_t known_weight_g,
+                                                                   uint16_t *detail)
+{
+    if ((detail == NULL) ||
+        (g_weight_service_binary_context.hx711 == NULL) ||
+        (g_weight_service_binary_context.tare_ready == NULL))
+    {
+        if (detail != NULL)
+        {
+            *detail = 0U;
+        }
+        return WEIGHT_SERVICE_CALIBRATION_NO_CONTEXT;
+    }
+
+    return WeightService_ExecuteCalibration(g_weight_service_binary_context.hx711,
+                                            g_weight_service_binary_context.latest_status,
+                                            g_weight_service_binary_context.latest_raw_value,
+                                            *(g_weight_service_binary_context.tare_ready),
+                                            known_weight_g,
+                                            detail);
+}
+
+/**
  * @brief 输出当前重量、净计数差值或错误信息。
  * @param hx711 HX711句柄指针，不能为空。
  * @param status 当前读数状态。
@@ -436,6 +594,8 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
         return;
     }
 
+    WeightService_UpdateBinaryContext(hx711, latest_status, latest_raw_value, tare_ready);
+
     if (BinaryProtocolService_HandleFrame(raw_frame, raw_frame_length) != 0U)
     {
         /*
@@ -505,60 +665,63 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
     }
     else if (WeightService_ParseCalibrationWeight(command_buffer, &known_weight_g) == 1U)
     {
-        if (*tare_ready == 0U)
+        uint16_t calibration_detail;
+        WeightService_CalibrationResult_t calibration_result;
+
+        if (known_weight_g > 0xFFFFUL)
+        {
+            calibration_result = WEIGHT_SERVICE_CALIBRATION_WEIGHT_RANGE;
+            calibration_detail = 0xFFFFU;
+        }
+        else
+        {
+            calibration_result = WeightService_ExecuteCalibration(hx711,
+                                                                  latest_status,
+                                                                  latest_raw_value,
+                                                                  *tare_ready,
+                                                                  (uint16_t)known_weight_g,
+                                                                  &calibration_detail);
+        }
+
+        if (calibration_result == WEIGHT_SERVICE_CALIBRATION_OK)
+        {
+            int32_t scale_x100;
+            int32_t scale_fraction;
+
+            scale_x100 = (int32_t)(hx711->scale_counts_per_g * 100.0f);
+            scale_fraction = scale_x100 % 100;
+            if (scale_fraction < 0)
+            {
+                scale_fraction = -scale_fraction;
+            }
+
+            my_printf(&huart1,
+                      "[OK][WEIGHT] Calibration success. weight=%lu g, scale=%ld.%02ld counts/g\r\n",
+                      (unsigned long)known_weight_g,
+                      (long)(scale_x100 / 100),
+                      (long)scale_fraction);
+        }
+        else if (calibration_result == WEIGHT_SERVICE_CALIBRATION_TARE_NOT_READY)
         {
             my_printf(&huart1, "[ERROR][WEIGHT] CAL rejected. Tare is not ready.\r\n");
         }
-        else if ((known_weight_g == 0U) || ((float)known_weight_g > hx711->rated_capacity_g))
+        else if (calibration_result == WEIGHT_SERVICE_CALIBRATION_WEIGHT_RANGE)
         {
             my_printf(&huart1,
                       "[ERROR][WEIGHT] CAL rejected. Weight must be 1~%ld g.\r\n",
                       (long)hx711->rated_capacity_g);
         }
-        else if (latest_status != HX711_STATUS_OK)
+        else if (calibration_result == WEIGHT_SERVICE_CALIBRATION_SAMPLE_INVALID)
         {
-            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
-            BinaryProtocolService_ReportFault((uint16_t)latest_status,
-                                              BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
-                                              BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
-                                              (int32_t)latest_status,
-                                              0U);
             my_printf(&huart1,
-                      "[ERROR][WEIGHT] CAL rejected. Latest sample invalid, status=%d\r\n",
-                      (int)latest_status);
+                      "[ERROR][WEIGHT] CAL rejected. Latest sample invalid, status=%u\r\n",
+                      (unsigned int)calibration_detail);
         }
         else
         {
-            status = HX711_CalibrateByKnownWeight(hx711, latest_raw_value, (float)known_weight_g);
-            if (status == HX711_STATUS_OK)
-            {
-                int32_t scale_x100;
-                int32_t scale_fraction;
-
-                BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
-                scale_x100 = (int32_t)(hx711->scale_counts_per_g * 100.0f);
-                scale_fraction = scale_x100 % 100;
-                if (scale_fraction < 0)
-                {
-                    scale_fraction = -scale_fraction;
-                }
-
-                my_printf(&huart1,
-                          "[OK][WEIGHT] Calibration success. weight=%lu g, scale=%ld.%02ld counts/g\r\n",
-                          (unsigned long)known_weight_g,
-                          (long)(scale_x100 / 100),
-                          (long)scale_fraction);
-            }
-            else
-            {
-                BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
-                BinaryProtocolService_ReportFault((uint16_t)status,
-                                                  BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT,
-                                                  BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
-                                                  (int32_t)status,
-                                                  0U);
-                my_printf(&huart1, "[ERROR][WEIGHT] Calibration failed, status=%d\r\n", (int)status);
-            }
+            my_printf(&huart1,
+                      "[ERROR][WEIGHT] Calibration failed, status=%u\r\n",
+                      (unsigned int)calibration_detail);
         }
     }
     else if (Ldc1614Service_HandleCommand(command_buffer) != 0U)
