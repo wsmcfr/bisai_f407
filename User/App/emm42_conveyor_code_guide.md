@@ -8,17 +8,17 @@
 
 | 功能 | Emm42 地址 ID | F4 串口 | F4 引脚 | 负责模块 |
 |---|---:|---|---|---|
-| 传送带电机 | `0x01` | `UART4` | `PC10(TX) / PC11(RX)` | `User/App/conveyor_motor_service.c` |
-| 摄像头前进/后退电机 | `0x02` | `USART6` | `PC6(TX) / PC7(RX)` | `User/App/camera_motor_service.c` |
-| 摄像头上下电机 | `0x03` | `USART6` | `PC6(TX) / PC7(RX)` | `User/App/camera_motor_service.c` |
+| 传送带电机 | 默认 `0x01` | `UART4` | `PC10(TX) / PC11(RX)` | `User/App/conveyor_motor_service.c` |
+| 摄像头前进/后退电机 | 默认 `0x02` | `USART6` | `PC6(TX) / PC7(RX)` | `User/App/camera_motor_service.c` |
+| 摄像头上下电机 | 默认 `0x03` | `USART6` | `PC6(TX) / PC7(RX)` | `User/App/camera_motor_service.c` |
 
 结论：
 
 | 问题 | 答案 |
 |---|---|
 | 传送带是否还使用 `USART6` | 不使用，传送带固定使用 `UART4 PC10/PC11`。 |
-| 摄像头前进/后退步进电机 ID | `0x02` |
-| 摄像头上下移动步进电机 ID | `0x03` |
+| 摄像头前进/后退步进电机 ID | 默认 `0x02`，可由 MP157 `STEPPER_PARAM_SET` 更新 F4 运行时参数 |
+| 摄像头上下移动步进电机 ID | 默认 `0x03`，可由 MP157 `STEPPER_PARAM_SET` 更新 F4 运行时参数 |
 
 ## 2. Current File Map
 
@@ -28,10 +28,11 @@
 | `Core/Src/freertos.c` | FreeRTOS 任务启动胶水 | 创建传送带任务 `ConveyorMotorService_Task()` 和摄像头电机任务 `CameraMotorService_Task()`。 |
 | `User/App/uart_command.c` | `USART1` 命令接收与线程安全打印 | 只负责收完整命令和安全打印，不直接控制电机。 |
 | `User/App/weight_service.c` | `USART1` 统一命令分发入口 | 分发 `BELT...` 到传送带服务，分发 `CAM...` 到摄像头电机服务。 |
-| `User/App/conveyor_motor_service.c` | 传送带状态机 | 绑定 `huart4`，电机地址固定 `0x01`。 |
-| `User/App/conveyor_motor_service.h` | 传送带服务公共接口 | 暴露任务入口和 `RequestScan/RequestStop/RequestTrack`。 |
-| `User/App/camera_motor_service.c` | 摄像头运动电机服务 | 绑定 `huart6`，前进/后退轴地址 `0x02`，上下轴地址 `0x03`。 |
-| `User/App/camera_motor_service.h` | 摄像头电机公共接口 | 暴露任务入口和 `CAM...` 命令处理入口。 |
+| `User/App/conveyor_motor_service.c` | 传送带状态机 | 绑定 `huart4`，默认地址 `0x01`；通过运行时配置支持地址、最小步长、常规速度和方向映射。 |
+| `User/App/conveyor_motor_service.h` | 传送带服务公共接口 | 暴露任务入口、`RequestScan/RequestStop/RequestTrack` 和 `RequestRuntimeConfig`。 |
+| `User/App/camera_motor_service.c` | 摄像头运动电机服务 | 绑定 `huart6`，默认地址 `0x02/0x03`；通过运行时配置支持两轴地址、最小步长、常规速度和方向映射。 |
+| `User/App/camera_motor_service.h` | 摄像头电机公共接口 | 暴露任务入口、`CAM...` 命令处理入口和 `RequestRuntimeConfig`。 |
+| `User/App/binary_protocol_service.c/.h` | MP157-F4 二进制协议 | 新增 `STEPPER_PARAM_SET 0x42`，把 MP157 参数页的三台电机配置投递到对应电机任务。 |
 | `User/Driver/emm42_motor.c` | Emm42 TTL 协议帧发送 | 通用驱动层，按句柄中的 `huart` 和 `address` 发送命令。 |
 | `User/Driver/emm42_motor.h` | Emm42 协议类型声明 | 定义电机句柄、方向、控制模式和发送接口。 |
 | `User/App/emm42_motor_uart_binding.md` | 串口与 ID 绑定总文档 | 现场调试时优先查这份文档。 |
@@ -46,9 +47,9 @@
 | 2 | `User/App/uart_command.c` | `UartCommand_Fetch()` / `UartCommand_FetchRaw()` | 把完整命令交给任务上下文。 |
 | 3 | `User/App/weight_service.c` | `WeightService_ProcessCommand()` | 统一分发二进制协议、机械臂帧和 ASCII 文本命令。 |
 | 4 | `User/App/conveyor_motor_service.c` | `ConveyorMotorService_HandleCommand()` | 解析 `BELTSCAN/BELTSTOP/BELTTRACK/BELTCAM/BELTENABLE/BELTINFO`。 |
-| 5 | `User/App/conveyor_motor_service.c` | `ConveyorMotorService_RequestScan/Stop/Track()` | 把控制意图投递到传送带任务队列。 |
+| 5 | `User/App/conveyor_motor_service.c` | `ConveyorMotorService_RequestScan/Stop/Track/RuntimeConfig()` | 把控制意图或运行时参数投递到传送带任务队列。 |
 | 6 | `User/App/conveyor_motor_service.c` | `ConveyorMotorService_Task()` | 独占 `UART4` 推进 `SCAN/TRACK/STOP` 状态机。 |
-| 7 | `User/Driver/emm42_motor.c` | `EMM42_MotorSetVelocity()` / `EMM42_MotorStopNow()` | 按地址 `0x01` 组帧并通过 `UART4` 发送给传送带电机。 |
+| 7 | `User/Driver/emm42_motor.c` | `EMM42_MotorSetVelocity()` / `EMM42_MotorStopNow()` | 按当前运行时地址组帧并通过 `UART4` 发送给传送带电机。 |
 
 摄像头两个运动轴的调试链路如下：
 
@@ -83,16 +84,25 @@
 | `CAMZ UP [rpm]` | 摄像头上下轴向上点动。 | `USART6 PC6/PC7 addr=0x03` |
 | `CAMZ DOWN [rpm]` | 摄像头上下轴向下点动。 | `USART6 PC6/PC7 addr=0x03` |
 
+### 4.3 MP157 二进制参数命令
+
+| 命令 | 作用 | 生效范围 |
+|---|---|---|
+| `STEPPER_PARAM_SET 0x42` | 一次下发三台电机的地址、最小步长、常规速度和方向映射。 | 只更新 F4 运行内存；不会写 F4 Flash，也不会写 Emm42 EEPROM。 |
+
+字段约束：地址 `1~247`，最小步长 `1~10000 step`，常规速度 `0~5000 rpm`，方向只能 `1/-1`。其中传送带常规速度用于扫描，摄像头两轴常规速度用于省略 rpm 时的默认点动速度。
+
 ## 5. Startup Behavior
 
 | 阶段 | 传送带任务行为 |
 |---|---|
 | 创建队列 | 创建长度为 1 的覆盖队列，只保留最新控制意图。 |
-| 绑定驱动 | `EMM42_MotorLoadDefaultConfig(&motor, &huart4)`，随后把地址覆盖为 `0x01`。 |
+| 绑定驱动 | `EMM42_MotorLoadDefaultConfig(&motor, &huart4)`，随后把地址覆盖为运行时配置默认值 `0x01`。 |
 | 启动修复 | 恢复闭环 FOC 控制模式，并按配置锁定电机面板按键。 |
 | 使能电机 | 发送 Emm42 使能帧。 |
 | 启动停机 | 发送立即停止帧，保证上电后处于已知静止态。 |
 | 默认模式 | 当前 `CONVEYOR_MOTOR_STARTUP_SCAN_ENABLE` 为 `0`，上电不自动巡航，等待 MP157 `START_CYCLE` 或调试命令 `BELTSCAN`。 |
+| 运行时参数 | MP157 下发 `STEPPER_PARAM_SET` 后，任务先进入 STOP，再更新当前地址、常规速度和方向映射。 |
 
 ## 6. Hardware Setup Notes
 
@@ -101,7 +111,7 @@
 | 传送带接线 | F4 `PC10(TX)` 接传送带 Emm42 `RX`，F4 `PC11(RX)` 接传送带 Emm42 `TX`。 |
 | 摄像头接线 | F4 `PC6(TX)` 接两个摄像头 Emm42 `RX`，F4 `PC7(RX)` 接两个摄像头 Emm42 `TX`。 |
 | 共地 | F4、Emm42 驱动器、电机电源必须共地。 |
-| 地址 | 同一条 `USART6` 上两个摄像头电机必须分别设置为 `0x02` 和 `0x03`。 |
+| 地址 | 同一条 `USART6` 上两个摄像头电机默认分别设置为 `0x02` 和 `0x03`；运行时下发时也必须互不相同。 |
 | 禁止混接 | 传送带不能再接到 `USART6 PC6/PC7`，否则会和摄像头两个电机抢总线。 |
 
 ## 7. Verification
@@ -111,7 +121,8 @@
 | 确认传送带串口 | USART1 串口助手 | `BELTINFO` | 输出 `[INFO][BELT] ...`，启动日志应含 `UART4=PC10/PC11, addr=1`。 | 检查 `conveyor_motor_service.c` 是否绑定 `huart4`，检查 PC10/PC11 接线和共地。 |
 | 启动传送带扫描 | USART1 串口助手 | `BELTSCAN` | 只有传送带电机动作。 | 如果摄像头电机动作，检查接线是否把传送带接到了 USART6。 |
 | 停止传送带 | USART1 串口助手 | `BELTSTOP` | 传送带停止。 | 检查 UART4 TX/RX 是否交叉、Emm42 地址是否为 `0x01`。 |
-| 查询摄像头电机 | USART1 串口助手 | `CAMINFO` | 输出 `USART6=PC6/PC7, forward_addr=2, z_addr=3`。 | 如果未知命令，检查 `weight_service.c` 是否接入 `CameraMotorService_HandleCommand()`。 |
+| 查询摄像头电机 | USART1 串口助手 | `CAMINFO` | 输出 `USART6=PC6/PC7, forward_addr=2, z_addr=3`，并显示两轴 `min_step/speed/dir`。 | 如果未知命令，检查 `weight_service.c` 是否接入 `CameraMotorService_HandleCommand()`。 |
+| 下发三电机参数 | MP157 Qt 参数页 | `参数设置 -> 步进参数 -> 保存并下发` | F4 返回 `ACK acked_cmd=0x42 status=0`；再发 `CAMINFO` 能看到摄像头两轴参数变化。 | 如果只保存 JSON 没 ACK，说明没有下发；如果 F4 没变化，确认 F4 固件已重新编译下载。 |
 | 测试摄像头前进轴 | USART1 串口助手 | `CAMFWD FORWARD 30` | 只有摄像头前进/后退轴动作。 | 如果上下轴动作，检查两个摄像头电机 ID 是否接反。 |
 | 测试摄像头上下轴 | USART1 串口助手 | `CAMZ UP 30` | 只有摄像头上下轴动作。 | 如果两个电机都动，检查两个电机是否仍是相同地址。 |
 | 停止摄像头两个轴 | USART1 串口助手 | `CAMSTOP` | 两个摄像头运动轴停止。 | 检查 USART6 接线、地址和供电。 |
@@ -124,3 +135,4 @@
 | 2026-07-02 | 明确摄像头前进/后退电机使用 `USART6 PC6/PC7 addr=0x02`。 |
 | 2026-07-02 | 明确摄像头上下电机使用 `USART6 PC6/PC7 addr=0x03`。 |
 | 2026-07-02 | 移除旧版“传送带继续复用 USART6/huart6”的说明，避免现场调试误接线。 |
+| 2026-07-03 | 增加 `STEPPER_PARAM_SET 0x42` 运行时参数说明；三台 Emm42 常规速度统一支持 `0~5000 rpm`。 |

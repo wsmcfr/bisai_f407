@@ -45,6 +45,7 @@ extern "C" {
  * | `0x22` | BELT_STOP_CENTERED | MP157 -> F4 | 停止传送带，表示零件已进入中心 ROI。 |
  * | `0x40` | QUERY_STATUS | MP157 -> F4 | 查询 F4 协议状态和传送带状态，成功回 STATUS_REPORT。 |
  * | `0x41` | BELT_MANUAL_CONTROL | MP157 -> F4 | 手动调试传送带扫描/停止，成功回 ACK。 |
+ * | `0x42` | STEPPER_PARAM_SET | MP157 -> F4 | 下发三台 Emm42 的地址、最小步长、常规速度和方向，成功回 ACK。 |
  * | `0x80` | ACK | F4 -> MP157 | 确认命令被接受。 |
  * | `0x81` | NACK | F4 -> MP157 | 拒绝命令并返回错误码。 |
  * | `0x82` | STATUS_REPORT | F4 -> MP157 | 查询成功后的结构化状态回包。 |
@@ -144,6 +145,14 @@ extern "C" {
 #define BINARY_PROTOCOL_BELT_MANUAL_PAYLOAD_LENGTH  (4U)
 
 /**
+ * @brief `STEPPER_PARAM_SET` 命令负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、motor_count:u8、flags:u8、
+ * 然后三条 7 字节电机记录：role_id、address、min_step、normal_speed_rpm、direction。
+ */
+#define BINARY_PROTOCOL_STEPPER_PARAM_PAYLOAD_LENGTH (25U)
+
+/**
  * @brief `ACK` 命令负载长度，单位字节。
  */
 #define BINARY_PROTOCOL_ACK_PAYLOAD_LENGTH           (7U)
@@ -181,6 +190,7 @@ typedef enum
     BINARY_PROTOCOL_CMD_ARM_JOB_START = 0x31U,      /* 机械臂任务开始，首轮仅保留命令字。 */
     BINARY_PROTOCOL_CMD_QUERY_STATUS = 0x40U,       /* 查询 F4 和传送带结构化状态，成功返回 STATUS_REPORT。 */
     BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL = 0x41U, /* 手动调试传送带扫描/停止，成功返回 ACK。 */
+    BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET = 0x42U,  /* 下发三台 Emm42 运行时参数，成功返回 ACK。 */
     BINARY_PROTOCOL_CMD_ACK = 0x80U,                /* ACK 回包，表示命令已被接受。 */
     BINARY_PROTOCOL_CMD_NACK = 0x81U,               /* NACK 回包，表示命令被拒绝并携带错误码。 */
     BINARY_PROTOCOL_CMD_STATUS_REPORT = 0x82U,      /* 状态上报，首轮保留给 MP157 查询和 UI 展示。 */
@@ -379,6 +389,29 @@ typedef struct
     uint8_t flags;                                /* 标志位，首版填 0。 */
 } BinaryProtocol_BeltManualPayload_t;
 
+/**
+ * @brief 单台步进电机参数记录。
+ */
+typedef struct
+{
+    uint8_t role_id;                              /* 电机角色：1=传送带，2=摄像头前后，3=摄像头上下。 */
+    uint8_t address;                              /* Emm42 地址，允许 1~247。 */
+    uint16_t min_step;                            /* 最小步长，单位 step，允许 1~10000。 */
+    uint16_t normal_speed_rpm;                    /* 常规速度，单位 RPM，允许 0~5000。 */
+    int8_t direction;                             /* 方向映射，1=正向，-1=反向。 */
+} BinaryProtocol_StepperMotorConfig_t;
+
+/**
+ * @brief `STEPPER_PARAM_SET` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前不绑定自动检测流程，MP157 首版固定填 0。 */
+    uint8_t motor_count;                          /* 电机记录数量，首版固定为 3。 */
+    uint8_t flags;                                /* 保留标志位，首版固定为 0。 */
+    BinaryProtocol_StepperMotorConfig_t motors[3]; /* 三台电机参数，按 role_id 识别业务角色。 */
+} BinaryProtocol_StepperParamPayload_t;
+
 uint8_t BinaryProtocolService_IsBinaryFrame(const uint8_t *frame_buffer, uint16_t frame_length);
 uint16_t BinaryProtocolService_Crc16CcittFalse(const uint8_t *data, uint16_t length);
 BinaryProtocol_ParseStatus_t BinaryProtocolService_ParseFrame(const uint8_t *frame_buffer,
@@ -417,6 +450,9 @@ uint8_t BinaryProtocolService_DecodeQueryStatus(const uint8_t *payload,
 uint8_t BinaryProtocolService_DecodeBeltManual(const uint8_t *payload,
                                                uint8_t payload_length,
                                                BinaryProtocol_BeltManualPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeStepperParam(const uint8_t *payload,
+                                                 uint8_t payload_length,
+                                                 BinaryProtocol_StepperParamPayload_t *decoded_payload);
 uint8_t BinaryProtocolService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_length);
 void BinaryProtocolService_SetFaultBit(uint16_t fault_bit);
 void BinaryProtocolService_ClearFaultBit(uint16_t fault_bit);

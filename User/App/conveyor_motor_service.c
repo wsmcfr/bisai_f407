@@ -60,6 +60,39 @@
 #define CONVEYOR_MOTOR_ADDRESS                      (1U)
 
 /**
+ * @brief 传送带默认最小步长，单位 step。
+ *
+ * 当前速度模式不直接使用该字段，但 MP157 参数页已经把它作为现场可调参数保存和下发，
+ * F4 侧先保存到运行时配置，后续补位置步进命令时直接复用。
+ */
+#define CONVEYOR_MOTOR_MIN_STEP_DEFAULT             (20U)
+
+/**
+ * @brief MP157 参数页允许下发的最大常规速度，单位 RPM。
+ *
+ * 底层 `EMM42_MotorSetVelocity()` 已按张大头协议支持 `0~5000 rpm`，
+ * 因此应用层配置也保持同样范围，避免 Qt 能输入的速度在 F4 侧被意外截断。
+ */
+#define CONVEYOR_MOTOR_CONFIG_MAX_SPEED_RPM         (5000U)
+
+/**
+ * @brief MP157 参数页允许下发的最小步长最大值，单位 step。
+ *
+ * 当前传送带速度模式暂不使用该字段，但仍在 F4 侧做范围约束，
+ * 避免异常 JSON 或误发帧把后续位置控制预留字段写成无意义大数。
+ */
+#define CONVEYOR_MOTOR_CONFIG_MAX_MIN_STEP          (10000U)
+
+/**
+ * @brief Emm42 单机地址允许范围。
+ *
+ * 地址 0 通常不作为普通单机站号使用，248 以上保留给特殊场景或非法值，
+ * 所以运行时配置只接受 1~247。
+ */
+#define CONVEYOR_MOTOR_ADDRESS_MIN                  (1U)
+#define CONVEYOR_MOTOR_ADDRESS_MAX                  (247U)
+
+/**
  * @brief 主机在跟踪模式下的坐标更新超时时间，单位毫秒。
  *
  * 如果主机长时间不再发送坐标，而电机仍保持上一次速度继续运动，
@@ -73,7 +106,7 @@
  * 用户要求“自己匀速转动，不需要太快”，
  * 因此这里默认给一个偏低的保守值。
  */
-#define CONVEYOR_MOTOR_SCAN_SPEED_RPM               (300U)
+#define CONVEYOR_MOTOR_SCAN_SPEED_RPM               (40U)
 
 /**
  * @brief 跟踪模式最小转速，单位 RPM。
@@ -82,7 +115,7 @@
  * 你当前反馈 `BELTTRACK 11` 仍然偏快，因此把这个基础速度降下来，
  * 让小误差区域先以更慢的速度贴近中心。
  */
-#define CONVEYOR_MOTOR_TRACK_MIN_SPEED_RPM          (20U)
+#define CONVEYOR_MOTOR_TRACK_MIN_SPEED_RPM          (10U)
 
 /**
  * @brief 小误差爬行区上限，单位像素。
@@ -225,8 +258,20 @@ typedef enum
 {
     CONVEYOR_MOTOR_COMMAND_STOP = 0, /* 队列命令：要求电机任务切换到 STOP，并立即下发停止帧。 */
     CONVEYOR_MOTOR_COMMAND_SCAN,     /* 队列命令：要求电机任务切换到 SCAN，并按巡航速度运行。 */
-    CONVEYOR_MOTOR_COMMAND_TRACK     /* 队列命令：要求电机任务使用最新像素误差执行视觉对中。 */
+    CONVEYOR_MOTOR_COMMAND_TRACK,    /* 队列命令：要求电机任务使用最新像素误差执行视觉对中。 */
+    CONVEYOR_MOTOR_COMMAND_CONFIG    /* 队列命令：更新 MP157 下发的地址、步长、常规速度和方向。 */
 } ConveyorMotor_CommandType_t;
+
+/**
+ * @brief MP157 下发的传送带运行参数。
+ */
+typedef struct
+{
+    uint8_t address;                 /* Emm42 地址，传送带当前使用 UART4 独占总线。 */
+    uint16_t min_step;               /* 最小步长，单位 step，当前保存给后续位置控制使用。 */
+    uint16_t normal_speed_rpm;       /* 常规扫描速度，单位 RPM，0 表示扫描模式保持停止。 */
+    int8_t direction;                /* 方向映射，>=0 表示 CW，<0 表示 CCW。 */
+} ConveyorMotor_RuntimeConfig_t;
 
 /**
  * @brief 电机任务消息队列中的命令结构。
@@ -239,6 +284,7 @@ typedef struct
 {
     ConveyorMotor_CommandType_t type; /* 命令类型，决定电机任务本轮切换到停止、巡航还是视觉跟踪模式。 */
     int32_t error_px;                 /* 视觉目标相对中心的带符号像素误差，单位像素，仅 TRACK 命令使用。 */
+    ConveyorMotor_RuntimeConfig_t config; /* CONFIG 命令携带的新运行参数，其它命令忽略该字段。 */
 } ConveyorMotor_Command_t;
 
 /**
@@ -273,6 +319,7 @@ typedef struct
     uint8_t fresh_track_sample_flag;               /* 新跟踪样本标志，1 表示本周期刚收到新的 BELTTRACK 误差。 */
     uint8_t track_timeout_reported_flag;           /* 跟踪超时日志抑制标志，避免超时期间反复刷同一条告警。 */
     TickType_t last_track_update_tick;             /* 最近一次收到视觉跟踪样本的 RTOS tick，用于计算跟踪输入超时。 */
+    ConveyorMotor_RuntimeConfig_t config;          /* 当前生效的 MP157 步进电机参数，任务内独占读写。 */
 } ConveyorMotor_Runtime_t;
 
 /**
@@ -298,6 +345,24 @@ static ConveyorMotor_RuntimeSnapshot_t g_conveyor_motor_runtime_snapshot =
     0U,
     0U
 };
+
+/**
+ * @brief 返回传送带电机的默认运行时配置。
+ * @return ConveyorMotor_RuntimeConfig_t 默认地址、最小步长、常规速度和方向。
+ *
+ * 该函数把编译期宏集中转换成运行时结构，
+ * 后续 MP157 下发新参数时只需要覆盖 `runtime.config`，不需要改散落宏值。
+ */
+static ConveyorMotor_RuntimeConfig_t ConveyorMotorService_GetDefaultRuntimeConfig(void)
+{
+    ConveyorMotor_RuntimeConfig_t config;
+
+    config.address = CONVEYOR_MOTOR_ADDRESS;
+    config.min_step = CONVEYOR_MOTOR_MIN_STEP_DEFAULT;
+    config.normal_speed_rpm = CONVEYOR_MOTOR_SCAN_SPEED_RPM;
+    config.direction = 1;
+    return config;
+}
 
 /**
  * @brief 跳过命令参数中的空格和制表符。
@@ -453,6 +518,7 @@ uint8_t ConveyorMotorService_RequestScan(void)
 {
     ConveyorMotor_Command_t command;
 
+    (void)memset(&command, 0, sizeof(command));
     command.type = CONVEYOR_MOTOR_COMMAND_SCAN;
     command.error_px = 0;
     return ConveyorMotorService_PostCommand(&command);
@@ -469,6 +535,7 @@ uint8_t ConveyorMotorService_RequestStop(void)
 {
     ConveyorMotor_Command_t command;
 
+    (void)memset(&command, 0, sizeof(command));
     command.type = CONVEYOR_MOTOR_COMMAND_STOP;
     command.error_px = 0;
     return ConveyorMotorService_PostCommand(&command);
@@ -486,8 +553,47 @@ uint8_t ConveyorMotorService_RequestTrack(int32_t error_px)
 {
     ConveyorMotor_Command_t command;
 
+    (void)memset(&command, 0, sizeof(command));
     command.type = CONVEYOR_MOTOR_COMMAND_TRACK;
     command.error_px = error_px;
+    return ConveyorMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 更新传送带步进电机运行参数。
+ * @param address Emm42 电机地址，允许 1~247。
+ * @param min_step 最小步长，单位 step，允许 1~10000。
+ * @param normal_speed_rpm 常规扫描速度，单位 RPM，允许 0~5000。
+ * @param direction 方向映射，1 表示保持默认方向，-1 表示反转默认方向。
+ * @return uint8_t 1 表示配置命令已投递，0 表示参数非法或任务队列尚未创建。
+ *
+ * 该函数只把新参数投递给传送带任务，
+ * 真正更新 `motor.address` 和 `runtime.config` 的动作在任务上下文完成，
+ * 避免协议层和传送带任务同时访问 UART4 或电机句柄。
+ */
+uint8_t ConveyorMotorService_RequestRuntimeConfig(uint8_t address,
+                                                  uint16_t min_step,
+                                                  uint16_t normal_speed_rpm,
+                                                  int8_t direction)
+{
+    ConveyorMotor_Command_t command;
+
+    if ((address < CONVEYOR_MOTOR_ADDRESS_MIN) ||
+        (address > CONVEYOR_MOTOR_ADDRESS_MAX) ||
+        (min_step == 0U) ||
+        (min_step > CONVEYOR_MOTOR_CONFIG_MAX_MIN_STEP) ||
+        (normal_speed_rpm > CONVEYOR_MOTOR_CONFIG_MAX_SPEED_RPM) ||
+        ((direction != 1) && (direction != -1)))
+    {
+        return 0U;
+    }
+
+    (void)memset(&command, 0, sizeof(command));
+    command.type = CONVEYOR_MOTOR_COMMAND_CONFIG;
+    command.config.address = address;
+    command.config.min_step = min_step;
+    command.config.normal_speed_rpm = normal_speed_rpm;
+    command.config.direction = direction;
     return ConveyorMotorService_PostCommand(&command);
 }
 
@@ -740,6 +846,28 @@ static EMM42_MotorDirection_t ConveyorMotorService_GetDirectionByError(int32_t e
 }
 
 /**
+ * @brief 按 MP157 运行时方向映射修正电机方向。
+ * @param base_direction 代码默认计算出来的方向。
+ * @param direction_mapping MP157 下发的方向映射，正数保留默认方向，负数反转方向。
+ * @return EMM42_MotorDirection_t 最终下发给 Emm42 的方向。
+ *
+ * 该函数用于现场快速修正“坐标越调越远”或传送带扫描方向相反的问题，
+ * 避免每次都重新修改 `CONVEYOR_MOTOR_POSITIVE_ERROR_IS_CW` 并重新编译烧录。
+ */
+static EMM42_MotorDirection_t ConveyorMotorService_MapRuntimeDirection(EMM42_MotorDirection_t base_direction,
+                                                                       int8_t direction_mapping)
+{
+    if (direction_mapping >= 0)
+    {
+        return base_direction;
+    }
+
+    return (base_direction == EMM42_MOTOR_DIRECTION_CW) ?
+           EMM42_MOTOR_DIRECTION_CCW :
+           EMM42_MOTOR_DIRECTION_CW;
+}
+
+/**
  * @brief 应用一次“立即停止”到电机。
  * @param motor 电机句柄，不能为空。
  * @param runtime 任务运行时状态，不能为空。
@@ -783,6 +911,7 @@ static EMM42_MotorStatus_t ConveyorMotorService_ApplyScan(const EMM42_MotorHandl
 {
     EMM42_MotorStatus_t status;
     EMM42_MotorDirection_t direction;
+    uint16_t speed_rpm;
 
     if ((motor == NULL) || (runtime == NULL))
     {
@@ -790,13 +919,21 @@ static EMM42_MotorStatus_t ConveyorMotorService_ApplyScan(const EMM42_MotorHandl
     }
 
     /*
-     * 巡航方向先统一固定为 CW。
-     * 若现场需要反向巡航，可后续再补成可配置项。
+     * 运行时方向映射来自 MP157 参数页：
+     * - direction=1：沿用工程默认 CW 扫描方向；
+     * - direction=-1：把扫描方向反过来，方便现场快速纠正安装方向。
      */
-    direction = EMM42_MOTOR_DIRECTION_CW;
+    direction = ConveyorMotorService_MapRuntimeDirection(EMM42_MOTOR_DIRECTION_CW,
+                                                         runtime->config.direction);
+    speed_rpm = runtime->config.normal_speed_rpm;
+
+    if (speed_rpm == 0U)
+    {
+        return ConveyorMotorService_ApplyStop(motor, runtime);
+    }
 
     if ((runtime->applied_mode == CONVEYOR_MOTOR_MODE_SCAN) &&
-        (runtime->applied_speed_rpm == CONVEYOR_MOTOR_SCAN_SPEED_RPM) &&
+        (runtime->applied_speed_rpm == speed_rpm) &&
         (runtime->applied_direction == direction))
     {
         return EMM42_MOTOR_STATUS_OK;
@@ -804,13 +941,13 @@ static EMM42_MotorStatus_t ConveyorMotorService_ApplyScan(const EMM42_MotorHandl
 
     status = EMM42_MotorSetVelocity(motor,
                                     direction,
-                                    CONVEYOR_MOTOR_SCAN_SPEED_RPM,
+                                    speed_rpm,
                                     CONVEYOR_MOTOR_ACCEL,
                                     false);
     if (status == EMM42_MOTOR_STATUS_OK)
     {
         runtime->applied_mode = CONVEYOR_MOTOR_MODE_SCAN;
-        runtime->applied_speed_rpm = CONVEYOR_MOTOR_SCAN_SPEED_RPM;
+        runtime->applied_speed_rpm = speed_rpm;
         runtime->applied_direction = direction;
     }
 
@@ -835,7 +972,9 @@ static EMM42_MotorStatus_t ConveyorMotorService_ApplyTrack(const EMM42_MotorHand
         return EMM42_MOTOR_STATUS_INVALID_PARAM;
     }
 
-    direction = ConveyorMotorService_GetDirectionByError(runtime->latest_error_px);
+    direction = ConveyorMotorService_MapRuntimeDirection(
+        ConveyorMotorService_GetDirectionByError(runtime->latest_error_px),
+        runtime->config.direction);
     speed_rpm = ConveyorMotorService_MapErrorToSpeed(
         ConveyorMotorService_GetAbsoluteError(runtime->latest_error_px));
 
@@ -958,9 +1097,12 @@ static void ConveyorMotorService_ReportDriverError(const char *stage, EMM42_Moto
  * @param runtime 任务运行时状态，不能为空。
  */
 static void ConveyorMotorService_HandleQueuedCommand(const ConveyorMotor_Command_t *command,
+                                                     EMM42_MotorHandle_t *motor,
                                                      ConveyorMotor_Runtime_t *runtime)
 {
-    if ((command == NULL) || (runtime == NULL))
+    EMM42_MotorStatus_t status;
+
+    if ((command == NULL) || (motor == NULL) || (runtime == NULL))
     {
         return;
     }
@@ -981,6 +1123,33 @@ static void ConveyorMotorService_HandleQueuedCommand(const ConveyorMotor_Command
             runtime->fresh_track_sample_flag = 1U;
             runtime->track_timeout_reported_flag = 0U;
             runtime->last_track_update_tick = xTaskGetTickCount();
+            break;
+
+        case CONVEYOR_MOTOR_COMMAND_CONFIG:
+            /*
+             * 配置命令只更新 F4 运行内存，不写 F4 Flash，也不写 Emm42 EEPROM。
+             * 先把业务状态切到 STOP，再尝试按旧地址发停止帧，避免参数切换时继续运动。
+             * 如果旧地址本来就是错的，停止帧可能发不到目标电机，但仍允许更新为新地址，
+             * 否则现场无法通过参数页把错误地址修回来。
+             */
+            runtime->desired_mode = CONVEYOR_MOTOR_MODE_STOP;
+            runtime->fresh_track_sample_flag = 0U;
+            runtime->track_timeout_reported_flag = 0U;
+            runtime->center_stable_count = 0U;
+            runtime->centered_flag = 0U;
+
+            status = ConveyorMotorService_ApplyStop(motor, runtime);
+            if (status != EMM42_MOTOR_STATUS_OK)
+            {
+                ConveyorMotorService_ReportDriverError("runtime config pre-stop", status);
+            }
+
+            runtime->config = command->config;
+            motor->address = command->config.address;
+            runtime->applied_mode = CONVEYOR_MOTOR_MODE_STOP;
+            runtime->applied_speed_rpm = 0U;
+            runtime->applied_direction = ConveyorMotorService_MapRuntimeDirection(EMM42_MOTOR_DIRECTION_CW,
+                                                                                  runtime->config.direction);
             break;
 
         case CONVEYOR_MOTOR_COMMAND_STOP:
@@ -1226,6 +1395,7 @@ void ConveyorMotorService_Task(void *argument)
     const char *failed_stage = "motor init";
 
     (void)argument;
+    runtime.config = ConveyorMotorService_GetDefaultRuntimeConfig();
 
     if (g_conveyor_motor_command_queue == NULL)
     {
@@ -1243,7 +1413,7 @@ void ConveyorMotorService_Task(void *argument)
     }
 
     EMM42_MotorLoadDefaultConfig(&motor, &huart4);
-    motor.address = CONVEYOR_MOTOR_ADDRESS;
+    motor.address = runtime.config.address;
 
     for (;;)
     {
@@ -1284,7 +1454,8 @@ void ConveyorMotorService_Task(void *argument)
         (CONVEYOR_MOTOR_STARTUP_SCAN_ENABLE != 0U) ? CONVEYOR_MOTOR_MODE_SCAN : CONVEYOR_MOTOR_MODE_STOP;
     runtime.applied_mode = CONVEYOR_MOTOR_MODE_STOP;
     runtime.applied_speed_rpm = 0U;
-    runtime.applied_direction = EMM42_MOTOR_DIRECTION_CW;
+    runtime.applied_direction = ConveyorMotorService_MapRuntimeDirection(EMM42_MOTOR_DIRECTION_CW,
+                                                                         runtime.config.direction);
     runtime.latest_error_px = 0;
     runtime.center_stable_count = 0U;
     runtime.centered_flag = 0U;
@@ -1301,7 +1472,7 @@ void ConveyorMotorService_Task(void *argument)
                           &command,
                           pdMS_TO_TICKS(CONVEYOR_MOTOR_CONTROL_PERIOD_MS)) == pdPASS)
         {
-            ConveyorMotorService_HandleQueuedCommand(&command, &runtime);
+            ConveyorMotorService_HandleQueuedCommand(&command, &motor, &runtime);
         }
 
         ConveyorMotorService_ControlStep(&motor, &runtime);

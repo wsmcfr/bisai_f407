@@ -4,7 +4,7 @@
 
 | 项目 | 内容 |
 |---|---|
-| 目标 | 把 3 个张大头 Emm42 步进电机绑定到正确串口，并明确同一条串口上的摄像头电机 ID。 |
+| 目标 | 把 3 个张大头 Emm42 步进电机绑定到正确串口，明确默认电机 ID，并记录 MP157 可下发的运行时地址、步长、速度和方向参数。 |
 | 适用工程 | `E:\hal\bisai_f407_project` |
 | 芯片平台 | STM32F407，HAL + FreeRTOS |
 | 修改日期 | 2026-07-02 |
@@ -13,9 +13,9 @@
 
 | 功能 | Emm42 地址 ID | F4 串口 | F4 引脚 | 说明 |
 |---|---:|---|---|---|
-| 传送带电机 | `0x01` | `UART4` | `PC10(TX) / PC11(RX)` | 负责输送零件和根据视觉坐标做主要对中。 |
-| 摄像头前进/后退电机 | `0x02` | `USART6` | `PC6(TX) / PC7(RX)` | 负责摄像头前后方向微调。 |
-| 摄像头上下电机 | `0x03` | `USART6` | `PC6(TX) / PC7(RX)` | 负责摄像头上下方向调节或焦距/高度标定。 |
+| 传送带电机 | 默认 `0x01` | `UART4` | `PC10(TX) / PC11(RX)` | 负责输送零件和根据视觉坐标做主要对中；可由 `STEPPER_PARAM_SET` 更新 F4 运行时地址。 |
+| 摄像头前进/后退电机 | 默认 `0x02` | `USART6` | `PC6(TX) / PC7(RX)` | 负责摄像头前后方向微调；可由 `STEPPER_PARAM_SET` 更新 F4 运行时地址。 |
+| 摄像头上下电机 | 默认 `0x03` | `USART6` | `PC6(TX) / PC7(RX)` | 负责摄像头上下方向调节或焦距/高度标定；可由 `STEPPER_PARAM_SET` 更新 F4 运行时地址。 |
 
 结论：
 
@@ -30,10 +30,11 @@
 |---|---|---|
 | `User/Driver/emm42_motor.c` | 把驱动注释从“传送带独占 USART6”改为“通用 UART + 地址句柄”。 | 驱动层不再写死业务电机和串口，方便 UART4 与 USART6 同时复用同一个驱动。 |
 | `User/Driver/emm42_motor.h` | 明确默认地址只是驱动默认值，实际地址由应用层覆盖。 | 防止后续把两个摄像头电机都留在默认 `0x01`。 |
-| `User/App/conveyor_motor_service.c` | 将传送带电机绑定到 `huart4`，地址固定 `0x01`，启动日志改为 `UART4=PC10/PC11`。 | 传送带不再占用 `USART6`，避免和摄像头两个电机冲突。 |
-| `User/App/conveyor_motor_service.h` | 更新传送带任务说明为 `UART4 PC10/PC11`。 | 头文件说明和真实硬件一致。 |
-| `User/App/camera_motor_service.c` | 新增摄像头运动电机服务，绑定 `huart6`，内部维护地址 `0x02` 和 `0x03` 两个 Emm42 句柄。 | 可以通过 `CAM...` 文本命令调试摄像头前后轴和上下轴。 |
-| `User/App/camera_motor_service.h` | 新增摄像头运动电机服务对外接口。 | 供 FreeRTOS 创建任务、USART1 命令入口和后续二进制协议层调用。 |
+| `User/App/conveyor_motor_service.c` | 将传送带电机绑定到 `huart4`，默认地址 `0x01`；新增运行时配置队列命令。 | 传送带不再占用 `USART6`，并能接收 MP157 下发的地址、最小步长、常规速度和方向映射。 |
+| `User/App/conveyor_motor_service.h` | 更新传送带任务说明和 `ConveyorMotorService_RequestRuntimeConfig()` 声明。 | 二进制协议层可以安全投递参数，不直接抢 UART4。 |
+| `User/App/camera_motor_service.c` | 摄像头运动电机服务绑定 `huart6`，默认维护地址 `0x02` 和 `0x03`；新增运行时配置队列命令。 | 可以通过 `CAM...` 文本命令调试摄像头前后轴和上下轴，也可以由 MP157 下发运行时参数。 |
+| `User/App/camera_motor_service.h` | 新增摄像头运行时参数接口声明。 | 供 FreeRTOS 创建任务、USART1 命令入口和二进制协议层调用。 |
+| `User/App/binary_protocol_service.c/.h` | 新增 `STEPPER_PARAM_SET 0x42`。 | MP157 参数页可把三台电机配置下发给 F4。 |
 | `User/App/weight_service.c` | 在 USART1 统一命令分发入口中加入 `CameraMotorService_HandleCommand()`。 | `CAMINFO/CAMSTOP/CAMFWD/CAMZ` 能从 USART1 串口助手或 MP157 下发。 |
 | `User/App/uart_command.c` | 更新 USART1 命令总表，补充摄像头电机命令。 | 打开串口底座文件即可查到 `CAM...` 命令用途。 |
 | `Core/Src/freertos.c` | 创建 `cameraMotorTask`，启动摄像头电机服务任务。 | 新服务真正进入 FreeRTOS 调度。 |
@@ -71,10 +72,18 @@
 
 | 项目 | 规则 |
 |---|---|
-| 默认点动转速 | 省略 `[rpm]` 时使用 `30 rpm`。 |
-| 最大点动转速 | 用户输入超过上限时限制到 `120 rpm`。 |
+| 默认点动转速 | 省略 `[rpm]` 时使用当前轴运行时 `normal_speed_rpm`，上电默认 `30 rpm`。 |
+| 最大点动转速 | 用户输入和 MP157 下发速度都允许 `0~5000 rpm`；`0` 表示默认运动保持停止。 |
 | 停止方式 | 发送 `CAMSTOP`，F4 会分别给地址 `0x02` 和 `0x03` 发送立即停止命令。 |
-| 方向说明 | `FORWARD/BACKWARD/UP/DOWN` 是工程约定方向；如果实物方向反了，先在现场记录，再调整方向映射。 |
+| 方向说明 | `FORWARD/BACKWARD/UP/DOWN` 是工程约定方向；如果实物方向反了，可在 MP157 参数页把对应轴方向设为反向并下发。 |
+
+### 4.3 二进制步进参数命令
+
+| CMD | 作用 | 关键约束 |
+|---:|---|---|
+| `0x42 STEPPER_PARAM_SET` | 一次下发传送带、摄像头前后、摄像头上下三台电机的地址、最小步长、常规速度和方向。 | `cycle_id=0`、`motor_count=3`、`flags=0`；地址 `1~247`，步长 `1~10000`，速度 `0~5000 rpm`，方向只能 `1/-1`。 |
+
+说明：该命令只更新 F4 运行内存，不写 F4 Flash，也不写 Emm42 EEPROM；F4 断电重启后仍回到代码默认值，除非 MP157 再次下发。
 
 ## 5. Emm42 地址设置建议
 
@@ -105,7 +114,8 @@
 | 确认传送带串口 | USART1 串口助手 | `BELTINFO` | 输出 `[INFO][BELT] ...`，启动日志应显示 `UART4=PC10/PC11, addr=1`。 | 检查 `conveyor_motor_service.c` 是否仍绑定 `huart6`，检查 PC10/PC11 接线和共地。 |
 | 启动传送带扫描 | USART1 串口助手 | `BELTSCAN` | 传送带电机动作，摄像头两个电机不动。 | 如果摄像头电机动，说明接线或地址混乱；如果都不动，查 UART4 接线和 Emm42 地址。 |
 | 停止传送带 | USART1 串口助手 | `BELTSTOP` | 传送带停止。 | 查 Emm42 停止命令是否发到 UART4。 |
-| 查询摄像头电机 | USART1 串口助手 | `CAMINFO` | 输出 `forward_addr=2`、`z_addr=3`、`USART6=PC6/PC7`。 | 如果提示未知命令，检查 `weight_service.c` 是否已接入 `CameraMotorService_HandleCommand()`。 |
+| 查询摄像头电机 | USART1 串口助手 | `CAMINFO` | 输出 `forward_addr=2`、`z_addr=3`、`min_step`、`speed`、`dir` 和 `USART6=PC6/PC7`。 | 如果提示未知命令，检查 `weight_service.c` 是否已接入 `CameraMotorService_HandleCommand()`。 |
+| 下发步进参数 | MP157 Qt 参数页 | `参数设置 -> 步进参数 -> 保存并下发` | F4 回 `ACK acked_cmd=0x42 status=0`；再发 `CAMINFO` 能看到摄像头两个轴的速度/方向/地址变为下发值。 | 如果只保存 JSON 没有 ACK，说明没有真正下发；如果 F4 端没变化，确认 F4 已重新编译下载。 |
 | 测试摄像头前进轴 | USART1 串口助手 | `CAMFWD FORWARD 30` | 只有摄像头前进/后退轴动作。 | 如果上下轴动作，两个电机 ID 可能接反；如果两个都动，两个电机可能都是同一 ID。 |
 | 测试摄像头后退轴 | USART1 串口助手 | `CAMFWD BACKWARD 30` | 只有摄像头前进/后退轴反向动作。 | 如果方向反了，记录现场方向并调整方向映射。 |
 | 测试摄像头上升轴 | USART1 串口助手 | `CAMZ UP 30` | 只有摄像头上下轴动作。 | 如果前后轴动作，检查地址 `0x02/0x03` 是否设置反。 |
@@ -120,6 +130,7 @@
 | UART4 到传送带 | 串口助手发送 `BELTSCAN`。 | 观察传送带动作，再发 `BELTSTOP`。 | 只有传送带动作表示 UART4 绑定正确。 |
 | USART6 到摄像头前后轴 | 串口助手发送 `CAMFWD FORWARD 30`。 | 观察摄像头前后轴动作，再发 `CAMSTOP`。 | 只有地址 `0x02` 电机动作表示 ID 正确。 |
 | USART6 到摄像头上下轴 | 串口助手发送 `CAMZ UP 30`。 | 观察摄像头上下轴动作，再发 `CAMSTOP`。 | 只有地址 `0x03` 电机动作表示 ID 正确。 |
+| MP157 到 F4 步进参数 | MP157 Qt 发送 `STEPPER_PARAM_SET`。 | F4 回二进制 ACK；串口助手发送 `CAMINFO`。 | `CAMINFO` 中摄像头前后/上下轴地址、速度、方向映射与 MP157 参数页一致。 |
 
 ## 9. 修改记录
 
@@ -129,3 +140,4 @@
 | 2026-07-02 | 新增摄像头运动电机服务，摄像头前进/后退电机 ID 为 `0x02`，摄像头上下电机 ID 为 `0x03`。 |
 | 2026-07-02 | 新增 `CAMINFO/CAMSTOP/CAMFWD/CAMZ` 调试命令，用于现场确认两个摄像头电机是否能独立动作。 |
 | 2026-07-02 | 同步 `emm42_conveyor_code_guide.md` 和 `binary_protocol_service.md`，保证旧文档不再把传送带写成 `USART6/huart6`。 |
+| 2026-07-03 | 新增 MP157 `STEPPER_PARAM_SET` 运行时参数下发说明；三台电机速度范围按 Emm42 协议统一为 `0~5000 rpm`。 |

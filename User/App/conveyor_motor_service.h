@@ -83,6 +83,22 @@ uint8_t ConveyorMotorService_RequestStop(void);
 uint8_t ConveyorMotorService_RequestTrack(int32_t error_px);
 
 /**
+ * @brief 更新传送带步进电机运行参数。
+ * @param address Emm42 电机地址，允许 1~247。
+ * @param min_step 最小步长，单位 step，当前保存给后续位置步进命令使用。
+ * @param normal_speed_rpm 常规扫描速度，单位 RPM，允许 0~5000，0 表示保存后保持停止。
+ * @param direction 方向映射，正数表示按工程默认正向，负数表示反向。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或传送带任务尚未就绪。
+ *
+ * 该接口由 MP157 二进制 `STEPPER_PARAM_SET` 调用，只更新 F4 运行内存参数；
+ * 当前不写 F4 Flash，也不改 Emm42 驱动器自身 EEPROM。
+ */
+uint8_t ConveyorMotorService_RequestRuntimeConfig(uint8_t address,
+                                                  uint16_t min_step,
+                                                  uint16_t normal_speed_rpm,
+                                                  int8_t direction);
+
+/**
  * @brief 读取传送带服务当前状态快照。
  * @param status 状态输出结构体，不能为空。
  * @return uint8_t 1 表示读取成功，0 表示参数为空或服务尚未就绪。

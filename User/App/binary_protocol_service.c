@@ -1,12 +1,48 @@
 #include "binary_protocol_service.h"
 
 #ifndef BINARY_PROTOCOL_HOST_TEST
+#include "camera_motor_service.h"
 #include "conveyor_motor_service.h"
 #include "uart_command.h"
 #include "usart.h"
 #endif
 
 #include <string.h>
+
+/**
+ * @brief `STEPPER_PARAM_SET` 中的电机角色编号：传送带电机。
+ */
+#define BINARY_PROTOCOL_STEPPER_ROLE_CONVEYOR       (1U)
+
+/**
+ * @brief `STEPPER_PARAM_SET` 中的电机角色编号：摄像头前进/后退电机。
+ */
+#define BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_FORWARD (2U)
+
+/**
+ * @brief `STEPPER_PARAM_SET` 中的电机角色编号：摄像头上下电机。
+ */
+#define BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_Z       (3U)
+
+/**
+ * @brief 步进电机地址允许的最小普通站号。
+ */
+#define BINARY_PROTOCOL_STEPPER_ADDRESS_MIN         (1U)
+
+/**
+ * @brief 步进电机地址允许的最大普通站号。
+ */
+#define BINARY_PROTOCOL_STEPPER_ADDRESS_MAX         (247U)
+
+/**
+ * @brief 步进电机最小步长允许最大值，单位 step。
+ */
+#define BINARY_PROTOCOL_STEPPER_MIN_STEP_MAX        (10000U)
+
+/**
+ * @brief 步进电机常规速度允许最大值，单位 RPM。
+ */
+#define BINARY_PROTOCOL_STEPPER_SPEED_MAX_RPM       (5000U)
 
 /**
  * @brief F4 二进制协议运行状态。
@@ -522,6 +558,49 @@ uint8_t BinaryProtocolService_DecodeBeltManual(const uint8_t *payload,
     return 1U;
 }
 
+/**
+ * @brief 解码 STEPPER_PARAM_SET 负载。
+ * @param payload 原始负载。
+ * @param payload_length 原始负载长度。
+ * @param decoded_payload 解码输出对象。
+ * @return uint8_t 1 表示解码成功，0 表示长度或参数非法。
+ *
+ * 负载固定 25 字节：
+ * cycle_id:u16、motor_count:u8、flags:u8，
+ * 然后三条记录，每条为 role_id:u8、address:u8、min_step:u16、normal_speed_rpm:u16、direction:i8。
+ */
+uint8_t BinaryProtocolService_DecodeStepperParam(const uint8_t *payload,
+                                                 uint8_t payload_length,
+                                                 BinaryProtocol_StepperParamPayload_t *decoded_payload)
+{
+    uint8_t index;
+    uint8_t offset;
+
+    if ((payload == NULL) ||
+        (decoded_payload == NULL) ||
+        (payload_length != BINARY_PROTOCOL_STEPPER_PARAM_PAYLOAD_LENGTH))
+    {
+        return 0U;
+    }
+
+    (void)memset(decoded_payload, 0, sizeof(*decoded_payload));
+    decoded_payload->cycle_id = BinaryProtocolService_ReadU16Le(&payload[0]);
+    decoded_payload->motor_count = payload[2];
+    decoded_payload->flags = payload[3];
+
+    for (index = 0U; index < 3U; ++index)
+    {
+        offset = (uint8_t)(4U + (index * 7U));
+        decoded_payload->motors[index].role_id = payload[offset];
+        decoded_payload->motors[index].address = payload[offset + 1U];
+        decoded_payload->motors[index].min_step = BinaryProtocolService_ReadU16Le(&payload[offset + 2U]);
+        decoded_payload->motors[index].normal_speed_rpm = BinaryProtocolService_ReadU16Le(&payload[offset + 4U]);
+        decoded_payload->motors[index].direction = (int8_t)payload[offset + 6U];
+    }
+
+    return 1U;
+}
+
 #ifndef BINARY_PROTOCOL_HOST_TEST
 /**
  * @brief 通过 USART1 发送一帧二进制协议。
@@ -762,6 +841,133 @@ static uint8_t BinaryProtocolService_IsActiveCycle(uint16_t cycle_id)
 {
     return ((g_binary_protocol_runtime.active_cycle_id != 0U) &&
             (g_binary_protocol_runtime.active_cycle_id == cycle_id)) ? 1U : 0U;
+}
+
+/**
+ * @brief 从三条步进电机记录中查找指定角色。
+ * @param payload 已解码的步进电机参数负载，不能为空。
+ * @param role_id 目标角色编号。
+ * @param motor 输出电机配置，不能为空。
+ * @return uint8_t 1 表示找到，0 表示没有对应角色。
+ */
+static uint8_t BinaryProtocolService_FindStepperMotor(const BinaryProtocol_StepperParamPayload_t *payload,
+                                                      uint8_t role_id,
+                                                      BinaryProtocol_StepperMotorConfig_t *motor)
+{
+    uint8_t index;
+
+    if ((payload == NULL) || (motor == NULL))
+    {
+        return 0U;
+    }
+
+    for (index = 0U; index < 3U; ++index)
+    {
+        if (payload->motors[index].role_id == role_id)
+        {
+            *motor = payload->motors[index];
+            return 1U;
+        }
+    }
+
+    return 0U;
+}
+
+/**
+ * @brief 校验 STEPPER_PARAM_SET 的业务字段范围。
+ * @param payload 已解码的步进电机参数负载，不能为空。
+ * @param detail 输出 NACK detail，不能为空。
+ * @return uint8_t 1 表示字段全部合法，0 表示存在非法字段。
+ *
+ * 校验策略：
+ * 1. 首版参数下发不绑定流程，所以 cycle_id 必须为 0；
+ * 2. motor_count 固定为 3，flags 固定为 0；
+ * 3. role_id 必须刚好覆盖 1/2/3，不能重复；
+ * 4. 每条记录都必须满足地址、步长、速度和方向范围。
+ */
+static uint8_t BinaryProtocolService_ValidateStepperParam(const BinaryProtocol_StepperParamPayload_t *payload,
+                                                          uint16_t *detail)
+{
+    uint8_t index;
+    uint8_t role_mask = 0U;
+
+    if ((payload == NULL) || (detail == NULL))
+    {
+        return 0U;
+    }
+
+    if (payload->cycle_id != 0U)
+    {
+        *detail = payload->cycle_id;
+        return 0U;
+    }
+
+    if (payload->motor_count != 3U)
+    {
+        *detail = payload->motor_count;
+        return 0U;
+    }
+
+    if (payload->flags != 0U)
+    {
+        *detail = payload->flags;
+        return 0U;
+    }
+
+    for (index = 0U; index < 3U; ++index)
+    {
+        const BinaryProtocol_StepperMotorConfig_t *motor = &payload->motors[index];
+        uint8_t role_bit;
+
+        if ((motor->role_id < BINARY_PROTOCOL_STEPPER_ROLE_CONVEYOR) ||
+            (motor->role_id > BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_Z))
+        {
+            *detail = motor->role_id;
+            return 0U;
+        }
+
+        role_bit = (uint8_t)(1U << motor->role_id);
+        if ((role_mask & role_bit) != 0U)
+        {
+            *detail = motor->role_id;
+            return 0U;
+        }
+        role_mask = (uint8_t)(role_mask | role_bit);
+
+        if ((motor->address < BINARY_PROTOCOL_STEPPER_ADDRESS_MIN) ||
+            (motor->address > BINARY_PROTOCOL_STEPPER_ADDRESS_MAX))
+        {
+            *detail = motor->address;
+            return 0U;
+        }
+
+        if ((motor->min_step == 0U) ||
+            (motor->min_step > BINARY_PROTOCOL_STEPPER_MIN_STEP_MAX))
+        {
+            *detail = motor->min_step;
+            return 0U;
+        }
+
+        if (motor->normal_speed_rpm > BINARY_PROTOCOL_STEPPER_SPEED_MAX_RPM)
+        {
+            *detail = motor->normal_speed_rpm;
+            return 0U;
+        }
+
+        if ((motor->direction != 1) && (motor->direction != -1))
+        {
+            *detail = (uint16_t)((uint8_t)motor->direction);
+            return 0U;
+        }
+    }
+
+    if (role_mask != 0x0EU)
+    {
+        *detail = role_mask;
+        return 0U;
+    }
+
+    return 1U;
 }
 
 /**
@@ -1316,6 +1522,94 @@ static void BinaryProtocolService_HandleBeltManual(const BinaryProtocol_Frame_t 
 }
 
 /**
+ * @brief 处理 STEPPER_PARAM_SET。
+ * @param frame 已解析帧。
+ *
+ * 该命令把 MP157 参数页中的三台 Emm42 参数同步到 F4 运行内存：
+ * 1. role_id=1 投递给传送带任务；
+ * 2. role_id=2/3 一次性投递给摄像头电机任务；
+ * 3. 成功只表示 F4 任务已接收运行时参数，不表示写入 F4 Flash 或 Emm42 EEPROM。
+ */
+static void BinaryProtocolService_HandleStepperParam(const BinaryProtocol_Frame_t *frame)
+{
+    BinaryProtocol_StepperParamPayload_t payload;
+    BinaryProtocol_StepperMotorConfig_t conveyor_motor;
+    BinaryProtocol_StepperMotorConfig_t camera_forward_motor;
+    BinaryProtocol_StepperMotorConfig_t camera_z_motor;
+    uint16_t detail = 0U;
+
+    if (BinaryProtocolService_DecodeStepperParam(frame->payload, frame->payload_length, &payload) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_PAYLOAD_LENGTH,
+                                       frame->payload_length);
+        return;
+    }
+
+    if (BinaryProtocolService_ValidateStepperParam(&payload, &detail) == 0U)
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       detail);
+        return;
+    }
+
+    if ((BinaryProtocolService_FindStepperMotor(&payload,
+                                                BINARY_PROTOCOL_STEPPER_ROLE_CONVEYOR,
+                                                &conveyor_motor) == 0U) ||
+        (BinaryProtocolService_FindStepperMotor(&payload,
+                                                BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_FORWARD,
+                                                &camera_forward_motor) == 0U) ||
+        (BinaryProtocolService_FindStepperMotor(&payload,
+                                                BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_Z,
+                                                &camera_z_motor) == 0U))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       0U);
+        return;
+    }
+
+    if (ConveyorMotorService_RequestRuntimeConfig(conveyor_motor.address,
+                                                  conveyor_motor.min_step,
+                                                  conveyor_motor.normal_speed_rpm,
+                                                  conveyor_motor.direction) == 0U)
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_HARDWARE_FAULT,
+                                       BINARY_PROTOCOL_STEPPER_ROLE_CONVEYOR);
+        return;
+    }
+
+    if (CameraMotorService_RequestRuntimeConfig(camera_forward_motor.address,
+                                                camera_forward_motor.min_step,
+                                                camera_forward_motor.normal_speed_rpm,
+                                                camera_forward_motor.direction,
+                                                camera_z_motor.address,
+                                                camera_z_motor.min_step,
+                                                camera_z_motor.normal_speed_rpm,
+                                                camera_z_motor.direction) == 0U)
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_HARDWARE_FAULT,
+                                       BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_FORWARD);
+        return;
+    }
+
+    BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U);
+}
+
+/**
  * @brief 处理一帧来自 USART1 的二进制协议。
  * @param frame_buffer 原始帧缓存。
  * @param frame_length 原始帧长度。
@@ -1389,6 +1683,10 @@ uint8_t BinaryProtocolService_HandleFrame(const uint8_t *frame_buffer, uint16_t 
 
         case BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL:
             BinaryProtocolService_HandleBeltManual(&frame);
+            break;
+
+        case BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET:
+            BinaryProtocolService_HandleStepperParam(&frame);
             break;
 
         default:
