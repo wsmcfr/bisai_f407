@@ -18,6 +18,8 @@
  * | `EMM42_MotorSetControlMode()` | `[addr 46 69 save mode 6B]` | `save=0` 仅本次上电生效，`save=1` 写入电机存储；`mode=0` 开环，`mode=1` 闭环 FOC | 不转动，但会改变后续速度控制方式 |
  * | `EMM42_MotorSetButtonLock()` | `[addr D0 B3 save locked 6B]` | `locked=1` 锁面板按键，`locked=0` 解锁；`save` 含义同上 | 不转动，但会影响现场按键能否改参数 |
  * | `EMM42_MotorSetVelocity()` | `[addr F6 dir speedH speedL acc sync 6B]` | `dir` 控制方向，`speedH/speedL` 为 RPM，`acc` 为加速度参数 | 会让电机按目标速度运行 |
+ * | `EMM42_MotorMoveRelativePosition()` | `[addr FD dir speedH speedL acc pulse3 pulse2 pulse1 pulse0 rel sync 6B]` | `pulse` 为 32 位步数，`rel=0` 表示相对位置移动 | 会让电机移动固定步数 |
+ * | `EMM42_MotorResetCurrentPositionToZero()` | `[addr 0A 6D 6B]` | 将当前位置角度、位置误差和脉冲数清零，把当前位置作为新的零点 | 不转动，但会改变驱动器内部位置基准 |
  * | `EMM42_MotorStopNow()` | `[addr FE 98 sync 6B]` | 立即停止当前运动 | 会让正在运行的电机停下 |
  *
  * 维护要求：
@@ -230,6 +232,85 @@ EMM42_MotorStatus_t EMM42_MotorSetVelocity(const EMM42_MotorHandle_t *motor,
     frame[5] = acceleration;
     frame[6] = (uint8_t)(sync_flag ? 1U : 0U);
     frame[7] = 0x6BU;
+
+    return EMM42_MotorTransmitFrame(motor, frame, (uint16_t)sizeof(frame));
+}
+
+/**
+ * @brief 发送相对位置模式运动命令。
+ * @param motor 电机句柄指针，不能为空。
+ * @param direction 旋转方向。
+ * @param velocity_rpm 目标转速，单位 RPM。
+ * @param acceleration 加速度参数。
+ * @param pulse_count 相对移动脉冲数，单位 step。
+ * @param sync_flag 同步运动标志。
+ * @return EMM42_MotorStatus_t 发送结果。
+ */
+EMM42_MotorStatus_t EMM42_MotorMoveRelativePosition(const EMM42_MotorHandle_t *motor,
+                                                    EMM42_MotorDirection_t direction,
+                                                    uint16_t velocity_rpm,
+                                                    uint8_t acceleration,
+                                                    uint32_t pulse_count,
+                                                    bool sync_flag)
+{
+    uint8_t frame[13];
+
+    if (motor == NULL)
+    {
+        return EMM42_MOTOR_STATUS_INVALID_PARAM;
+    }
+
+    if ((velocity_rpm > EMM42_MOTOR_MAX_SPEED_RPM) ||
+        (acceleration > EMM42_MOTOR_MAX_ACCEL) ||
+        (pulse_count == 0U))
+    {
+        return EMM42_MOTOR_STATUS_RANGE_ERROR;
+    }
+
+    /*
+     * 帧格式来自张大头 Emm_V5 位置模式例程：
+     * [地址][0xFD][方向][速度高][速度低][加速度][脉冲3][脉冲2][脉冲1][脉冲0][相对标志][同步标志][0x6B]
+     * 这里固定相对标志为 0，表示按当前位置移动 pulse_count 个脉冲。
+     */
+    frame[0] = motor->address;
+    frame[1] = 0xFDU;
+    frame[2] = (uint8_t)direction;
+    frame[3] = (uint8_t)(velocity_rpm >> 8);
+    frame[4] = (uint8_t)(velocity_rpm & 0xFFU);
+    frame[5] = acceleration;
+    frame[6] = (uint8_t)((pulse_count >> 24) & 0xFFU);
+    frame[7] = (uint8_t)((pulse_count >> 16) & 0xFFU);
+    frame[8] = (uint8_t)((pulse_count >> 8) & 0xFFU);
+    frame[9] = (uint8_t)(pulse_count & 0xFFU);
+    frame[10] = 0x00U;
+    frame[11] = (uint8_t)(sync_flag ? 1U : 0U);
+    frame[12] = 0x6BU;
+
+    return EMM42_MotorTransmitFrame(motor, frame, (uint16_t)sizeof(frame));
+}
+
+/**
+ * @brief 将电机当前位置清零。
+ * @param motor 电机句柄指针，不能为空。
+ * @return EMM42_MotorStatus_t 发送结果。
+ *
+ * 帧格式来自张大头 Emm V5 “Reset_CurPos_To_Zero”命令：
+ * [地址][0x0A][0x6D][0x6B]。
+ * 该命令不驱动电机运动，只把当前位置作为新的零点/标定基准。
+ */
+EMM42_MotorStatus_t EMM42_MotorResetCurrentPositionToZero(const EMM42_MotorHandle_t *motor)
+{
+    uint8_t frame[4];
+
+    if (motor == NULL)
+    {
+        return EMM42_MOTOR_STATUS_INVALID_PARAM;
+    }
+
+    frame[0] = motor->address;
+    frame[1] = 0x0AU;
+    frame[2] = 0x6DU;
+    frame[3] = 0x6BU;
 
     return EMM42_MotorTransmitFrame(motor, frame, (uint16_t)sizeof(frame));
 }

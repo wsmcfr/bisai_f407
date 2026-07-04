@@ -153,6 +153,36 @@ extern "C" {
 #define BINARY_PROTOCOL_STEPPER_PARAM_PAYLOAD_LENGTH (25U)
 
 /**
+ * @brief `ACTUATOR_POS_MOVE` 命令负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、actuator:u8、direction:u8、mode:u8、speed_rpm:u16、steps:u32、flags:u8。
+ */
+#define BINARY_PROTOCOL_ACTUATOR_POS_MOVE_PAYLOAD_LENGTH (12U)
+
+/**
+ * @brief `ACTUATOR_STOP` 命令负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、actuator:u8、flags:u8。
+ */
+#define BINARY_PROTOCOL_ACTUATOR_STOP_PAYLOAD_LENGTH     (4U)
+
+/**
+ * @brief `ACTUATOR_VEL_MOVE` 命令负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、actuator:u8、direction:u8、speed_rpm:u16、flags:u8。
+ * 该命令只用于手动连续运动，收到停止命令前电机会保持速度模式运行。
+ */
+#define BINARY_PROTOCOL_ACTUATOR_VEL_MOVE_PAYLOAD_LENGTH (7U)
+
+/**
+ * @brief `ACTUATOR_HOME` 命令负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、actuator:u8、flags:u8。
+ * 当前语义是“把当前位置设为新的零点”，不会让电机主动寻找限位或运动。
+ */
+#define BINARY_PROTOCOL_ACTUATOR_HOME_PAYLOAD_LENGTH     (4U)
+
+/**
  * @brief `WEIGHT_CALIBRATE` 命令负载长度，单位字节。
  *
  * 固定格式：cycle_id:u16、known_weight_g:u16、flags:u8。
@@ -200,6 +230,10 @@ typedef enum
     BINARY_PROTOCOL_CMD_QUERY_STATUS = 0x40U,       /* 查询 F4 和传送带结构化状态，成功返回 STATUS_REPORT。 */
     BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL = 0x41U, /* 手动调试传送带扫描/停止，成功返回 ACK。 */
     BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET = 0x42U,  /* 下发三台 Emm42 运行时参数，成功返回 ACK。 */
+    BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE = 0x50U,  /* 执行器位置运动命令，按 actuator 分发给传送带或摄像头电机服务。 */
+    BINARY_PROTOCOL_CMD_ACTUATOR_STOP = 0x51U,      /* 执行器停止命令，actuator=0xFF 表示全部停止。 */
+    BINARY_PROTOCOL_CMD_ACTUATOR_VEL_MOVE = 0x52U,  /* 执行器速度运动命令，手动调试时按方向持续运行到 STOP。 */
+    BINARY_PROTOCOL_CMD_ACTUATOR_HOME = 0x53U,      /* 执行器当前位置设零命令，用于参数页把当前位置设为标定零点。 */
     BINARY_PROTOCOL_CMD_ACK = 0x80U,                /* ACK 回包，表示命令已被接受。 */
     BINARY_PROTOCOL_CMD_NACK = 0x81U,               /* NACK 回包，表示命令被拒绝并携带错误码。 */
     BINARY_PROTOCOL_CMD_STATUS_REPORT = 0x82U,      /* 状态上报，首轮保留给 MP157 查询和 UI 展示。 */
@@ -422,6 +456,52 @@ typedef struct
 } BinaryProtocol_StepperParamPayload_t;
 
 /**
+ * @brief `ACTUATOR_POS_MOVE` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 自动流程号；手动调试允许为 0。 */
+    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头前后，2=摄像头上下。 */
+    uint8_t direction;                            /* 逻辑方向：0=后退/下降，1=前进/上升。 */
+    uint8_t mode;                                 /* 位置模式，首版 0=相对位置模式。 */
+    uint16_t speed_rpm;                           /* 运动速度，单位 RPM，0 表示使用对应轴默认速度。 */
+    uint32_t steps;                               /* 相对移动步数，单位 step，范围 1~4294967295。 */
+    uint8_t flags;                                /* 保留标志位，首版固定为 0。 */
+} BinaryProtocol_ActuatorPosMovePayload_t;
+
+/**
+ * @brief `ACTUATOR_STOP` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 自动流程号；手动调试允许为 0。 */
+    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头前后，2=摄像头上下，0xFF=全部。 */
+    uint8_t flags;                                /* 保留标志位，首版固定为 0。 */
+} BinaryProtocol_ActuatorStopPayload_t;
+
+/**
+ * @brief `ACTUATOR_VEL_MOVE` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 自动流程号；手动调试允许为 0，当前 Qt 手动页固定使用 0。 */
+    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头前后；上下轴手动不允许连续速度模式。 */
+    uint8_t direction;                            /* 逻辑方向：0=后退，1=前进。 */
+    uint16_t speed_rpm;                           /* 速度模式转速，单位 RPM，范围 1~5000。 */
+    uint8_t flags;                                /* 保留标志位，首版固定为 0。 */
+} BinaryProtocol_ActuatorVelMovePayload_t;
+
+/**
+ * @brief `ACTUATOR_HOME` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 自动流程号；参数页标定通常为 0。 */
+    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头前后，2=摄像头上下。 */
+    uint8_t flags;                                /* 保留标志位，首版固定为 0。 */
+} BinaryProtocol_ActuatorHomePayload_t;
+
+/**
  * @brief `WEIGHT_CALIBRATE` 负载解析结果。
  */
 typedef struct
@@ -472,6 +552,18 @@ uint8_t BinaryProtocolService_DecodeBeltManual(const uint8_t *payload,
 uint8_t BinaryProtocolService_DecodeStepperParam(const uint8_t *payload,
                                                  uint8_t payload_length,
                                                  BinaryProtocol_StepperParamPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeActuatorPosMove(const uint8_t *payload,
+                                                    uint8_t payload_length,
+                                                    BinaryProtocol_ActuatorPosMovePayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeActuatorStop(const uint8_t *payload,
+                                                 uint8_t payload_length,
+                                                 BinaryProtocol_ActuatorStopPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeActuatorVelMove(const uint8_t *payload,
+                                                    uint8_t payload_length,
+                                                    BinaryProtocol_ActuatorVelMovePayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeActuatorHome(const uint8_t *payload,
+                                                 uint8_t payload_length,
+                                                 BinaryProtocol_ActuatorHomePayload_t *decoded_payload);
 uint8_t BinaryProtocolService_DecodeWeightCalibration(const uint8_t *payload,
                                                       uint8_t payload_length,
                                                       BinaryProtocol_WeightCalibrationPayload_t *decoded_payload);

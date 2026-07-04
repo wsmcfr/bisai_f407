@@ -33,3 +33,4 @@ __pycache__/
 .spec-workflow/
 tmp/
 Vision/maixcam2/dist/
+Vision/*.zip

@@ -13,8 +13,8 @@ extern "C" {
  *
  * 该任务负责：
  * 1. 独占 `USART6` 作为摄像头运动 Emm42 TTL 总线，PC6(TX) 接两个电机 RX，PC7(RX) 接两个电机 TX；
- * 2. 初始化摄像头前进/后退电机，电机地址固定为 `0x02`；
- * 3. 初始化摄像头上下电机，电机地址固定为 `0x03`；
+ * 2. 初始化摄像头前进/后退电机，现场默认电机地址为 `0x03`；
+ * 3. 初始化摄像头上下电机，现场默认电机地址为 `0x02`；
  * 4. 串行执行来自 USART1 文本调试命令或后续二进制协议层的点动/停止请求；
  * 5. 确保同一条 `USART6` 总线上不会有两个任务同时发送 Emm42 命令。
  */
@@ -50,6 +50,46 @@ uint8_t CameraMotorService_RequestForwardJog(uint8_t forward_flag, uint16_t spee
  * @return uint8_t 1 表示请求已投递，0 表示摄像头电机服务尚未就绪。
  */
 uint8_t CameraMotorService_RequestZJog(uint8_t up_flag, uint16_t speed_rpm);
+
+/**
+ * @brief 请求摄像头前进/后退轴按相对位置模式移动固定步数。
+ * @param forward_flag 1 表示按工程约定的前进方向移动，0 表示按工程约定的后退方向移动。
+ * @param speed_rpm 位置运动速度，单位 RPM，传 0 时使用该轴默认速度。
+ * @param pulse_count 相对移动步数，单位 step，范围 1~4294967295。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或摄像头电机服务尚未就绪。
+ */
+uint8_t CameraMotorService_RequestForwardPosition(uint8_t forward_flag,
+                                                  uint16_t speed_rpm,
+                                                  uint32_t pulse_count);
+
+/**
+ * @brief 请求摄像头上下轴按相对位置模式移动固定步数。
+ * @param up_flag 1 表示按工程约定的向上方向移动，0 表示按工程约定的向下方向移动。
+ * @param speed_rpm 位置运动速度，单位 RPM，传 0 时使用该轴默认速度。
+ * @param pulse_count 相对移动步数，单位 step，范围 1~4294967295。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或摄像头电机服务尚未就绪。
+ */
+uint8_t CameraMotorService_RequestZPosition(uint8_t up_flag,
+                                            uint16_t speed_rpm,
+                                            uint32_t pulse_count);
+
+/**
+ * @brief 请求摄像头前进/后退轴把当前位置设为新的零点。
+ * @return uint8_t 1 表示请求已投递，0 表示摄像头电机服务尚未就绪。
+ *
+ * 该接口供二进制 `ACTUATOR_HOME actuator=1` 使用。
+ * F4 会先停止目标轴，再发送 Emm42 当前位置清零命令，不会让电机主动运动。
+ */
+uint8_t CameraMotorService_RequestForwardSetCurrentPositionZero(void);
+
+/**
+ * @brief 请求摄像头上下轴把当前位置设为新的零点。
+ * @return uint8_t 1 表示请求已投递，0 表示摄像头电机服务尚未就绪。
+ *
+ * 该接口供二进制 `ACTUATOR_HOME actuator=2` 使用。
+ * F4 会先停止目标轴，再发送 Emm42 当前位置清零命令，不会让电机主动运动。
+ */
+uint8_t CameraMotorService_RequestZSetCurrentPositionZero(void);
 
 /**
  * @brief 请求摄像头两个运动轴立即停止。

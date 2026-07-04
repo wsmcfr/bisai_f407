@@ -15,8 +15,8 @@ extern "C" {
  */
 typedef struct
 {
-    uint8_t desired_mode;        /* 命令层期望模式：0=STOP，1=SCAN，2=TRACK。 */
-    uint8_t applied_mode;        /* 实际下发模式：0=STOP，1=SCAN，2=TRACK。 */
+    uint8_t desired_mode;        /* 命令层期望模式：0=STOP，1=SCAN，2=TRACK，3=POSITION，4=JOG。 */
+    uint8_t applied_mode;        /* 实际下发模式：0=STOP，1=SCAN，2=TRACK，3=POSITION，4=JOG。 */
     int32_t latest_error_px;     /* 最近一次视觉误差，单位像素。 */
     uint16_t speed_rpm;          /* 当前已下发转速，单位 RPM。 */
     uint8_t direction;           /* 当前方向：0=CW，1=CCW。 */
@@ -81,6 +81,37 @@ uint8_t ConveyorMotorService_RequestStop(void);
  * 该接口供二进制 `VISION_POS` 调用，行为等价于文本命令 `BELTTRACK <error>`。
  */
 uint8_t ConveyorMotorService_RequestTrack(int32_t error_px);
+
+/**
+ * @brief 请求传送带按指定方向持续速度运动。
+ * @param forward_flag 1 表示按工程默认前进方向运动，0 表示按工程默认后退方向运动。
+ * @param speed_rpm 速度模式转速，单位 RPM，范围 1~5000。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或传送带任务尚未就绪。
+ *
+ * 该接口供二进制 `ACTUATOR_VEL_MOVE` 手动控制使用。
+ * 它不会自动停止，必须由 `ConveyorMotorService_RequestStop()` 或自动流程 STOP 命令结束。
+ */
+uint8_t ConveyorMotorService_RequestJog(uint8_t forward_flag, uint16_t speed_rpm);
+
+/**
+ * @brief 请求传送带按相对位置模式移动固定步数。
+ * @param forward_flag 1 表示按工程默认前进方向移动，0 表示按工程默认后退方向移动。
+ * @param speed_rpm 位置运动速度，单位 RPM，传 0 时使用传送带常规速度。
+ * @param pulse_count 相对移动步数，单位 step，范围 1~4294967295。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或传送带任务尚未就绪。
+ */
+uint8_t ConveyorMotorService_RequestPosition(uint8_t forward_flag,
+                                             uint16_t speed_rpm,
+                                             uint32_t pulse_count);
+
+/**
+ * @brief 请求传送带把当前位置设为新的零点。
+ * @return uint8_t 1 表示请求已投递，0 表示传送带任务尚未就绪。
+ *
+ * 该接口供二进制 `ACTUATOR_HOME` 参数标定使用。
+ * F4 任务会先停止传送带电机，再发送 Emm42 当前位置清零命令；不会让电机主动运动。
+ */
+uint8_t ConveyorMotorService_RequestSetCurrentPositionZero(void);
 
 /**
  * @brief 更新传送带步进电机运行参数。

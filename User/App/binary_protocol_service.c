@@ -26,6 +26,26 @@
 #define BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_Z       (3U)
 
 /**
+ * @brief `ACTUATOR_POS_MOVE/ACTUATOR_STOP` 中的执行器编号：传送带。
+ */
+#define BINARY_PROTOCOL_ACTUATOR_CONVEYOR           (0U)
+
+/**
+ * @brief `ACTUATOR_POS_MOVE/ACTUATOR_STOP` 中的执行器编号：摄像头前进/后退轴。
+ */
+#define BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD     (1U)
+
+/**
+ * @brief `ACTUATOR_POS_MOVE/ACTUATOR_STOP` 中的执行器编号：摄像头上下轴。
+ */
+#define BINARY_PROTOCOL_ACTUATOR_CAMERA_Z           (2U)
+
+/**
+ * @brief `ACTUATOR_STOP` 中的执行器编号：全部可停止执行器。
+ */
+#define BINARY_PROTOCOL_ACTUATOR_ALL                (0xFFU)
+
+/**
  * @brief 步进电机地址允许的最小普通站号。
  */
 #define BINARY_PROTOCOL_STEPPER_ADDRESS_MIN         (1U)
@@ -599,6 +619,117 @@ uint8_t BinaryProtocolService_DecodeStepperParam(const uint8_t *payload,
         decoded_payload->motors[index].direction = (int8_t)payload[offset + 6U];
     }
 
+    return 1U;
+}
+
+/**
+ * @brief 解码 ACTUATOR_POS_MOVE 负载。
+ * @param payload 原始负载。
+ * @param payload_length 原始负载长度。
+ * @param decoded_payload 解码输出对象。
+ * @return uint8_t 1 表示解码成功，0 表示长度或参数非法。
+ *
+ * 负载固定 12 字节：
+ * cycle_id:u16、actuator:u8、direction:u8、mode:u8、speed_rpm:u16、steps:u32、flags:u8。
+ */
+uint8_t BinaryProtocolService_DecodeActuatorPosMove(const uint8_t *payload,
+                                                    uint8_t payload_length,
+                                                    BinaryProtocol_ActuatorPosMovePayload_t *decoded_payload)
+{
+    if ((payload == NULL) ||
+        (decoded_payload == NULL) ||
+        (payload_length != BINARY_PROTOCOL_ACTUATOR_POS_MOVE_PAYLOAD_LENGTH))
+    {
+        return 0U;
+    }
+
+    decoded_payload->cycle_id = BinaryProtocolService_ReadU16Le(&payload[0]);
+    decoded_payload->actuator = payload[2];
+    decoded_payload->direction = payload[3];
+    decoded_payload->mode = payload[4];
+    decoded_payload->speed_rpm = BinaryProtocolService_ReadU16Le(&payload[5]);
+    decoded_payload->steps = BinaryProtocolService_ReadU32Le(&payload[7]);
+    decoded_payload->flags = payload[11];
+    return 1U;
+}
+
+/**
+ * @brief 解码 ACTUATOR_STOP 负载。
+ * @param payload 原始负载。
+ * @param payload_length 原始负载长度。
+ * @param decoded_payload 解码输出对象。
+ * @return uint8_t 1 表示解码成功，0 表示长度或参数非法。
+ */
+uint8_t BinaryProtocolService_DecodeActuatorStop(const uint8_t *payload,
+                                                 uint8_t payload_length,
+                                                 BinaryProtocol_ActuatorStopPayload_t *decoded_payload)
+{
+    if ((payload == NULL) ||
+        (decoded_payload == NULL) ||
+        (payload_length != BINARY_PROTOCOL_ACTUATOR_STOP_PAYLOAD_LENGTH))
+    {
+        return 0U;
+    }
+
+    decoded_payload->cycle_id = BinaryProtocolService_ReadU16Le(&payload[0]);
+    decoded_payload->actuator = payload[2];
+    decoded_payload->flags = payload[3];
+    return 1U;
+}
+
+/**
+ * @brief 解码 ACTUATOR_VEL_MOVE 负载。
+ * @param payload 原始负载。
+ * @param payload_length 原始负载长度。
+ * @param decoded_payload 解码输出对象。
+ * @return uint8_t 1 表示解码成功，0 表示长度或参数非法。
+ *
+ * 负载固定 7 字节：
+ * cycle_id:u16、actuator:u8、direction:u8、speed_rpm:u16、flags:u8。
+ */
+uint8_t BinaryProtocolService_DecodeActuatorVelMove(const uint8_t *payload,
+                                                    uint8_t payload_length,
+                                                    BinaryProtocol_ActuatorVelMovePayload_t *decoded_payload)
+{
+    if ((payload == NULL) ||
+        (decoded_payload == NULL) ||
+        (payload_length != BINARY_PROTOCOL_ACTUATOR_VEL_MOVE_PAYLOAD_LENGTH))
+    {
+        return 0U;
+    }
+
+    decoded_payload->cycle_id = BinaryProtocolService_ReadU16Le(&payload[0]);
+    decoded_payload->actuator = payload[2];
+    decoded_payload->direction = payload[3];
+    decoded_payload->speed_rpm = BinaryProtocolService_ReadU16Le(&payload[4]);
+    decoded_payload->flags = payload[6];
+    return 1U;
+}
+
+/**
+ * @brief 解码 ACTUATOR_HOME 负载。
+ * @param payload 原始负载。
+ * @param payload_length 原始负载长度。
+ * @param decoded_payload 解码输出对象。
+ * @return uint8_t 1 表示解码成功，0 表示长度或参数非法。
+ *
+ * 负载固定 4 字节：
+ * cycle_id:u16、actuator:u8、flags:u8。
+ */
+uint8_t BinaryProtocolService_DecodeActuatorHome(const uint8_t *payload,
+                                                 uint8_t payload_length,
+                                                 BinaryProtocol_ActuatorHomePayload_t *decoded_payload)
+{
+    if ((payload == NULL) ||
+        (decoded_payload == NULL) ||
+        (payload_length != BINARY_PROTOCOL_ACTUATOR_HOME_PAYLOAD_LENGTH))
+    {
+        return 0U;
+    }
+
+    decoded_payload->cycle_id = BinaryProtocolService_ReadU16Le(&payload[0]);
+    decoded_payload->actuator = payload[2];
+    decoded_payload->flags = payload[3];
     return 1U;
 }
 
@@ -1639,6 +1770,337 @@ static void BinaryProtocolService_HandleStepperParam(const BinaryProtocol_Frame_
 }
 
 /**
+ * @brief 处理 ACTUATOR_POS_MOVE。
+ * @param frame 已解析帧。
+ *
+ * 分发规则：
+ * 1. actuator=0：传送带电机走 UART4 位置模式；
+ * 2. actuator=1：摄像头前进/后退轴走 USART6 位置模式；
+ * 3. actuator=2：摄像头上下轴走 USART6 位置模式；
+ * 4. cycle_id=0 允许手动调试，非 0 时必须匹配当前自动流程。
+ */
+static void BinaryProtocolService_HandleActuatorPosMove(const BinaryProtocol_Frame_t *frame)
+{
+    BinaryProtocol_ActuatorPosMovePayload_t payload;
+    uint8_t accepted = 0U;
+
+    if (BinaryProtocolService_DecodeActuatorPosMove(frame->payload, frame->payload_length, &payload) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_PAYLOAD_LENGTH,
+                                       frame->payload_length);
+        return;
+    }
+
+    if ((payload.cycle_id != 0U) && (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_CYCLE_MISMATCH,
+                                       g_binary_protocol_runtime.active_cycle_id);
+        return;
+    }
+
+    if ((payload.flags != 0U) ||
+        (payload.mode != 0U) ||
+        (payload.direction > 1U) ||
+        (payload.speed_rpm > BINARY_PROTOCOL_STEPPER_SPEED_MAX_RPM) ||
+        (payload.steps == 0U))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.actuator);
+        return;
+    }
+
+    if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CONVEYOR)
+    {
+        accepted = ConveyorMotorService_RequestPosition((payload.direction != 0U) ? 1U : 0U,
+                                                        payload.speed_rpm,
+                                                        payload.steps);
+    }
+    else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD)
+    {
+        accepted = CameraMotorService_RequestForwardPosition((payload.direction != 0U) ? 1U : 0U,
+                                                             payload.speed_rpm,
+                                                             payload.steps);
+    }
+    else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_Z)
+    {
+        accepted = CameraMotorService_RequestZPosition((payload.direction != 0U) ? 1U : 0U,
+                                                       payload.speed_rpm,
+                                                       payload.steps);
+    }
+    else
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.actuator);
+        return;
+    }
+
+    if (accepted == 0U)
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_HARDWARE_FAULT,
+                                       payload.actuator);
+        return;
+    }
+
+    BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U);
+}
+
+/**
+ * @brief 处理 ACTUATOR_STOP。
+ * @param frame 已解析帧。
+ *
+ * actuator=0 停传送带，actuator=1/2 停摄像头两轴，actuator=0xFF 同时停止传送带和摄像头两轴。
+ */
+static void BinaryProtocolService_HandleActuatorStop(const BinaryProtocol_Frame_t *frame)
+{
+    BinaryProtocol_ActuatorStopPayload_t payload;
+    uint8_t conveyor_accepted = 1U;
+    uint8_t camera_accepted = 1U;
+
+    if (BinaryProtocolService_DecodeActuatorStop(frame->payload, frame->payload_length, &payload) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_PAYLOAD_LENGTH,
+                                       frame->payload_length);
+        return;
+    }
+
+    if ((payload.cycle_id != 0U) && (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_CYCLE_MISMATCH,
+                                       g_binary_protocol_runtime.active_cycle_id);
+        return;
+    }
+
+    if (payload.flags != 0U)
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.flags);
+        return;
+    }
+
+    if ((payload.actuator == BINARY_PROTOCOL_ACTUATOR_CONVEYOR) ||
+        (payload.actuator == BINARY_PROTOCOL_ACTUATOR_ALL))
+    {
+        conveyor_accepted = ConveyorMotorService_RequestStop();
+    }
+
+    if ((payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD) ||
+        (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_Z) ||
+        (payload.actuator == BINARY_PROTOCOL_ACTUATOR_ALL))
+    {
+        camera_accepted = CameraMotorService_RequestStopAll();
+    }
+
+    if ((payload.actuator != BINARY_PROTOCOL_ACTUATOR_CONVEYOR) &&
+        (payload.actuator != BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD) &&
+        (payload.actuator != BINARY_PROTOCOL_ACTUATOR_CAMERA_Z) &&
+        (payload.actuator != BINARY_PROTOCOL_ACTUATOR_ALL))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.actuator);
+        return;
+    }
+
+    if ((conveyor_accepted == 0U) || (camera_accepted == 0U))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_HARDWARE_FAULT,
+                                       payload.actuator);
+        return;
+    }
+
+    BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U);
+}
+
+/**
+ * @brief 处理 ACTUATOR_VEL_MOVE。
+ * @param frame 已解析帧。
+ *
+ * 分发规则：
+ * 1. actuator=0：传送带进入指定方向速度模式，直到收到 STOP；
+ * 2. actuator=1：摄像头前进/后退轴进入指定方向速度模式，直到收到 STOP；
+ * 3. actuator=2：上下轴不允许连续速度模式，避免误操作造成无限升降，只能用 ACTUATOR_POS_MOVE 固定步数。
+ */
+static void BinaryProtocolService_HandleActuatorVelMove(const BinaryProtocol_Frame_t *frame)
+{
+    BinaryProtocol_ActuatorVelMovePayload_t payload;
+    uint8_t accepted = 0U;
+
+    if (BinaryProtocolService_DecodeActuatorVelMove(frame->payload, frame->payload_length, &payload) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_PAYLOAD_LENGTH,
+                                       frame->payload_length);
+        return;
+    }
+
+    if ((payload.cycle_id != 0U) && (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_CYCLE_MISMATCH,
+                                       g_binary_protocol_runtime.active_cycle_id);
+        return;
+    }
+
+    if ((payload.flags != 0U) ||
+        (payload.direction > 1U) ||
+        (payload.speed_rpm == 0U) ||
+        (payload.speed_rpm > BINARY_PROTOCOL_STEPPER_SPEED_MAX_RPM))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.actuator);
+        return;
+    }
+
+    if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CONVEYOR)
+    {
+        accepted = ConveyorMotorService_RequestJog((payload.direction != 0U) ? 1U : 0U,
+                                                  payload.speed_rpm);
+    }
+    else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD)
+    {
+        accepted = CameraMotorService_RequestForwardJog((payload.direction != 0U) ? 1U : 0U,
+                                                        payload.speed_rpm);
+    }
+    else
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.actuator);
+        return;
+    }
+
+    if (accepted == 0U)
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_HARDWARE_FAULT,
+                                       payload.actuator);
+        return;
+    }
+
+    BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U);
+}
+
+/**
+ * @brief 处理 ACTUATOR_HOME。
+ * @param frame 已解析帧。
+ *
+ * 当前 HOME 的实际语义是“设当前位置为零点”：
+ * 1. actuator=0：传送带电机停止后清零当前位置；
+ * 2. actuator=1：摄像头前进/后退轴停止后清零当前位置；
+ * 3. actuator=2：摄像头上下轴停止后清零当前位置；
+ * 4. 不支持 actuator=0xFF，避免一次误触把全部轴的标定基准同时改掉。
+ */
+static void BinaryProtocolService_HandleActuatorHome(const BinaryProtocol_Frame_t *frame)
+{
+    BinaryProtocol_ActuatorHomePayload_t payload;
+    uint8_t accepted = 0U;
+
+    if (BinaryProtocolService_DecodeActuatorHome(frame->payload, frame->payload_length, &payload) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_PAYLOAD_LENGTH,
+                                       frame->payload_length);
+        return;
+    }
+
+    if ((payload.cycle_id != 0U) && (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_CYCLE_MISMATCH,
+                                       g_binary_protocol_runtime.active_cycle_id);
+        return;
+    }
+
+    if (payload.flags != 0U)
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.flags);
+        return;
+    }
+
+    if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CONVEYOR)
+    {
+        accepted = ConveyorMotorService_RequestSetCurrentPositionZero();
+    }
+    else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD)
+    {
+        accepted = CameraMotorService_RequestForwardSetCurrentPositionZero();
+    }
+    else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_Z)
+    {
+        accepted = CameraMotorService_RequestZSetCurrentPositionZero();
+    }
+    else
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.actuator);
+        return;
+    }
+
+    if (accepted == 0U)
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_HARDWARE_FAULT,
+                                       payload.actuator);
+        return;
+    }
+
+    BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U);
+}
+
+/**
  * @brief 把称重服务标定结果映射成二进制协议 NACK 错误码。
  * @param result 称重服务返回的标定业务结果。
  * @return BinaryProtocol_ErrorCode_t 协议层错误码。
@@ -1809,6 +2271,22 @@ uint8_t BinaryProtocolService_HandleFrame(const uint8_t *frame_buffer, uint16_t 
 
         case BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET:
             BinaryProtocolService_HandleStepperParam(&frame);
+            break;
+
+        case BINARY_PROTOCOL_CMD_ACTUATOR_POS_MOVE:
+            BinaryProtocolService_HandleActuatorPosMove(&frame);
+            break;
+
+        case BINARY_PROTOCOL_CMD_ACTUATOR_STOP:
+            BinaryProtocolService_HandleActuatorStop(&frame);
+            break;
+
+        case BINARY_PROTOCOL_CMD_ACTUATOR_VEL_MOVE:
+            BinaryProtocolService_HandleActuatorVelMove(&frame);
+            break;
+
+        case BINARY_PROTOCOL_CMD_ACTUATOR_HOME:
+            BinaryProtocolService_HandleActuatorHome(&frame);
             break;
 
         default:

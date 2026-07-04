@@ -187,6 +187,38 @@ EMM42_MotorStatus_t EMM42_MotorSetVelocity(const EMM42_MotorHandle_t *motor,
                                            bool sync_flag);
 
 /**
+ * @brief 发送相对位置模式运动命令。
+ * @param motor 电机句柄指针，不能为空。
+ * @param direction 旋转方向。
+ * @param velocity_rpm 目标转速，单位 RPM，范围 0~5000。
+ * @param acceleration 加速度参数，范围 0~255。
+ * @param pulse_count 相对移动脉冲数，单位 step，范围 1~4294967295。
+ * @param sync_flag 同步运动标志，当前通常传 `false`。
+ * @return EMM42_MotorStatus_t 发送结果。
+ *
+ * 该接口对应张大头 Emm42 `0xFD` 位置模式命令。
+ * 本工程只开放相对位置模式：MP157/F4 上层传入固定步数，
+ * 电机按当前位置移动 pulse_count 个脉冲，运动完成状态首版不解析回包。
+ */
+EMM42_MotorStatus_t EMM42_MotorMoveRelativePosition(const EMM42_MotorHandle_t *motor,
+                                                    EMM42_MotorDirection_t direction,
+                                                    uint16_t velocity_rpm,
+                                                    uint8_t acceleration,
+                                                    uint32_t pulse_count,
+                                                    bool sync_flag);
+
+/**
+ * @brief 将电机当前位置清零。
+ * @param motor 电机句柄指针，不能为空。
+ * @return EMM42_MotorStatus_t 发送结果。
+ *
+ * 该接口对应张大头 Emm V5 的“将当前的位置角度清零”命令。
+ * 命令不会让电机转动，而是让驱动器把当前位置角度、位置误差和脉冲数等内部位置量清零。
+ * 当前驱动只发送命令帧，不解析电机回包，因此返回 OK 只表示帧已成功发出。
+ */
+EMM42_MotorStatus_t EMM42_MotorResetCurrentPositionToZero(const EMM42_MotorHandle_t *motor);
+
+/**
  * @brief 发送立即停止命令。
  * @param motor 电机句柄指针，不能为空。
  * @param sync_flag 同步运动标志，当前通常传 `false`。

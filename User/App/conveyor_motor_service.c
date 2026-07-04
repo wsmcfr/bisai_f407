@@ -33,7 +33,7 @@
  *
  * 运行边界：
  * - 如果 TRACK 模式超过 `CONVEYOR_MOTOR_TRACK_TIMEOUT_MS` 没有新视觉误差，会主动停机；
- * - 正误差默认映射到 CW，若现场方向相反，只改 `CONVEYOR_MOTOR_POSITIVE_ERROR_IS_CW`；
+ * - 正误差默认映射到 CCW，保证上方来料的负误差沿扫描方向继续送入 ROI 中心；
  * - 本文件只决定模式和速度，具体 Emm42 字节帧见 `User/Driver/emm42_motor.c` 顶部协议表。
  */
 
@@ -51,8 +51,8 @@
  *
  * 当前硬件分配：
  * - 传送带电机：UART4 PC10/PC11，地址 0x01；
- * - 摄像头前进/后退电机：USART6 PC6/PC7，地址 0x02；
- * - 摄像头上下电机：USART6 PC6/PC7，地址 0x03。
+ * - 摄像头前进/后退电机：USART6 PC6/PC7，现场地址 0x03；
+ * - 摄像头上下电机：USART6 PC6/PC7，现场地址 0x02。
  *
  * 传送带电机虽然独占 UART4，但仍明确写出地址，
  * 方便以后通过串口日志核对现场电机 ID 是否设置正确。
@@ -112,25 +112,28 @@
  * @brief 跟踪模式最小转速，单位 RPM。
  *
  * 这里的“最小转速”同时也作为“中心附近爬行速度”使用。
- * 你当前反馈 `BELTTRACK 11` 仍然偏快，因此把这个基础速度降下来，
- * 让小误差区域先以更慢的速度贴近中心。
+ * 现场出现过“小误差仍在持续下发坐标，但 10rpm 推不动传送带”的卡滞现象，
+ * 说明原来的爬行速度已经低于当前机械负载下的静摩擦启动速度。
+ * 因此这里提高到 20rpm，保证只要真的需要微调，传送带就能实际动起来。
  */
-#define CONVEYOR_MOTOR_TRACK_MIN_SPEED_RPM          (10U)
+#define CONVEYOR_MOTOR_TRACK_MIN_SPEED_RPM          (20U)
 
 /**
  * @brief 小误差爬行区上限，单位像素。
  *
  * 当误差刚刚走出死区时，仍然不适合马上给较高转速。
- * 因此在这个范围内，统一使用低速爬行，提升人工调试手感。
+ * 当前现场反馈“速度太快、需要来回移动几次才停”，
+ * 因此把爬行区扩大到 50px，让零件靠近 ROI 中心前就进入低速段。
  */
-#define CONVEYOR_MOTOR_TRACK_CRAWL_MAX_ERROR_PX     (30U)
+#define CONVEYOR_MOTOR_TRACK_CRAWL_MAX_ERROR_PX     (50U)
 
 /**
  * @brief 跟踪模式最大转速，单位 RPM。
  *
- * 初版先限在一个相对保守的速度上限，避免刚接入视觉后电机动作过猛。
+ * 视觉闭环只负责把零件慢慢送到 ROI 中央，不能像手动点动一样追求速度。
+ * 当前把上限从 250rpm 降到 80rpm，用于减少远距离跟踪时的物理惯性过冲。
  */
-#define CONVEYOR_MOTOR_TRACK_MAX_SPEED_RPM          (250U)
+#define CONVEYOR_MOTOR_TRACK_MAX_SPEED_RPM          (80U)
 
 /**
  * @brief 像素误差到 RPM 的线性映射系数。
@@ -147,9 +150,10 @@
  * @brief 默认加速度参数。
  *
  * 该参数直接对应张大头速度模式协议中的 `acc` 字段。
- * 在低速视觉纠偏场景里，适当减小加速度可以让动作更柔和。
+ * 在低速视觉纠偏场景里，减小加速度可以降低速度切换和停机前的冲量，
+ * 让零件更容易一次停在 ROI 中央附近。
  */
-#define CONVEYOR_MOTOR_ACCEL                        (5U)
+#define CONVEYOR_MOTOR_ACCEL                        (2U)
 
 /**
  * @brief 启动时是否强制恢复 Emm42 的控制模式。
@@ -204,8 +208,11 @@
  *
  * 当目标误差绝对值落入这个区间时，电机立即停止，
  * 以避免在中心附近来回抖动。
+ * 当前从 18px 继续扩到 24px，目的是把“肉眼已经接近 ROI 中央”的小误差
+ * 直接判定为居中，避免 F4 在 18~24px 这种微小误差上反复给低速命令。
+ * 如果现场发现零件停得明显偏离 ROI 中央，再逐步缩小到 20px 或 18px。
  */
-#define CONVEYOR_MOTOR_CENTER_DEADBAND_PX           (10)
+#define CONVEYOR_MOTOR_CENTER_DEADBAND_PX           (24)
 
 /**
  * @brief 连续多少帧都落在中心死区内，才认为“已经稳定对中”。
@@ -217,12 +224,15 @@
 #define CONVEYOR_MOTOR_CENTER_STABLE_FRAMES         (3U)
 
 /**
- * @brief 正误差默认对应 CW 方向。
+ * @brief 正误差默认对应 CCW 方向。
  *
- * 传送带的实际机械安装方向和相机坐标正方向有关，
- * 真机联调时如果发现“误差越大却往反方向跑”，只需要把这里改成 0。
+ * MP157 现在按上方来料下发 `axis_px=center_y`、`target_px=height/2`，
+ * 零件刚从画面上方进入时 `axis_px-target_px` 为负数。
+ * 现场验证负误差走 CCW 会把零件推回上方离开视野，
+ * 因此这里把“正误差是否为 CW”固定为 0，让负误差走 CW 扫描送入方向。
+ * 后续如果现场安装方向再次变化，只改这个宏，不要在 MP157 协议层偷偷反号。
  */
-#define CONVEYOR_MOTOR_POSITIVE_ERROR_IS_CW         (1U)
+#define CONVEYOR_MOTOR_POSITIVE_ERROR_IS_CW         (0U)
 
 /**
  * @brief 是否在任务启动后默认进入巡航模式。
@@ -248,7 +258,9 @@ typedef enum
 {
     CONVEYOR_MOTOR_MODE_STOP = 0, /* 停止模式，电机保持静止，等待下一条巡航或跟踪命令。 */
     CONVEYOR_MOTOR_MODE_SCAN,     /* 巡航扫描模式，传送带按固定低速匀速运行，用于寻找或输送目标。 */
-    CONVEYOR_MOTOR_MODE_TRACK     /* 视觉跟踪模式，根据相机中心误差动态调整速度和方向。 */
+    CONVEYOR_MOTOR_MODE_TRACK,    /* 视觉跟踪模式，根据相机中心误差动态调整速度和方向。 */
+    CONVEYOR_MOTOR_MODE_POSITION, /* 位置模式，已下发一次固定步数运动，等待下一条 STOP/SCAN/TRACK 命令。 */
+    CONVEYOR_MOTOR_MODE_JOG       /* 手动持续运动模式，按指定方向和速度运行，直到收到 STOP。 */
 } ConveyorMotor_Mode_t;
 
 /**
@@ -259,6 +271,9 @@ typedef enum
     CONVEYOR_MOTOR_COMMAND_STOP = 0, /* 队列命令：要求电机任务切换到 STOP，并立即下发停止帧。 */
     CONVEYOR_MOTOR_COMMAND_SCAN,     /* 队列命令：要求电机任务切换到 SCAN，并按巡航速度运行。 */
     CONVEYOR_MOTOR_COMMAND_TRACK,    /* 队列命令：要求电机任务使用最新像素误差执行视觉对中。 */
+    CONVEYOR_MOTOR_COMMAND_POSITION, /* 队列命令：要求电机任务按位置模式移动固定步数。 */
+    CONVEYOR_MOTOR_COMMAND_JOG,      /* 队列命令：要求电机任务按指定方向和速度持续运行。 */
+    CONVEYOR_MOTOR_COMMAND_SET_ZERO, /* 队列命令：要求电机任务停止后把当前位置设为零点。 */
     CONVEYOR_MOTOR_COMMAND_CONFIG    /* 队列命令：更新 MP157 下发的地址、步长、常规速度和方向。 */
 } ConveyorMotor_CommandType_t;
 
@@ -284,6 +299,9 @@ typedef struct
 {
     ConveyorMotor_CommandType_t type; /* 命令类型，决定电机任务本轮切换到停止、巡航还是视觉跟踪模式。 */
     int32_t error_px;                 /* 视觉目标相对中心的带符号像素误差，单位像素，仅 TRACK 命令使用。 */
+    EMM42_MotorDirection_t direction; /* 位置模式逻辑方向，CW 表示工程默认前进，CCW 表示工程默认后退。 */
+    uint16_t speed_rpm;               /* 位置模式速度，单位 RPM；0 表示使用当前运行参数常规速度。 */
+    uint32_t pulse_count;             /* 位置模式相对移动步数，单位 step。 */
     ConveyorMotor_RuntimeConfig_t config; /* CONFIG 命令携带的新运行参数，其它命令忽略该字段。 */
 } ConveyorMotor_Command_t;
 
@@ -319,6 +337,8 @@ typedef struct
     uint8_t fresh_track_sample_flag;               /* 新跟踪样本标志，1 表示本周期刚收到新的 BELTTRACK 误差。 */
     uint8_t track_timeout_reported_flag;           /* 跟踪超时日志抑制标志，避免超时期间反复刷同一条告警。 */
     TickType_t last_track_update_tick;             /* 最近一次收到视觉跟踪样本的 RTOS tick，用于计算跟踪输入超时。 */
+    EMM42_MotorDirection_t jog_direction;          /* 手动持续运动的逻辑方向，由 ACTUATOR_VEL_MOVE 写入。 */
+    uint16_t jog_speed_rpm;                        /* 手动持续运动的速度，单位 RPM，由 ACTUATOR_VEL_MOVE 写入。 */
     ConveyorMotor_RuntimeConfig_t config;          /* 当前生效的 MP157 步进电机参数，任务内独占读写。 */
 } ConveyorMotor_Runtime_t;
 
@@ -395,6 +415,12 @@ static const char *ConveyorMotorService_GetModeName(ConveyorMotor_Mode_t mode)
 
         case CONVEYOR_MOTOR_MODE_TRACK:
             return "TRACK";
+
+        case CONVEYOR_MOTOR_MODE_POSITION:
+            return "POSITION";
+
+        case CONVEYOR_MOTOR_MODE_JOG:
+            return "JOG";
 
         case CONVEYOR_MOTOR_MODE_STOP:
         default:
@@ -556,6 +582,73 @@ uint8_t ConveyorMotorService_RequestTrack(int32_t error_px)
     (void)memset(&command, 0, sizeof(command));
     command.type = CONVEYOR_MOTOR_COMMAND_TRACK;
     command.error_px = error_px;
+    return ConveyorMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 请求传送带按指定方向持续速度运动。
+ * @param forward_flag 1 表示工程默认前进方向，0 表示工程默认后退方向。
+ * @param speed_rpm 速度模式转速，单位 RPM，范围 1~5000。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或任务队列尚未创建。
+ *
+ * 该函数只投递手动持续运动命令，不会自动计步或自动停机。
+ * 上位机必须继续通过 `ACTUATOR_STOP` 或 `STOP_CYCLE` 结束这次速度运动。
+ */
+uint8_t ConveyorMotorService_RequestJog(uint8_t forward_flag, uint16_t speed_rpm)
+{
+    ConveyorMotor_Command_t command;
+
+    if ((speed_rpm == 0U) || (speed_rpm > CONVEYOR_MOTOR_CONFIG_MAX_SPEED_RPM))
+    {
+        return 0U;
+    }
+
+    (void)memset(&command, 0, sizeof(command));
+    command.type = CONVEYOR_MOTOR_COMMAND_JOG;
+    command.direction = (forward_flag != 0U) ? EMM42_MOTOR_DIRECTION_CW : EMM42_MOTOR_DIRECTION_CCW;
+    command.speed_rpm = speed_rpm;
+    return ConveyorMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 请求传送带按相对位置模式移动固定步数。
+ * @param forward_flag 1 表示工程默认前进方向，0 表示工程默认后退方向。
+ * @param speed_rpm 位置运动速度，单位 RPM，传 0 使用运行参数常规速度。
+ * @param pulse_count 相对移动步数，单位 step。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或任务队列尚未创建。
+ */
+uint8_t ConveyorMotorService_RequestPosition(uint8_t forward_flag,
+                                             uint16_t speed_rpm,
+                                             uint32_t pulse_count)
+{
+    ConveyorMotor_Command_t command;
+
+    if ((speed_rpm > CONVEYOR_MOTOR_CONFIG_MAX_SPEED_RPM) || (pulse_count == 0U))
+    {
+        return 0U;
+    }
+
+    (void)memset(&command, 0, sizeof(command));
+    command.type = CONVEYOR_MOTOR_COMMAND_POSITION;
+    command.direction = (forward_flag != 0U) ? EMM42_MOTOR_DIRECTION_CW : EMM42_MOTOR_DIRECTION_CCW;
+    command.speed_rpm = speed_rpm;
+    command.pulse_count = pulse_count;
+    return ConveyorMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 请求传送带把当前位置设为新的零点。
+ * @return uint8_t 1 表示请求已投递，0 表示传送带任务尚未就绪。
+ *
+ * 这里只投递队列命令，真正停机和 Emm42 清零帧发送在传送带任务上下文执行，
+ * 避免协议解析任务直接占用 UART4。
+ */
+uint8_t ConveyorMotorService_RequestSetCurrentPositionZero(void)
+{
+    ConveyorMotor_Command_t command;
+
+    (void)memset(&command, 0, sizeof(command));
+    command.type = CONVEYOR_MOTOR_COMMAND_SET_ZERO;
     return ConveyorMotorService_PostCommand(&command);
 }
 
@@ -997,6 +1090,56 @@ static EMM42_MotorStatus_t ConveyorMotorService_ApplyTrack(const EMM42_MotorHand
 }
 
 /**
+ * @brief 执行手动持续运动速度命令。
+ * @param motor 电机句柄，不能为空。
+ * @param runtime 任务运行时状态，不能为空，里面保存手动方向和速度。
+ * @return EMM42_MotorStatus_t 发送结果。
+ *
+ * 手动 JOG 模式只负责让电机保持某个速度运行。
+ * 停止条件由 STOP 命令触发，不能在这里自动停，否则会破坏“按一次持续动”的调试语义。
+ */
+static EMM42_MotorStatus_t ConveyorMotorService_ApplyJog(const EMM42_MotorHandle_t *motor,
+                                                         ConveyorMotor_Runtime_t *runtime)
+{
+    EMM42_MotorStatus_t status;
+    EMM42_MotorDirection_t mapped_direction;
+
+    if ((motor == NULL) || (runtime == NULL))
+    {
+        return EMM42_MOTOR_STATUS_INVALID_PARAM;
+    }
+
+    if (runtime->jog_speed_rpm == 0U)
+    {
+        return ConveyorMotorService_ApplyStop(motor, runtime);
+    }
+
+    mapped_direction = ConveyorMotorService_MapRuntimeDirection(runtime->jog_direction,
+                                                               runtime->config.direction);
+
+    if ((runtime->applied_mode == CONVEYOR_MOTOR_MODE_JOG) &&
+        (runtime->applied_speed_rpm == runtime->jog_speed_rpm) &&
+        (runtime->applied_direction == mapped_direction))
+    {
+        return EMM42_MOTOR_STATUS_OK;
+    }
+
+    status = EMM42_MotorSetVelocity(motor,
+                                    mapped_direction,
+                                    runtime->jog_speed_rpm,
+                                    CONVEYOR_MOTOR_ACCEL,
+                                    false);
+    if (status == EMM42_MOTOR_STATUS_OK)
+    {
+        runtime->applied_mode = CONVEYOR_MOTOR_MODE_JOG;
+        runtime->applied_speed_rpm = runtime->jog_speed_rpm;
+        runtime->applied_direction = mapped_direction;
+    }
+
+    return status;
+}
+
+/**
  * @brief 在任务启动阶段把电机恢复到当前工程预期的基础模式。
  * @param motor 电机句柄，不能为空。
  * @param failed_stage 输出失败阶段描述，不能为空。
@@ -1125,6 +1268,88 @@ static void ConveyorMotorService_HandleQueuedCommand(const ConveyorMotor_Command
             runtime->last_track_update_tick = xTaskGetTickCount();
             break;
 
+        case CONVEYOR_MOTOR_COMMAND_POSITION:
+        {
+            EMM42_MotorDirection_t mapped_direction;
+            uint16_t speed_rpm;
+
+            runtime->desired_mode = CONVEYOR_MOTOR_MODE_POSITION;
+            runtime->fresh_track_sample_flag = 0U;
+            runtime->track_timeout_reported_flag = 0U;
+            runtime->center_stable_count = 0U;
+            runtime->centered_flag = 0U;
+
+            mapped_direction = ConveyorMotorService_MapRuntimeDirection(command->direction,
+                                                                        runtime->config.direction);
+            speed_rpm = (command->speed_rpm == 0U) ?
+                        runtime->config.normal_speed_rpm :
+                        command->speed_rpm;
+            if (speed_rpm == 0U)
+            {
+                ConveyorMotorService_ReportDriverError("position speed zero",
+                                                       EMM42_MOTOR_STATUS_RANGE_ERROR);
+                break;
+            }
+
+            status = EMM42_MotorMoveRelativePosition(motor,
+                                                     mapped_direction,
+                                                     speed_rpm,
+                                                     CONVEYOR_MOTOR_ACCEL,
+                                                     command->pulse_count,
+                                                     false);
+            if (status != EMM42_MOTOR_STATUS_OK)
+            {
+                ConveyorMotorService_ReportDriverError("position command", status);
+                break;
+            }
+
+            runtime->applied_mode = CONVEYOR_MOTOR_MODE_POSITION;
+            runtime->applied_speed_rpm = speed_rpm;
+            runtime->applied_direction = mapped_direction;
+            break;
+        }
+
+        case CONVEYOR_MOTOR_COMMAND_JOG:
+            runtime->desired_mode = CONVEYOR_MOTOR_MODE_JOG;
+            runtime->fresh_track_sample_flag = 0U;
+            runtime->track_timeout_reported_flag = 0U;
+            runtime->center_stable_count = 0U;
+            runtime->centered_flag = 0U;
+            runtime->jog_direction = command->direction;
+            runtime->jog_speed_rpm = command->speed_rpm;
+            break;
+
+        case CONVEYOR_MOTOR_COMMAND_SET_ZERO:
+            /*
+             * 当前位置清零是参数标定动作，不应该在运动中执行。
+             * 因此先切到 STOP 并发送停止帧，再发送 Emm42 当前位置清零帧。
+             */
+            runtime->desired_mode = CONVEYOR_MOTOR_MODE_STOP;
+            runtime->fresh_track_sample_flag = 0U;
+            runtime->track_timeout_reported_flag = 0U;
+            runtime->center_stable_count = 0U;
+            runtime->centered_flag = 0U;
+            runtime->jog_speed_rpm = 0U;
+
+            status = ConveyorMotorService_ApplyStop(motor, runtime);
+            if (status != EMM42_MOTOR_STATUS_OK)
+            {
+                ConveyorMotorService_ReportDriverError("home pre-stop", status);
+                break;
+            }
+
+            status = EMM42_MotorResetCurrentPositionToZero(motor);
+            if (status != EMM42_MOTOR_STATUS_OK)
+            {
+                ConveyorMotorService_ReportDriverError("home set-zero", status);
+                break;
+            }
+
+            runtime->applied_mode = CONVEYOR_MOTOR_MODE_STOP;
+            runtime->applied_speed_rpm = 0U;
+            my_printf(&huart1, "[OK][BELT] Current position set to zero.\r\n");
+            break;
+
         case CONVEYOR_MOTOR_COMMAND_CONFIG:
             /*
              * 配置命令只更新 F4 运行内存，不写 F4 Flash，也不写 Emm42 EEPROM。
@@ -1171,8 +1396,9 @@ static void ConveyorMotorService_HandleQueuedCommand(const ConveyorMotor_Command
  * 状态机规则：
  * 1. `SCAN`：固定低速巡航；
  * 2. `TRACK`：有新误差就更新速度；进入死区立刻停；
- * 3. `STOP`：保持停止；
- * 4. 跟踪超时：强制停机。
+ * 3. `JOG`：手动指定方向和速度持续运行，直到收到停止；
+ * 4. `STOP`：保持停止；
+ * 5. 跟踪超时：强制停机。
  */
 static void ConveyorMotorService_ControlStep(const EMM42_MotorHandle_t *motor,
                                              ConveyorMotor_Runtime_t *runtime)
@@ -1256,6 +1482,22 @@ static void ConveyorMotorService_ControlStep(const EMM42_MotorHandle_t *motor,
                     }
                 }
             }
+            break;
+
+        case CONVEYOR_MOTOR_MODE_JOG:
+            status = ConveyorMotorService_ApplyJog(motor, runtime);
+            if (status != EMM42_MOTOR_STATUS_OK)
+            {
+                ConveyorMotorService_ReportDriverError("jog command", status);
+            }
+            break;
+
+        case CONVEYOR_MOTOR_MODE_POSITION:
+            /*
+             * 位置模式是一条一次性 Emm42 0xFD 命令。
+             * 在没有电机回包解析的首版中，周期任务不重复发送，也不自动追加 stop，
+             * 否则会在电机还未完成固定步数运动时立刻打断。
+             */
             break;
 
         case CONVEYOR_MOTOR_MODE_STOP:
@@ -1462,6 +1704,8 @@ void ConveyorMotorService_Task(void *argument)
     runtime.fresh_track_sample_flag = 0U;
     runtime.track_timeout_reported_flag = 0U;
     runtime.last_track_update_tick = xTaskGetTickCount();
+    runtime.jog_direction = EMM42_MOTOR_DIRECTION_CW;
+    runtime.jog_speed_rpm = 0U;
     ConveyorMotorService_UpdateSnapshot(&runtime);
 
     ConveyorMotorService_ReportReady();

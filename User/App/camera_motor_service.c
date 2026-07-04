@@ -18,8 +18,8 @@
  * 1. 用户/MP157 通过 USART1 发送 ASCII 文本命令，命令先由 `weight_service.c` 统一取出并规范化；
  * 2. 本文件只处理 `CAM...` 前缀命令，不直接读取 USART1 DMA 缓存；
  * 3. 摄像头两个运动电机共用 USART6，PC6(TX) 接两个 Emm42 RX，PC7(RX) 接两个 Emm42 TX，115200 8N1，必须共地；
- * 4. 摄像头前进/后退轴电机地址固定为 `0x02`；
- * 5. 摄像头上下轴电机地址固定为 `0x03`；
+ * 4. 摄像头前进/后退轴电机现场默认地址为 `0x03`；
+ * 5. 摄像头上下轴电机现场默认地址为 `0x02`；
  * 6. 同一条 USART6 总线上禁止使用广播运动命令，否则两个摄像头轴可能同时动作。
  *
  * 用户可发送的 CAM 命令：
@@ -27,10 +27,10 @@
  * | --- | --- | --- | --- |
  * | `CAMINFO` | 无参数 | 不改变电机，只打印串口、地址和最近动作 | `[INFO][CAM] ...` |
  * | `CAMSTOP` | 无参数 | 同时停止前进/后退轴和上下轴 | `[OK][CAM] Stop requested.` |
- * | `CAMFWD FORWARD [rpm]` | 前进/后退轴按工程约定前进方向点动，rpm 可省略 | 地址 0x02 电机转动 | 可看机械结构和 `CAMINFO` |
- * | `CAMFWD BACKWARD [rpm]` | 前进/后退轴按工程约定后退方向点动，rpm 可省略 | 地址 0x02 电机反向转动 | 可看机械结构和 `CAMINFO` |
- * | `CAMZ UP [rpm]` | 上下轴按工程约定上升方向点动，rpm 可省略 | 地址 0x03 电机转动 | 可看机械结构和 `CAMINFO` |
- * | `CAMZ DOWN [rpm]` | 上下轴按工程约定下降方向点动，rpm 可省略 | 地址 0x03 电机反向转动 | 可看机械结构和 `CAMINFO` |
+ * | `CAMFWD FORWARD [rpm]` | 前进/后退轴按工程约定前进方向点动，rpm 可省略 | 地址 0x03 电机转动 | 可看机械结构和 `CAMINFO` |
+ * | `CAMFWD BACKWARD [rpm]` | 前进/后退轴按工程约定后退方向点动，rpm 可省略 | 地址 0x03 电机反向转动 | 可看机械结构和 `CAMINFO` |
+ * | `CAMZ UP [rpm]` | 上下轴按工程约定上升方向点动，rpm 可省略 | 地址 0x02 电机转动 | 可看机械结构和 `CAMINFO` |
+ * | `CAMZ DOWN [rpm]` | 上下轴按工程约定下降方向点动，rpm 可省略 | 地址 0x02 电机反向转动 | 可看机械结构和 `CAMINFO` |
  *
  * 调试注意：
  * - 设置 Emm42 地址时建议一次只给一个摄像头电机上电，设置完成后贴标签；
@@ -42,7 +42,7 @@
 /**
  * @brief 摄像头前进/后退轴 Emm42 地址。
  */
-#define CAMERA_MOTOR_FORWARD_ADDRESS             (2U)
+#define CAMERA_MOTOR_FORWARD_ADDRESS             (3U)
 
 /**
  * @brief 摄像头前进/后退轴默认最小步长，单位 step。
@@ -55,7 +55,7 @@
 /**
  * @brief 摄像头上下轴 Emm42 地址。
  */
-#define CAMERA_MOTOR_Z_ADDRESS                   (3U)
+#define CAMERA_MOTOR_Z_ADDRESS                   (2U)
 
 /**
  * @brief 摄像头上下轴默认最小步长，单位 step。
@@ -112,17 +112,18 @@
 /**
  * @brief 摄像头电机命令队列长度。
  *
- * 这里使用长度为 1 的覆盖队列，保证调试点动始终执行最新意图，不堆积旧点动命令。
+ * 这里使用短 FIFO 队列，保证 STEPPER_PARAM_SET 配置命令不会被下一条手动运动覆盖。
+ * STOP 命令单独走队首优先投递，确保手动连续运动时停止意图尽快执行。
  */
-#define CAMERA_MOTOR_COMMAND_QUEUE_LENGTH        (1U)
+#define CAMERA_MOTOR_COMMAND_QUEUE_LENGTH        (4U)
 
 /**
  * @brief 摄像头运动轴选择。
  */
 typedef enum
 {
-    CAMERA_MOTOR_AXIS_FORWARD = 0, /* 摄像头前进/后退轴，对应 USART6 上地址 0x02 的 Emm42 电机。 */
-    CAMERA_MOTOR_AXIS_Z            /* 摄像头上下轴，对应 USART6 上地址 0x03 的 Emm42 电机。 */
+    CAMERA_MOTOR_AXIS_FORWARD = 0, /* 摄像头前进/后退轴，对应 USART6 上现场默认地址 0x03 的 Emm42 电机。 */
+    CAMERA_MOTOR_AXIS_Z            /* 摄像头上下轴，对应 USART6 上现场默认地址 0x02 的 Emm42 电机。 */
 } CameraMotor_Axis_t;
 
 /**
@@ -132,6 +133,8 @@ typedef enum
 {
     CAMERA_MOTOR_COMMAND_STOP_ALL = 0, /* 队列命令：停止摄像头两个运动轴。 */
     CAMERA_MOTOR_COMMAND_JOG,          /* 队列命令：指定某一个摄像头运动轴按给定方向和速度点动。 */
+    CAMERA_MOTOR_COMMAND_POSITION,     /* 队列命令：指定某一个摄像头运动轴按相对位置模式移动固定步数。 */
+    CAMERA_MOTOR_COMMAND_SET_ZERO,     /* 队列命令：指定某一个摄像头运动轴停止后把当前位置设为零点。 */
     CAMERA_MOTOR_COMMAND_CONFIG        /* 队列命令：更新两个摄像头运动轴的运行时参数。 */
 } CameraMotor_CommandType_t;
 
@@ -164,6 +167,8 @@ typedef struct
     CameraMotor_Axis_t axis;              /* 目标轴，点动命令使用；停止全部命令会忽略该字段。 */
     EMM42_MotorDirection_t direction;     /* 逻辑方向，CW 表示前进/上升，CCW 表示后退/下降，任务内会再套用运行时方向映射。 */
     uint16_t speed_rpm;                   /* 请求转速，单位 RPM；0 表示使用当前轴的运行时默认速度。 */
+    uint32_t pulse_count;                 /* 位置模式相对移动步数，单位 step；只有 POSITION 命令使用。 */
+    uint32_t stop_epoch;                  /* STOP 代际编号，用于丢弃 STOP 之前还没执行的旧运动命令。 */
     CameraMotor_RuntimeConfigSet_t config; /* CONFIG 命令携带的新运行时参数，其它命令忽略该字段。 */
 } CameraMotor_Command_t;
 
@@ -183,8 +188,8 @@ typedef struct
     CameraMotor_Axis_t last_axis;          /* 最近一次动作的轴，用于 `CAMINFO` 判断刚才控制的是前后轴还是上下轴。 */
     EMM42_MotorDirection_t last_direction; /* 最近一次动作方向，用于现场核对方向映射是否正确。 */
     uint16_t last_speed_rpm;               /* 最近一次下发的速度，单位 RPM，0 表示最近动作是停止。 */
-    uint8_t forward_initialized;           /* 前进/后退轴初始化标志，1 表示地址 0x02 句柄已经通过初始化和启动配置。 */
-    uint8_t z_initialized;                 /* 上下轴初始化标志，1 表示地址 0x03 句柄已经通过初始化和启动配置。 */
+    uint8_t forward_initialized;           /* 前进/后退轴初始化标志，1 表示现场地址 0x03 句柄已经通过初始化和启动配置。 */
+    uint8_t z_initialized;                 /* 上下轴初始化标志，1 表示现场地址 0x02 句柄已经通过初始化和启动配置。 */
     uint8_t forward_address;               /* 当前前进/后退轴运行时地址。 */
     uint8_t z_address;                     /* 当前上下轴运行时地址。 */
     uint16_t forward_min_step;             /* 当前前进/后退轴最小步长，单位 step。 */
@@ -201,6 +206,15 @@ typedef struct
  * 由 USART1 命令分发入口写入，由摄像头电机任务独占读取。
  */
 static QueueHandle_t g_camera_motor_command_queue = NULL;
+
+/**
+ * @brief 摄像头电机 STOP 代际编号。
+ *
+ * 协议层收到 STOP 后会递增该编号；普通 JOG/POSITION/HOME 命令入队时记录当前编号。
+ * 如果 STOP 插到队首后队列里还残留旧 JOG，摄像头任务会发现旧命令的 stop_epoch 落后，
+ * 直接丢弃它，避免现场出现“按了停止但旧前后轴点动又继续执行”的现象。
+ */
+static volatile uint32_t g_camera_motor_stop_epoch = 1U;
 
 /**
  * @brief 摄像头电机运行快照。
@@ -243,6 +257,70 @@ static CameraMotor_RuntimeConfigSet_t CameraMotorService_GetDefaultConfigSet(voi
     config_set.z.direction = 1;
 
     return config_set;
+}
+
+/**
+ * @brief 读取当前 STOP 代际编号。
+ * @return uint32_t 当前 STOP 代际编号。
+ *
+ * 该值会被 USART1 协议任务和摄像头电机任务同时访问，因此读取时进入 FreeRTOS 临界区。
+ */
+static uint32_t CameraMotorService_ReadStopEpoch(void)
+{
+    uint32_t epoch;
+
+    taskENTER_CRITICAL();
+    epoch = g_camera_motor_stop_epoch;
+    taskEXIT_CRITICAL();
+
+    return epoch;
+}
+
+/**
+ * @brief 递增并返回新的 STOP 代际编号。
+ * @return uint32_t 新的 STOP 代际编号。
+ *
+ * STOP 是安全动作，每次 STOP 都开启一个新的代际；编号回绕到 0 时拉回 1，
+ * 避免刚上电时默认清零的旧命令和新命令混淆。
+ */
+static uint32_t CameraMotorService_AdvanceStopEpoch(void)
+{
+    uint32_t epoch;
+
+    taskENTER_CRITICAL();
+    g_camera_motor_stop_epoch++;
+    if (g_camera_motor_stop_epoch == 0U)
+    {
+        g_camera_motor_stop_epoch = 1U;
+    }
+    epoch = g_camera_motor_stop_epoch;
+    taskEXIT_CRITICAL();
+
+    return epoch;
+}
+
+/**
+ * @brief 判断一条摄像头运动命令是否已经被后续 STOP 作废。
+ * @param command 摄像头电机队列命令，不能为空。
+ * @return uint8_t 1 表示应丢弃，0 表示可以继续执行。
+ *
+ * CONFIG 不属于运动命令，不能因为 STOP 被丢弃，否则会重新引入“参数 ACK 后未应用”的问题。
+ * STOP_ALL 自身也不做旧命令判断，因为它正是用于提升 stop_epoch 的安全命令。
+ */
+static uint8_t CameraMotorService_IsStaleMotionCommand(const CameraMotor_Command_t *command)
+{
+    if (command == NULL)
+    {
+        return 0U;
+    }
+
+    if ((command->type == CAMERA_MOTOR_COMMAND_STOP_ALL) ||
+        (command->type == CAMERA_MOTOR_COMMAND_CONFIG))
+    {
+        return 0U;
+    }
+
+    return (command->stop_epoch != CameraMotorService_ReadStopEpoch()) ? 1U : 0U;
 }
 
 /**
@@ -325,19 +403,43 @@ static uint16_t CameraMotorService_LimitJogSpeed(uint16_t speed_rpm)
 }
 
 /**
- * @brief 向摄像头电机任务投递一条覆盖旧命令的新命令。
+ * @brief 向摄像头电机任务投递一条命令。
  * @param command 待投递命令，不能为空。
- * @return uint8_t 1 表示投递成功，0 表示任务队列尚未创建。
+ * @return uint8_t 1 表示投递成功，0 表示任务队列尚未创建或队列已满。
+ *
+ * 普通 CONFIG/JOG/POSITION/HOME 命令按 FIFO 顺序进入队列，避免刚下发的运行时地址配置
+ * 被后续手动动作覆盖。STOP_ALL 是安全动作，优先插到队首；若队列已满，先清掉未执行的
+ * 普通命令再投递 STOP，保证连续运动可以被停止。
  */
 static uint8_t CameraMotorService_PostCommand(const CameraMotor_Command_t *command)
 {
+    CameraMotor_Command_t queued_command;
+    BaseType_t send_status;
+
     if ((command == NULL) || (g_camera_motor_command_queue == NULL))
     {
         return 0U;
     }
 
-    (void)xQueueOverwrite(g_camera_motor_command_queue, command);
-    return 1U;
+    queued_command = *command;
+
+    if (queued_command.type == CAMERA_MOTOR_COMMAND_STOP_ALL)
+    {
+        queued_command.stop_epoch = CameraMotorService_AdvanceStopEpoch();
+        send_status = xQueueSendToFront(g_camera_motor_command_queue, &queued_command, 0U);
+        if (send_status != pdPASS)
+        {
+            (void)xQueueReset(g_camera_motor_command_queue);
+            send_status = xQueueSendToFront(g_camera_motor_command_queue, &queued_command, 0U);
+        }
+    }
+    else
+    {
+        queued_command.stop_epoch = CameraMotorService_ReadStopEpoch();
+        send_status = xQueueSendToBack(g_camera_motor_command_queue, &queued_command, 0U);
+    }
+
+    return (send_status == pdPASS) ? 1U : 0U;
 }
 
 /**
@@ -373,6 +475,92 @@ uint8_t CameraMotorService_RequestZJog(uint8_t up_flag, uint16_t speed_rpm)
     command.axis = CAMERA_MOTOR_AXIS_Z;
     command.direction = (up_flag != 0U) ? EMM42_MOTOR_DIRECTION_CW : EMM42_MOTOR_DIRECTION_CCW;
     command.speed_rpm = CameraMotorService_LimitJogSpeed(speed_rpm);
+    return CameraMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 请求摄像头前进/后退轴按相对位置模式移动固定步数。
+ * @param forward_flag 1 表示前进方向，0 表示后退方向。
+ * @param speed_rpm 位置运动速度，单位 RPM，传 0 使用默认值。
+ * @param pulse_count 相对移动步数，单位 step。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或服务尚未就绪。
+ */
+uint8_t CameraMotorService_RequestForwardPosition(uint8_t forward_flag,
+                                                  uint16_t speed_rpm,
+                                                  uint32_t pulse_count)
+{
+    CameraMotor_Command_t command;
+
+    if (pulse_count == 0U)
+    {
+        return 0U;
+    }
+
+    (void)memset(&command, 0, sizeof(command));
+    command.type = CAMERA_MOTOR_COMMAND_POSITION;
+    command.axis = CAMERA_MOTOR_AXIS_FORWARD;
+    command.direction = (forward_flag != 0U) ? EMM42_MOTOR_DIRECTION_CW : EMM42_MOTOR_DIRECTION_CCW;
+    command.speed_rpm = CameraMotorService_LimitJogSpeed(speed_rpm);
+    command.pulse_count = pulse_count;
+    return CameraMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 请求摄像头上下轴按相对位置模式移动固定步数。
+ * @param up_flag 1 表示向上方向，0 表示向下方向。
+ * @param speed_rpm 位置运动速度，单位 RPM，传 0 使用默认值。
+ * @param pulse_count 相对移动步数，单位 step。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或服务尚未就绪。
+ */
+uint8_t CameraMotorService_RequestZPosition(uint8_t up_flag,
+                                            uint16_t speed_rpm,
+                                            uint32_t pulse_count)
+{
+    CameraMotor_Command_t command;
+
+    if (pulse_count == 0U)
+    {
+        return 0U;
+    }
+
+    (void)memset(&command, 0, sizeof(command));
+    command.type = CAMERA_MOTOR_COMMAND_POSITION;
+    command.axis = CAMERA_MOTOR_AXIS_Z;
+    command.direction = (up_flag != 0U) ? EMM42_MOTOR_DIRECTION_CW : EMM42_MOTOR_DIRECTION_CCW;
+    command.speed_rpm = CameraMotorService_LimitJogSpeed(speed_rpm);
+    command.pulse_count = pulse_count;
+    return CameraMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 请求摄像头前进/后退轴把当前位置设为新的零点。
+ * @return uint8_t 1 表示请求已投递，0 表示摄像头电机任务尚未就绪。
+ */
+uint8_t CameraMotorService_RequestForwardSetCurrentPositionZero(void)
+{
+    CameraMotor_Command_t command;
+
+    (void)memset(&command, 0, sizeof(command));
+    command.type = CAMERA_MOTOR_COMMAND_SET_ZERO;
+    command.axis = CAMERA_MOTOR_AXIS_FORWARD;
+    command.direction = EMM42_MOTOR_DIRECTION_CW;
+    command.speed_rpm = 0U;
+    return CameraMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 请求摄像头上下轴把当前位置设为新的零点。
+ * @return uint8_t 1 表示请求已投递，0 表示摄像头电机任务尚未就绪。
+ */
+uint8_t CameraMotorService_RequestZSetCurrentPositionZero(void)
+{
+    CameraMotor_Command_t command;
+
+    (void)memset(&command, 0, sizeof(command));
+    command.type = CAMERA_MOTOR_COMMAND_SET_ZERO;
+    command.axis = CAMERA_MOTOR_AXIS_Z;
+    command.direction = EMM42_MOTOR_DIRECTION_CW;
+    command.speed_rpm = 0U;
     return CameraMotorService_PostCommand(&command);
 }
 
@@ -828,6 +1016,15 @@ static void CameraMotorService_ApplyCommand(const CameraMotor_Command_t *command
         return;
     }
 
+    if (CameraMotorService_IsStaleMotionCommand(command) != 0U)
+    {
+        my_printf(&huart1,
+                  "[INFO][CAM] Drop stale motion after STOP. type=%u, axis=%s\r\n",
+                  (unsigned int)command->type,
+                  CameraMotorService_GetAxisName(command->axis));
+        return;
+    }
+
     if (command->type == CAMERA_MOTOR_COMMAND_STOP_ALL)
     {
         status = EMM42_MotorStopNow(forward_motor, false);
@@ -857,6 +1054,11 @@ static void CameraMotorService_ApplyCommand(const CameraMotor_Command_t *command
         CameraMotorService_UpdateActionSnapshot(CAMERA_MOTOR_AXIS_FORWARD,
                                                 EMM42_MOTOR_DIRECTION_CW,
                                                 0U);
+        my_printf(&huart1,
+                  "[OK][CAM] Stop applied. forward_addr=%u, z_addr=%u, epoch=%lu\r\n",
+                  (unsigned int)forward_motor->address,
+                  (unsigned int)z_motor->address,
+                  (unsigned long)command->stop_epoch);
         return;
     }
 
@@ -899,6 +1101,12 @@ static void CameraMotorService_ApplyCommand(const CameraMotor_Command_t *command
         CameraMotorService_UpdateActionSnapshot(CAMERA_MOTOR_AXIS_FORWARD,
                                                 EMM42_MOTOR_DIRECTION_CW,
                                                 0U);
+        my_printf(&huart1,
+                  "[OK][CAM] Runtime config applied. forward_addr=%u, z_addr=%u, forward_speed=%u, z_speed=%u\r\n",
+                  (unsigned int)runtime->config.forward.address,
+                  (unsigned int)runtime->config.z.address,
+                  (unsigned int)runtime->config.forward.normal_speed_rpm,
+                  (unsigned int)runtime->config.z.normal_speed_rpm);
         return;
     }
 
@@ -906,9 +1114,97 @@ static void CameraMotorService_ApplyCommand(const CameraMotor_Command_t *command
     target_config = (command->axis == CAMERA_MOTOR_AXIS_Z) ?
                     &runtime->config.z :
                     &runtime->config.forward;
+
+    if (command->type == CAMERA_MOTOR_COMMAND_SET_ZERO)
+    {
+        status = EMM42_MotorStopNow(target_motor, false);
+        if (status != EMM42_MOTOR_STATUS_OK)
+        {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
+            BinaryProtocolService_ReportFault((uint16_t)status,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR,
+                                              BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                              (int32_t)status,
+                                              0U);
+            my_printf(&huart1,
+                      "[ERROR][CAM] home pre-stop failed. axis=%s, status=%d\r\n",
+                      CameraMotorService_GetAxisName(command->axis),
+                      (int)status);
+            return;
+        }
+
+        status = EMM42_MotorResetCurrentPositionToZero(target_motor);
+        if (status != EMM42_MOTOR_STATUS_OK)
+        {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
+            BinaryProtocolService_ReportFault((uint16_t)status,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR,
+                                              BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                              (int32_t)status,
+                                              0U);
+            my_printf(&huart1,
+                      "[ERROR][CAM] home set-zero failed. axis=%s, status=%d\r\n",
+                      CameraMotorService_GetAxisName(command->axis),
+                      (int)status);
+            return;
+        }
+
+        CameraMotorService_UpdateActionSnapshot(command->axis,
+                                                EMM42_MOTOR_DIRECTION_CW,
+                                                0U);
+        my_printf(&huart1,
+                  "[OK][CAM] Current position set to zero. axis=%s\r\n",
+                  CameraMotorService_GetAxisName(command->axis));
+        return;
+    }
+
     mapped_direction = CameraMotorService_MapRuntimeDirection(command->direction,
                                                              target_config->direction);
     speed_rpm = CameraMotorService_ResolveJogSpeed(command->speed_rpm, target_config);
+
+    if (command->type == CAMERA_MOTOR_COMMAND_POSITION)
+    {
+        if (speed_rpm == 0U)
+        {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
+            BinaryProtocolService_ReportFault(EMM42_MOTOR_STATUS_RANGE_ERROR,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR,
+                                              BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                              0,
+                                              0U);
+            my_printf(&huart1,
+                      "[ERROR][CAM] position speed is zero. axis=%s\r\n",
+                      CameraMotorService_GetAxisName(command->axis));
+            return;
+        }
+
+        status = EMM42_MotorMoveRelativePosition(target_motor,
+                                                 mapped_direction,
+                                                 speed_rpm,
+                                                 CAMERA_MOTOR_ACCEL,
+                                                 command->pulse_count,
+                                                 false);
+        if (status != EMM42_MOTOR_STATUS_OK)
+        {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
+            BinaryProtocolService_ReportFault((uint16_t)status,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR,
+                                              BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                              (int32_t)status,
+                                              0U);
+            my_printf(&huart1,
+                      "[ERROR][CAM] position failed. axis=%s, pulse=%lu, status=%d\r\n",
+                      CameraMotorService_GetAxisName(command->axis),
+                      (unsigned long)command->pulse_count,
+                      (int)status);
+            return;
+        }
+
+        CameraMotorService_UpdateActionSnapshot(command->axis,
+                                                mapped_direction,
+                                                speed_rpm);
+        return;
+    }
 
     if (speed_rpm == 0U)
     {
