@@ -268,13 +268,13 @@ static void test_decode_stepper_param_payload(void)
     payload[10] = 1U;
 
     payload[11] = 2U;
-    payload[12] = 2U;
+    payload[12] = 3U;
     write_u16_le(&payload[13], 5U);
     write_u16_le(&payload[15], 137U);
     payload[17] = 1U;
 
     payload[18] = 3U;
-    payload[19] = 3U;
+    payload[19] = 2U;
     write_u16_le(&payload[20], 5U);
     write_u16_le(&payload[22], 5000U);
     payload[24] = 0xFFU;
@@ -285,8 +285,9 @@ static void test_decode_stepper_param_payload(void)
     expect_u16("decode_stepper_param_cycle", stepper_param.cycle_id, 0x0000U);
     expect_int("decode_stepper_param_count", (int)stepper_param.motor_count, 3);
     expect_int("decode_stepper_param_role0", (int)stepper_param.motors[0].role_id, 1);
-    expect_int("decode_stepper_param_addr1", (int)stepper_param.motors[1].address, 2);
+    expect_int("decode_stepper_param_lateral_addr", (int)stepper_param.motors[1].address, 3);
     expect_u16("decode_stepper_param_speed1", stepper_param.motors[1].normal_speed_rpm, 137U);
+    expect_int("decode_stepper_param_z_addr", (int)stepper_param.motors[2].address, 2);
     expect_u16("decode_stepper_param_speed2", stepper_param.motors[2].normal_speed_rpm, 5000U);
     expect_int("decode_stepper_param_direction2", (int)stepper_param.motors[2].direction, -1);
 }

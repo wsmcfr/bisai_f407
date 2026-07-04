@@ -437,7 +437,7 @@ typedef struct
  */
 typedef struct
 {
-    uint8_t role_id;                              /* 电机角色：1=传送带，2=摄像头前后，3=摄像头上下。 */
+    uint8_t role_id;                              /* 电机角色：1=传送带，2=摄像头左右，3=摄像头上下。 */
     uint8_t address;                              /* Emm42 地址，允许 1~247。 */
     uint16_t min_step;                            /* 最小步长，单位 step，允许 1~10000。 */
     uint16_t normal_speed_rpm;                    /* 常规速度，单位 RPM，允许 0~5000。 */
@@ -461,8 +461,8 @@ typedef struct
 typedef struct
 {
     uint16_t cycle_id;                            /* 自动流程号；手动调试允许为 0。 */
-    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头前后，2=摄像头上下。 */
-    uint8_t direction;                            /* 逻辑方向：0=后退/下降，1=前进/上升。 */
+    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头左右，2=摄像头上下。 */
+    uint8_t direction;                            /* 逻辑方向：传送带 0=后退/1=前进，左右轴 0=左移/1=右移，上下轴 0=下降/1=上升。 */
     uint8_t mode;                                 /* 位置模式，首版 0=相对位置模式。 */
     uint16_t speed_rpm;                           /* 运动速度，单位 RPM，0 表示使用对应轴默认速度。 */
     uint32_t steps;                               /* 相对移动步数，单位 step，范围 1~4294967295。 */
@@ -475,7 +475,7 @@ typedef struct
 typedef struct
 {
     uint16_t cycle_id;                            /* 自动流程号；手动调试允许为 0。 */
-    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头前后，2=摄像头上下，0xFF=全部。 */
+    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头左右，2=摄像头上下，0xFF=全部。 */
     uint8_t flags;                                /* 保留标志位，首版固定为 0。 */
 } BinaryProtocol_ActuatorStopPayload_t;
 
@@ -485,8 +485,8 @@ typedef struct
 typedef struct
 {
     uint16_t cycle_id;                            /* 自动流程号；手动调试允许为 0，当前 Qt 手动页固定使用 0。 */
-    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头前后；上下轴手动不允许连续速度模式。 */
-    uint8_t direction;                            /* 逻辑方向：0=后退，1=前进。 */
+    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头左右；上下轴手动不允许连续速度模式。 */
+    uint8_t direction;                            /* 逻辑方向：传送带 0=后退/1=前进，左右轴 0=左移/1=右移。 */
     uint16_t speed_rpm;                           /* 速度模式转速，单位 RPM，范围 1~5000。 */
     uint8_t flags;                                /* 保留标志位，首版固定为 0。 */
 } BinaryProtocol_ActuatorVelMovePayload_t;
@@ -497,7 +497,7 @@ typedef struct
 typedef struct
 {
     uint16_t cycle_id;                            /* 自动流程号；参数页标定通常为 0。 */
-    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头前后，2=摄像头上下。 */
+    uint8_t actuator;                             /* 执行器编号：0=传送带，1=摄像头左右，2=摄像头上下。 */
     uint8_t flags;                                /* 保留标志位，首版固定为 0。 */
 } BinaryProtocol_ActuatorHomePayload_t;
 

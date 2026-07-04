@@ -83,8 +83,8 @@ typedef struct
  * 张大头例程默认按地址 1 演示，因此驱动默认值仍保留为 1。
  * 当前工程的实际地址分配由应用层覆盖：
  * - 传送带电机：地址 1，UART4，PC10/PC11；
- * - 摄像头前进/后退电机：地址 2，USART6，PC6/PC7；
- * - 摄像头上下电机：地址 3，USART6，PC6/PC7。
+ * - 摄像头左右电机：地址 3，USART6，PC6/PC7；
+ * - 摄像头上下电机：地址 2，USART6，PC6/PC7。
  */
 #define EMM42_MOTOR_DEFAULT_ADDRESS            (1U)
 

@@ -20,7 +20,7 @@
  * | 称重调试入口 | `GET` / `TARE` / `CAL 1000` | `weight_service.c` | 仅作为串口助手维护入口；MP157 主链路不再等待文本回包 | USART1 文本默认静默，正式联调需补二进制命令 |
  * | LDC 标定入口 | `LDCCAL CH1 20` / `LDCSTOP` | `ldc1614_service.c` | 仅作为串口助手维护入口；自动流程故障走 `FAULT_REPORT` | USART1 文本默认静默 |
  * | 传送带调试入口 | 二进制 `BELT_MANUAL_CONTROL` / `QUERY_STATUS` | `binary_protocol_service.c` | 切换巡航、停止或查询结构化状态 | 正确返回 `ACK/STATUS_REPORT`，错误返回 `NACK/FAULT_REPORT` |
- * | 摄像头电机维护入口 | `CAMINFO` / `CAMSTOP` / `CAMFWD FORWARD 30` / `CAMZ UP 30` | `camera_motor_service.c` | 调试摄像头前后轴和上下轴，两个电机共用 USART6 但地址不同 | USART1 文本默认静默，自动流程后续需补二进制命令 |
+ * | 摄像头电机维护入口 | `CAMINFO` / `CAMSTOP` / `CAMLAT LEFT 30` / `CAMLAT RIGHT 30` / `CAMZ UP 30` | `camera_motor_service.c` | 调试摄像头左右轴和上下轴，两个电机共用 USART6 但地址不同 | USART1 文本默认静默，自动流程走二进制执行器命令 |
  * | 机械臂 HEX 帧 | `55 55 02 01` / `55 55 05 06 03 01 00` | `robot_arm_service.c` | 透传到 USART3/ESP32，查询或执行 LeArm 动作 | 查询类有 `[ARM] RX...` 日志，运动类通常看机械臂动作 |
  *
  * 串口链路：

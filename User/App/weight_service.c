@@ -744,7 +744,7 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
          * 日志会被截断并和其它事件日志混在一起，反而更难看清。
          */
         my_printf(&huart1,
-                  "[ERROR][UART] Unknown cmd. Use STATUS/GET/TARE/CAL/LDCCAL/LDCSTOP/BELTSCAN/BELTSTOP/BELTTRACK/BELTINFO/CAMINFO/CAMSTOP/CAMFWD/CAMZ.\r\n");
+                  "[ERROR][UART] Unknown cmd. Use STATUS/GET/TARE/CAL/LDCCAL/LDCSTOP/BELTSCAN/BELTSTOP/BELTTRACK/BELTINFO/CAMINFO/CAMSTOP/CAMLAT/CAMZ.\r\n");
     }
 }
 

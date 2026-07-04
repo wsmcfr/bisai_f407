@@ -16,9 +16,16 @@
 #define BINARY_PROTOCOL_STEPPER_ROLE_CONVEYOR       (1U)
 
 /**
- * @brief `STEPPER_PARAM_SET` 中的电机角色编号：摄像头前进/后退电机。
+ * @brief `STEPPER_PARAM_SET` 中的电机角色编号：摄像头左右电机。
  */
-#define BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_FORWARD (2U)
+#define BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_LATERAL (2U)
+
+/**
+ * @brief 旧版摄像头前进/后退角色编号兼容别名。
+ *
+ * 协议数字仍然是 2；新业务语义已经改为摄像头左右轴。
+ */
+#define BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_FORWARD BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_LATERAL
 
 /**
  * @brief `STEPPER_PARAM_SET` 中的电机角色编号：摄像头上下电机。
@@ -31,9 +38,16 @@
 #define BINARY_PROTOCOL_ACTUATOR_CONVEYOR           (0U)
 
 /**
- * @brief `ACTUATOR_POS_MOVE/ACTUATOR_STOP` 中的执行器编号：摄像头前进/后退轴。
+ * @brief `ACTUATOR_POS_MOVE/ACTUATOR_STOP` 中的执行器编号：摄像头左右轴。
  */
-#define BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD     (1U)
+#define BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL     (1U)
+
+/**
+ * @brief 旧版摄像头前进/后退执行器编号兼容别名。
+ *
+ * 协议数字仍然是 1；新业务语义已经改为摄像头左右轴。
+ */
+#define BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD     BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL
 
 /**
  * @brief `ACTUATOR_POS_MOVE/ACTUATOR_STOP` 中的执行器编号：摄像头上下轴。
@@ -1687,14 +1701,14 @@ static void BinaryProtocolService_HandleBeltManual(const BinaryProtocol_Frame_t 
  *
  * 该命令把 MP157 参数页中的三台 Emm42 参数同步到 F4 运行内存：
  * 1. role_id=1 投递给传送带任务；
- * 2. role_id=2/3 一次性投递给摄像头电机任务；
+ * 2. role_id=2/3 一次性投递给摄像头电机任务，其中 role_id=2 是左右轴；
  * 3. 成功只表示 F4 任务已接收运行时参数，不表示写入 F4 Flash 或 Emm42 EEPROM。
  */
 static void BinaryProtocolService_HandleStepperParam(const BinaryProtocol_Frame_t *frame)
 {
     BinaryProtocol_StepperParamPayload_t payload;
     BinaryProtocol_StepperMotorConfig_t conveyor_motor;
-    BinaryProtocol_StepperMotorConfig_t camera_forward_motor;
+    BinaryProtocol_StepperMotorConfig_t camera_lateral_motor;
     BinaryProtocol_StepperMotorConfig_t camera_z_motor;
     uint16_t detail = 0U;
 
@@ -1722,8 +1736,8 @@ static void BinaryProtocolService_HandleStepperParam(const BinaryProtocol_Frame_
                                                 BINARY_PROTOCOL_STEPPER_ROLE_CONVEYOR,
                                                 &conveyor_motor) == 0U) ||
         (BinaryProtocolService_FindStepperMotor(&payload,
-                                                BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_FORWARD,
-                                                &camera_forward_motor) == 0U) ||
+                                                BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_LATERAL,
+                                                &camera_lateral_motor) == 0U) ||
         (BinaryProtocolService_FindStepperMotor(&payload,
                                                 BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_Z,
                                                 &camera_z_motor) == 0U))
@@ -1749,10 +1763,10 @@ static void BinaryProtocolService_HandleStepperParam(const BinaryProtocol_Frame_
         return;
     }
 
-    if (CameraMotorService_RequestRuntimeConfig(camera_forward_motor.address,
-                                                camera_forward_motor.min_step,
-                                                camera_forward_motor.normal_speed_rpm,
-                                                camera_forward_motor.direction,
+    if (CameraMotorService_RequestRuntimeConfig(camera_lateral_motor.address,
+                                                camera_lateral_motor.min_step,
+                                                camera_lateral_motor.normal_speed_rpm,
+                                                camera_lateral_motor.direction,
                                                 camera_z_motor.address,
                                                 camera_z_motor.min_step,
                                                 camera_z_motor.normal_speed_rpm,
@@ -1762,7 +1776,7 @@ static void BinaryProtocolService_HandleStepperParam(const BinaryProtocol_Frame_
                                        frame->sequence,
                                        frame->command,
                                        BINARY_PROTOCOL_ERROR_HARDWARE_FAULT,
-                                       BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_FORWARD);
+                                       BINARY_PROTOCOL_STEPPER_ROLE_CAMERA_LATERAL);
         return;
     }
 
@@ -1775,7 +1789,7 @@ static void BinaryProtocolService_HandleStepperParam(const BinaryProtocol_Frame_
  *
  * 分发规则：
  * 1. actuator=0：传送带电机走 UART4 位置模式；
- * 2. actuator=1：摄像头前进/后退轴走 USART6 位置模式；
+ * 2. actuator=1：摄像头左右轴走 USART6 位置模式；
  * 3. actuator=2：摄像头上下轴走 USART6 位置模式；
  * 4. cycle_id=0 允许手动调试，非 0 时必须匹配当前自动流程。
  */
@@ -1824,9 +1838,9 @@ static void BinaryProtocolService_HandleActuatorPosMove(const BinaryProtocol_Fra
                                                         payload.speed_rpm,
                                                         payload.steps);
     }
-    else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD)
+    else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL)
     {
-        accepted = CameraMotorService_RequestForwardPosition((payload.direction != 0U) ? 1U : 0U,
+        accepted = CameraMotorService_RequestLateralPosition((payload.direction != 0U) ? 1U : 0U,
                                                              payload.speed_rpm,
                                                              payload.steps);
     }
@@ -1864,6 +1878,7 @@ static void BinaryProtocolService_HandleActuatorPosMove(const BinaryProtocol_Fra
  * @param frame 已解析帧。
  *
  * actuator=0 停传送带，actuator=1/2 停摄像头两轴，actuator=0xFF 同时停止传送带和摄像头两轴。
+ * 当前摄像头 actuator=1 是左右轴，actuator=2 是上下轴；任意摄像头轴停止都投递摄像头服务 STOP_ALL。
  */
 static void BinaryProtocolService_HandleActuatorStop(const BinaryProtocol_Frame_t *frame)
 {
@@ -1907,7 +1922,7 @@ static void BinaryProtocolService_HandleActuatorStop(const BinaryProtocol_Frame_
         conveyor_accepted = ConveyorMotorService_RequestStop();
     }
 
-    if ((payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD) ||
+    if ((payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL) ||
         (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_Z) ||
         (payload.actuator == BINARY_PROTOCOL_ACTUATOR_ALL))
     {
@@ -1915,7 +1930,7 @@ static void BinaryProtocolService_HandleActuatorStop(const BinaryProtocol_Frame_
     }
 
     if ((payload.actuator != BINARY_PROTOCOL_ACTUATOR_CONVEYOR) &&
-        (payload.actuator != BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD) &&
+        (payload.actuator != BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL) &&
         (payload.actuator != BINARY_PROTOCOL_ACTUATOR_CAMERA_Z) &&
         (payload.actuator != BINARY_PROTOCOL_ACTUATOR_ALL))
     {
@@ -1946,7 +1961,7 @@ static void BinaryProtocolService_HandleActuatorStop(const BinaryProtocol_Frame_
  *
  * 分发规则：
  * 1. actuator=0：传送带进入指定方向速度模式，直到收到 STOP；
- * 2. actuator=1：摄像头前进/后退轴进入指定方向速度模式，直到收到 STOP；
+ * 2. actuator=1：摄像头左右轴进入指定方向速度模式，直到收到 STOP；
  * 3. actuator=2：上下轴不允许连续速度模式，避免误操作造成无限升降，只能用 ACTUATOR_POS_MOVE 固定步数。
  */
 static void BinaryProtocolService_HandleActuatorVelMove(const BinaryProtocol_Frame_t *frame)
@@ -1992,9 +2007,9 @@ static void BinaryProtocolService_HandleActuatorVelMove(const BinaryProtocol_Fra
         accepted = ConveyorMotorService_RequestJog((payload.direction != 0U) ? 1U : 0U,
                                                   payload.speed_rpm);
     }
-    else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD)
+    else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL)
     {
-        accepted = CameraMotorService_RequestForwardJog((payload.direction != 0U) ? 1U : 0U,
+        accepted = CameraMotorService_RequestLateralJog((payload.direction != 0U) ? 1U : 0U,
                                                         payload.speed_rpm);
     }
     else
@@ -2026,7 +2041,7 @@ static void BinaryProtocolService_HandleActuatorVelMove(const BinaryProtocol_Fra
  *
  * 当前 HOME 的实际语义是“设当前位置为零点”：
  * 1. actuator=0：传送带电机停止后清零当前位置；
- * 2. actuator=1：摄像头前进/后退轴停止后清零当前位置；
+ * 2. actuator=1：摄像头左右轴停止后清零当前位置；
  * 3. actuator=2：摄像头上下轴停止后清零当前位置；
  * 4. 不支持 actuator=0xFF，避免一次误触把全部轴的标定基准同时改掉。
  */
@@ -2069,9 +2084,9 @@ static void BinaryProtocolService_HandleActuatorHome(const BinaryProtocol_Frame_
     {
         accepted = ConveyorMotorService_RequestSetCurrentPositionZero();
     }
-    else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_FORWARD)
+    else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL)
     {
-        accepted = CameraMotorService_RequestForwardSetCurrentPositionZero();
+        accepted = CameraMotorService_RequestLateralSetCurrentPositionZero();
     }
     else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_Z)
     {
