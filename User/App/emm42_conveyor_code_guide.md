@@ -28,13 +28,13 @@
 | `Core/Src/freertos.c` | FreeRTOS 任务启动胶水 | 创建传送带任务 `ConveyorMotorService_Task()` 和摄像头电机任务 `CameraMotorService_Task()`。 |
 | `User/App/uart_command.c` | `USART1` 命令接收与线程安全打印 | 只负责收完整命令和安全打印，不直接控制电机。 |
 | `User/App/weight_service.c` | `USART1` 统一命令分发入口 | 分发 `BELT...` 到传送带服务，分发 `CAM...` 到摄像头电机服务。 |
-| `User/App/conveyor_motor_service.c` | 传送带状态机 | 绑定 `huart4`，默认地址 `0x01`；通过运行时配置支持地址、最小步长、对中/短步速度、上料扫描速度和方向映射；支持 `ACTUATOR_VEL_MOVE/ACTUATOR_POS_MOVE/ACTUATOR_HOME`；位置运动成功发送后轮询 `[addr FD 9F 6B]` 并上报 `EVENT_REPORT`。 |
+| `User/App/conveyor_motor_service.c` | 传送带状态机 | 绑定 `huart4`，默认地址 `0x01`；通过运行时配置支持地址、最小步长、对中/短步速度、上料扫描速度和方向映射；支持 `ACTUATOR_VEL_MOVE/ACTUATOR_POS_MOVE/ACTUATOR_HOME`；位置运动成功发送后优先轮询 `[addr FD 9F 6B]`，未收到主动回包时按估算运动时间上报 `EVENT_REPORT event=0x14 status=5 estimated-done`。 |
 | `User/App/conveyor_motor_service.h` | 传送带服务公共接口 | 暴露任务入口、`RequestScan/RequestStop/RequestTrack`、`RequestRuntimeConfig`、`RequestJog`、`RequestPosition`、`RequestPositionWithReport` 和 `RequestSetCurrentPositionZero`。 |
 | `User/App/camera_motor_service.c` | 摄像头运动电机服务 | 绑定 `huart6`，现场默认左右轴地址 `0x03`、上下轴地址 `0x02`；通过运行时配置支持两轴地址、最小步长、常规速度和方向映射；支持左右轴持续速度运动、两轴固定步数位置运动和当前位置设零。 |
 | `User/App/camera_motor_service.h` | 摄像头电机公共接口 | 暴露任务入口、`CAM...` 命令处理入口、`RequestRuntimeConfig`、左右轴/上下轴运动和设零接口。 |
-| `User/App/binary_protocol_service.c/.h` | MP157-F4 二进制协议 | 新增 `STEPPER_PARAM_SET 0x42`，把 MP157 参数页的三台电机配置投递到对应电机任务；新增 `ACTUATOR_POS_MOVE/STOP/VEL_MOVE/HOME 0x50~0x53` 控制三台执行器。 |
+| `User/App/binary_protocol_service.c/.h` | MP157-F4 二进制协议 | 新增 `STEPPER_PARAM_SET 0x42`，把 MP157 参数页的三台电机配置投递到对应电机任务；新增 `ACTUATOR_POS_MOVE/STOP/VEL_MOVE/HOME 0x50~0x53` 控制三台执行器；新增 `BINARY_PROTOCOL_ACTUATOR_MOVE_STATUS_ESTIMATED_DONE=5`。 |
 | `User/Driver/emm42_motor.c` | Emm42 TTL 协议帧发送和回包解析 | 通用驱动层，按句柄中的 `huart` 和 `address` 发送速度、停止、相对位置和当前位置清零命令，并非阻塞解析到位回包 `[addr FD 9F 6B]`。 |
-| `User/Driver/emm42_motor.h` | Emm42 协议类型声明 | 定义电机句柄、方向、控制模式、速度模式、相对位置模式、到位回包解析器和当前位置清零接口。 |
+| `User/Driver/emm42_motor.h` | Emm42 协议类型声明 | 定义电机句柄、方向、控制模式、速度模式、相对位置模式、到位回包解析器、当前位置清零接口和 `EMM42_MOTOR_STATUS_ESTIMATED_DONE`。 |
 | `User/App/emm42_motor_uart_binding.md` | 串口与 ID 绑定总文档 | 现场调试时优先查这份文档。 |
 
 ## 3. Data Flow
@@ -89,7 +89,7 @@
 | 命令 | 作用 | 生效范围 |
 |---|---|---|
 | `STEPPER_PARAM_SET 0x42` | 一次下发三台电机的地址、最小步长、常规/对中速度、传送带上料扫描速度和方向映射。 | 只更新 F4 运行内存；不会写 F4 Flash，也不会写 Emm42 EEPROM。 |
-| `ACTUATOR_POS_MOVE 0x50` | 让传送带、左右轴或上下轴按相对位置模式移动固定步数。 | 三台执行器均支持；F4 先回 ACK，真实到位后回 `EVENT_REPORT event=0x14`，超时回 `event=0x15`。 |
+| `ACTUATOR_POS_MOVE 0x50` | 让传送带、左右轴或上下轴按相对位置模式移动固定步数。 | 三台执行器均支持；F4 先回 ACK，收到主动到位回包后回 `EVENT_REPORT event=0x14 status=0`，没有主动回包但估算到期后回 `event=0x14 status=5 estimated-done`，真实通信故障才回 `event=0x15`。 |
 | `ACTUATOR_STOP 0x51` | 停止指定执行器，`actuator=0xFF` 停止全部可停止执行器。 | 传送带、左右轴、上下轴。 |
 | `ACTUATOR_VEL_MOVE 0x52` | 让传送带或左右轴按速度模式持续运动，直到收到 STOP。 | 只允许 `actuator=0/1`；上下轴不允许连续速度模式。 |
 | `ACTUATOR_HOME 0x53` | 停止目标电机后把当前位置设为新的零点。 | 三台执行器均支持；不做主动回零运动，不支持 `actuator=0xFF`。 |
@@ -117,7 +117,7 @@
 | 共地 | F4、Emm42 驱动器、电机电源必须共地。 |
 | 地址 | 同一条 `USART6` 上两个摄像头电机现场默认分别设置为左右轴 `0x03`、上下轴 `0x02`；运行时下发时也必须互不相同。 |
 | 禁止混接 | 传送带不能再接到 `USART6 PC6/PC7`，否则会和摄像头两个电机抢总线。 |
-| Response 设置 | 张大头 Emm42 位置模式必须把 Response 配为 `Reached` 或 `Both`，否则 F4 收不到 `[addr FD 9F 6B]` 到位回包。 |
+| Response 设置 | 建议把张大头 Emm42 位置模式 Response 配为 `Reached` 或 `Both`，这样 F4 能收到 `[addr FD 9F 6B]` 主动到位回包；如果现场没有主动回包，F4 会按步数/速度估算完成并返回 `status=5 estimated-done`。 |
 
 ## 7. Verification
 
@@ -133,7 +133,7 @@
 | 下发三电机参数 | MP157 Qt 参数页 | `参数设置 -> 步进参数 -> 保存并下发` | F4 返回 `ACK acked_cmd=0x42 status=0`；再发 `BELTINFO` 能看到传送带 `track/scan` 双速度，发 `CAMINFO` 能看到摄像头两轴参数变化。 | 如果只保存 JSON 没 ACK，说明没有下发；如果 F4 没变化，确认 F4 固件已重新编译下载；如果 `NACK error_code=4`，检查 MP157 是否仍发送旧 25 字节负载。 |
 | 手动传送带持续运动 | MP157 Qt 手动三轴弹窗 | 切到传送带页，点击正转或反转，再点击停止。 | F4 返回 `ACK acked_cmd=0x52 status=0` 后传送带持续运动；停止返回 `ACK acked_cmd=0x51 status=0` 并停机。 | 若点击一次只动一下，确认 MP157 发的是 `ACTUATOR_VEL_MOVE`；若显示 `status=1/2`，确认 F4 已烧录 ACK 修复。 |
 | 传送带当前位置设零 | MP157 Qt 参数页步进弹窗 | 切到传送带页，点击 `设当前位置为零点`。 | F4 返回 `ACK acked_cmd=0x53 status=0`，传送带不主动运动，只发送 Emm42 `[addr 0A 6D 6B]`。 | 若返回未知命令，F4 仍是旧固件；若 ACK 但设零无效，检查传送带地址、Emm42 命令支持和 `[addr 0A 6D 6B]` 帧。 |
-| 传送带位置到位事件 | MP157 Qt 自动流程或二进制串口工具 | 发送 `ACTUATOR_POS_MOVE actuator=0 direction=0/1 steps>0`。 | F4 先返回 `ACK acked_cmd=0x50 status=0`；传送带真实到位后返回 `EVENT_REPORT event=0x14 related_seq=<本次SEQ>`。 | 若只有 ACK 没 DONE，检查传送带 Emm42 Response 是否为 `Reached/Both`、UART4 RX `PC11` 是否接好、地址是否 `0x01`、电源和共地。 |
+| 传送带位置到位事件 | MP157 Qt 自动流程或二进制串口工具 | 发送 `ACTUATOR_POS_MOVE actuator=0 direction=0/1 steps>0`。 | F4 先返回 `ACK acked_cmd=0x50 status=0`；传送带主动回包到位后返回 `EVENT_REPORT event=0x14 status=0 related_seq=<本次SEQ>`；未收到主动回包但估算到期后返回 `event=0x14 status=5`。 | 若总是 `status=5`，检查传送带 Emm42 Response 是否为 `Reached/Both`、UART4 RX `PC11` 是否接好、地址是否 `0x01`、电源和共地；流程不会再因为缺少主动回包永久卡住。 |
 | 测试摄像头右移 | USART1 串口助手 | `CAMLAT RIGHT 30` | 只有摄像头左右轴动作。 | 如果上下轴动作，检查两个摄像头电机 ID 是否接反。 |
 | 测试摄像头上下轴 | USART1 串口助手 | `CAMZ UP 30` | 只有摄像头上下轴动作。 | 如果两个电机都动，检查两个电机是否仍是相同地址。 |
 | 停止摄像头两个轴 | USART1 串口助手 | `CAMSTOP` | 两个摄像头运动轴停止。 | 检查 USART6 接线、地址和供电。 |
@@ -153,5 +153,6 @@
 | 2026-07-04 | 新增 MP157 `ACTUATOR_VEL_MOVE` 手动连续速度运动，传送带和左右轴点击一次持续运动，直到 `ACTUATOR_STOP`。 |
 | 2026-07-04 | 新增 MP157 `ACTUATOR_POS_MOVE` 固定步数位置运动和 `ACTUATOR_HOME` 当前位置设零，当前位置设零使用 Emm42 `[addr 0A 6D 6B]`，不主动寻找限位。 |
 | 2026-07-04 | 现场摄像头电机地址改为左右轴 `0x03`、上下轴 `0x02`；摄像头服务命令队列改为短 FIFO，STOP 队首优先。 |
-| 2026-07-05 | 新增位置运动真实到位事件链：传送带位置命令成功发送后，任务轮询 `[addr FD 9F 6B]`，到位上报 `EVENT_REPORT event=0x14`，超时上报 `event=0x15`；ACK 不再被当成运动完成。 |
+| 2026-07-05 | 新增位置运动完成事件链：传送带位置命令成功发送后，任务轮询 `[addr FD 9F 6B]`，主动回包到位上报 `EVENT_REPORT event=0x14 status=0`，估算完成兜底上报 `event=0x14 status=5`，真实通信/驱动故障才上报 `event=0x15`；ACK 不再被当成运动完成。 |
+| 2026-07-05 | 复核张大头官方位置模式例程后确认示例没有解析主动完成帧；位置运动完成机制改为 `status=0` 表示真实主动回包到位，`status=5 estimated-done` 表示估算完成兜底，真实通信错误才用 `event=0x15`。 |
 | 2026-07-05 | 传送带运行参数拆成双速度：`scan_speed_rpm` 用于未检测到零件时的上料扫描，`normal_speed_rpm` 用于检测到零件后的视觉对中和短步微调；`STEPPER_PARAM_SET` 改为 31 字节负载、单条 9 字节记录。 |

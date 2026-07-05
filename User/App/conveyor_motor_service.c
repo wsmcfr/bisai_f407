@@ -691,7 +691,9 @@ static void ConveyorMotorService_ReportPositionCommandFailure(const ConveyorMoto
  * @param runtime 传送带任务运行时状态，不能为空。
  *
  * 该函数不阻塞等待串口数据，每个控制周期只读少量已到达字节。
- * 正常识别 `[addr FD 9F 6B]` 后发送 DONE；超过估算时间或 UART RX 出错后发送 TIMEOUT。
+ * 正常识别 `[addr FD 9F 6B]` 后发送 `DONE + status=0`；
+ * 若驱动器没有主动回包，但步数/速度估算时间和安全余量已经到期，则发送
+ * `DONE + ESTIMATED_DONE` 作为流程兜底；只有 UART 读取错误等真实故障才发送 TIMEOUT。
  */
 static void ConveyorMotorService_PollPendingMoveReport(const EMM42_MotorHandle_t *motor,
                                                        ConveyorMotor_Runtime_t *runtime)
@@ -742,20 +744,13 @@ static void ConveyorMotorService_PollPendingMoveReport(const EMM42_MotorHandle_t
     current_tick = xTaskGetTickCount();
     if ((current_tick - runtime->pending_move.start_tick) >= runtime->pending_move.timeout_ticks)
     {
-        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CONVEYOR_NOT_READY);
-        BinaryProtocolService_ReportFault((uint16_t)EMM42_MOTOR_STATUS_TIMEOUT,
-                                          BINARY_PROTOCOL_FAULT_SOURCE_CONVEYOR,
-                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
-                                          BinaryProtocolService_BuildActuatorMoveDetail(runtime->pending_move.actuator,
-                                                                                       runtime->pending_move.direction,
-                                                                                       (uint16_t)EMM42_MOTOR_STATUS_TIMEOUT),
-                                          runtime->pending_move.related_seq);
+        BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_CONVEYOR_NOT_READY);
         ConveyorMotorService_SendMoveReport(runtime->pending_move.cycle_id,
                                             runtime->pending_move.related_seq,
                                             runtime->pending_move.actuator,
                                             runtime->pending_move.direction,
-                                            BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT,
-                                            (uint16_t)EMM42_MOTOR_STATUS_TIMEOUT);
+                                            BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE,
+                                            (uint16_t)EMM42_MOTOR_STATUS_ESTIMATED_DONE);
         ConveyorMotorService_ClearPendingMoveReport(runtime);
     }
 }

@@ -604,7 +604,9 @@ static void CameraMotorService_ReportPositionCommandFailure(const CameraMotor_Co
  * @param runtime 摄像头电机运行时状态，不能为空。
  *
  * 因为两个摄像头轴共用 USART6，本函数一次只处理一个 pending。
- * 解析器会匹配目标轴地址，只有 `[目标地址 FD 9F 6B]` 才算真实到位。
+ * 解析器会匹配目标轴地址，收到 `[目标地址 FD 9F 6B]` 时立即上报真实到位。
+ * 如果张大头驱动器没有主动回包，本函数在估算运动时间和安全余量到期后，
+ * 上报 `ACTUATOR_MOVE_DONE + ESTIMATED_DONE`，避免 MP157 自动流程永久卡在 Z 轴等待。
  */
 static void CameraMotorService_PollPendingMoveReport(const EMM42_MotorHandle_t *lateral_motor,
                                                      const EMM42_MotorHandle_t *z_motor,
@@ -661,20 +663,13 @@ static void CameraMotorService_PollPendingMoveReport(const EMM42_MotorHandle_t *
     current_tick = xTaskGetTickCount();
     if ((current_tick - runtime->pending_move.start_tick) >= runtime->pending_move.timeout_ticks)
     {
-        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
-        BinaryProtocolService_ReportFault((uint16_t)EMM42_MOTOR_STATUS_TIMEOUT,
-                                          BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR,
-                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
-                                          BinaryProtocolService_BuildActuatorMoveDetail(runtime->pending_move.actuator,
-                                                                                       runtime->pending_move.direction,
-                                                                                       (uint16_t)EMM42_MOTOR_STATUS_TIMEOUT),
-                                          runtime->pending_move.related_seq);
+        BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
         CameraMotorService_SendMoveReport(runtime->pending_move.cycle_id,
                                           runtime->pending_move.related_seq,
                                           runtime->pending_move.actuator,
                                           runtime->pending_move.direction,
-                                          BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT,
-                                          (uint16_t)EMM42_MOTOR_STATUS_TIMEOUT);
+                                          BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE,
+                                          (uint16_t)EMM42_MOTOR_STATUS_ESTIMATED_DONE);
         CameraMotorService_ClearPendingMoveReport(runtime);
     }
 }

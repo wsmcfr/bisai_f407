@@ -24,7 +24,7 @@
 | Emm42 地址 | 传送带电机站号 | 默认 `0x01`，可由 MP157 `STEPPER_PARAM_SET` 运行时更新，合法范围 `1~247`。 |
 | FreeRTOS 队列 | 协议层向传送带任务投递控制命令 | 队列长度为 1，使用覆盖写入，视觉坐标以最新误差为准。 |
 | MP157 主链路 | 二进制协议入口 | USART1 收到 `START_CYCLE/VISION_POS/STEPPER_PARAM_SET/ACTUATOR_POS_MOVE` 后转交本模块。 |
-| Emm42 Response | 位置到位事件 | 位置模式必须配置为 `Reached` 或 `Both`，否则 F4 收不到 `[addr FD 9F 6B]` 到位回包。 |
+| Emm42 Response | 位置到位事件 | 配置为 `Reached` 或 `Both` 时 F4 可收到 `[addr FD 9F 6B]` 主动到位回包；若现场没有主动回包，F4 按步数、速度和安全余量估算到期后上报 `DONE status=5 estimated-done`。 |
 
 ## 使用方法
 
@@ -45,15 +45,15 @@
 | 查询运行参数 | F4 USART1 串口助手 | `BELTINFO` | 日志含 `track=<normal_speed_rpm> rpm, scan=<scan_speed_rpm> rpm`。 | 若没有 `track/scan` 字段，说明 F4 未烧录新固件或串口连接到旧程序。 |
 | 验证上料速度 | F4 USART1 串口助手 | 先下发 `STEPPER_PARAM_SET` 设置 `scan_speed_rpm=60`，再发 `BELTSCAN` | 传送带按 60rpm 附近扫描，`BELTINFO` 显示 `scan=60 rpm`。 | 若仍按旧速度转，检查 MP157 是否收到 `ACK acked_cmd=0x42`、F4 是否打印 `Runtime config applied`。 |
 | 验证对中速度 | F4 USART1 串口助手 | 设置 `normal_speed_rpm=137` 后发送 `BELTTRACK -120` | `BELTINFO` 显示 `track=137 rpm`，实际跟踪速度不超过该值。 | 若速度仍受固定 80rpm 限制，检查 `ConveyorMotorService_MapErrorToSpeed()` 是否使用 `runtime->config.normal_speed_rpm`。 |
-| 验证位置到位事件 | MP157 Qt 自动流程或二进制串口工具 | 发送 `ACTUATOR_POS_MOVE actuator=0 speed_rpm=0 steps>0` | F4 先 ACK，传送带到位后再发 `EVENT_REPORT event=0x14 related_seq=<本次SEQ>`。 | 若只有 ACK 没 DONE，检查 Emm42 Response、UART4 RX `PC11`、地址和共地。 |
+| 验证位置到位事件 | MP157 Qt 自动流程或二进制串口工具 | 发送 `ACTUATOR_POS_MOVE actuator=0 speed_rpm=0 steps>0` | F4 先 ACK；收到 `[addr FD 9F 6B]` 时发 `EVENT_REPORT event=0x14 status=0 related_seq=<本次SEQ>`；没有主动回包但估算运动时间到期时发 `event=0x14 status=5`；UART 读取错误或发送失败才发 `event=0x15`。 | 若总是 `status=5`，检查 Emm42 Response、UART4 RX `PC11`、地址和共地；流程不会再因缺少主动回包永久等待。 |
 
 ## 读写验证
 
 | 数据路径 | 写入怎么做 | 读取/确认怎么做 |
 |---|---|---|
 | MP157 -> F4 参数 | MP157 发送 `STEPPER_PARAM_SET 0x42`，负载为 31 字节。 | F4 返回 `ACK status=0` 后，用 `BELTINFO` 读取 `track/scan`，用 `CAMINFO` 读取摄像头两轴参数。 |
-| F4 -> 传送带 Emm42 | 本模块调用 `EMM42_MotorSetVelocity()`、`EMM42_MotorMoveRelativePosition()` 或 `EMM42_MotorStopNow()` 通过 UART4 发送帧。 | 观察传送带动作；位置模式还要读取 Emm42 `[addr FD 9F 6B]` 到位回包。 |
-| F4 -> MP157 到位事件 | 位置运动成功发送后，任务轮询 Emm42 到位回包。 | 到位时发送 `EVENT_REPORT event=0x14`，超时或串口异常发送 `event=0x15`，MP157 自动流程只能用该事件推进。 |
+| F4 -> 传送带 Emm42 | 本模块调用 `EMM42_MotorSetVelocity()`、`EMM42_MotorMoveRelativePosition()` 或 `EMM42_MotorStopNow()` 通过 UART4 发送帧。 | 观察传送带动作；位置模式优先读取 Emm42 `[addr FD 9F 6B]` 到位回包，未收到时按估算运动时间兜底。 |
+| F4 -> MP157 到位事件 | 位置运动成功发送后，任务轮询 Emm42 到位回包并同步检查估算运动时间。 | 收到主动回包时发送 `EVENT_REPORT event=0x14 status=0`；估算完成时发送 `event=0x14 status=5`；真实通信错误发送 `event=0x15`，MP157 自动流程只能用该事件推进。 |
 | 文本调试命令 | 串口助手发送 `BELTSCAN/BELTTRACK/BELTSTOP/BELTINFO`。 | 只用于现场单模块排查；正式自动流程以二进制命令为准。 |
 
 ## 失败排查
@@ -74,3 +74,4 @@
 | 2026-07-05 | 新增本模块说明文档，记录传送带服务、双速度参数、读写验证和失败排查。 |
 | 2026-07-05 | `ConveyorMotorService_RequestRuntimeConfig()` 增加 `scan_speed_rpm`，传送带 SCAN 使用上料速度，TRACK 和短步位置运动使用 `normal_speed_rpm`。 |
 | 2026-07-05 | `BELTINFO` 增加 `track/scan` 输出，用于现场确认 MP157 参数页是否同步到 F4 运行内存。 |
+| 2026-07-05 | 位置运动完成机制改为“主动到位回包优先、估算完成兜底”：张大头官方位置模式例程没有证明默认一定主动返回完成帧，所以没有 `[addr FD 9F 6B]` 时不再发 `TIMEOUT` 卡住 MP157，而是发 `EVENT_REPORT event=0x14 status=5 estimated-done`。 |

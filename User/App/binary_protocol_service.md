@@ -10,7 +10,7 @@
 
 | 文件 | 类型 | 修改原因 |
 |---|---|---|
-| `User/App/binary_protocol_service.h` | 修改 | 定义协议帧格式、命令字、错误码、负载结构、CRC/解帧/分发接口；新增 `STEPPER_PARAM_SET(0x42)` 和 31 字节步进参数负载，单条电机记录 9 字节，包含传送带对中/短步速度 `normal_speed_rpm` 和上料扫描速度 `scan_speed_rpm`；新增 `WEIGHT_CALIBRATE(0x30)` 和 5 字节称重标定负载；新增 `ACTUATOR_POS_MOVE(0x50)`、`ACTUATOR_STOP(0x51)`、`ACTUATOR_VEL_MOVE(0x52)`、`ACTUATOR_HOME(0x53)` 执行器负载。 |
+| `User/App/binary_protocol_service.h` | 修改 | 定义协议帧格式、命令字、错误码、负载结构、CRC/解帧/分发接口；新增 `STEPPER_PARAM_SET(0x42)` 和 31 字节步进参数负载，单条电机记录 9 字节，包含传送带对中/短步速度 `normal_speed_rpm` 和上料扫描速度 `scan_speed_rpm`；新增 `WEIGHT_CALIBRATE(0x30)` 和 5 字节称重标定负载；新增 `ACTUATOR_POS_MOVE(0x50)`、`ACTUATOR_STOP(0x51)`、`ACTUATOR_VEL_MOVE(0x52)`、`ACTUATOR_HOME(0x53)` 执行器负载；新增 `BINARY_PROTOCOL_ACTUATOR_MOVE_STATUS_ESTIMATED_DONE=5`，用于标记 F4 未收到 Emm42 主动到位回包但按估算完成的兜底事件。 |
 | `User/App/binary_protocol_service.c` | 修改 | 实现 CRC16-CCITT-FALSE、组帧、解帧、负载解码、ACK/NACK 发送和命令分发；新增三台步进电机参数校验和分发，新增称重标定解码与 `WeightService_RequestCalibration()` 调用；新增三轴位置运动、速度连续运动、停止和当前位置设零分发，并保证成功 ACK 的 `status=0`。 |
 | `User/App/uart_command.h` | 修改 | 增加 `UartCommand_SendRaw()`，用于发送包含 `0x00` 的二进制 ACK/NACK 帧。 |
 | `User/App/uart_command.c` | 修改 | 让二进制原始帧发送和 `my_printf()` 共用 USART1 发送互斥锁，避免文本日志和二进制帧交叉。 |
@@ -127,6 +127,14 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | 7 | `steps` | `u32` | `1~4294967295` | 相对移动步数，单位 step。 |
 | 11 | `flags` | `u8` | 固定 `0` | 首版保留。 |
 
+位置运动完成事件：
+
+| EVENT | `detail_i32` 低 16 位 status | 含义 | MP157 处理 |
+|---:|---:|---|---|
+| `0x14 ACTUATOR_MOVE_DONE` | `0` | F4 收到张大头 Emm42 `[addr FD 9F 6B]` 主动到位回包。 | 认为本次位置运动完成，继续 ROI 复查或下一阶段。 |
+| `0x14 ACTUATOR_MOVE_DONE` | `5 estimated-done` | F4 没收到主动回包，但按 `steps/speed_rpm` 估算运动时间加安全余量已经到期。 | 继续流程，同时在日志里保留 `estimated-done`，供现场检查 Response/RX/地址。 |
+| `0x15 ACTUATOR_MOVE_TIMEOUT` | 底层错误码 | 位置帧发送失败、UART 读取错误或其它真实通信/驱动故障。 | 停止自动推进，提示检查 F4、电机和串口链路。 |
+
 ### `ACTUATOR_STOP 0x51`
 
 | 偏移 | 字段 | 类型 | 合法范围 | 说明 |
@@ -236,3 +244,4 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | 2026-07-04 | 摄像头轴默认地址按现场实物改为左右轴 `0x03`、上下轴 `0x02`；摄像头电机服务队列改为短 FIFO，STOP 队首优先，避免 `STEPPER_PARAM_SET` 已 ACK 但 CONFIG 被下一条手动动作覆盖。 |
 | 2026-07-04 | 修正左右轴停止键无效：摄像头电机服务新增 `stop_epoch`，STOP 后自动丢弃旧 JOG/POSITION/HOME 运动命令，避免旧队列命令在 STOP 后重新启动左右轴。 |
 | 2026-07-05 | `STEPPER_PARAM_SET 0x42` 扩展为 31 字节负载、三条 9 字节电机记录；新增 `scan_speed_rpm`，传送带 SCAN 使用上料速度，TRACK/短步使用 `normal_speed_rpm`，摄像头两轴继续使用常规速度。 |
+| 2026-07-05 | 新增位置运动估算完成状态：张大头官方位置模式例程只演示发送 `Emm_V5_Pos_Control()` 并等待串口帧，没有证明默认一定主动返回完成帧；因此 F4 没收到 `[addr FD 9F 6B]` 时，按估算运动时间发送 `EVENT_REPORT event=0x14 status=5 estimated-done`，不再用普通无回包场景卡住 MP157 自动流程。 |

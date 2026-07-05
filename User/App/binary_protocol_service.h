@@ -227,18 +227,31 @@ extern "C" {
 #define BINARY_PROTOCOL_EVENT_REPORT_PAYLOAD_LENGTH  (16U)
 
 /**
- * @brief EVENT_REPORT 事件：执行器位置运动已经真实到位。
+ * @brief EVENT_REPORT 事件：执行器位置运动已经完成。
  *
- * F4 只有在对应张大头 Emm42 返回 `[addr FD 9F 6B]` 后才能发送该事件。
+ * `detail_i32` 的低 16 位必须说明完成来源：
+ * - `0` 表示 F4 收到了张大头 Emm42 `[addr FD 9F 6B]` 主动到位回包；
+ * - `BINARY_PROTOCOL_ACTUATOR_MOVE_STATUS_ESTIMATED_DONE` 表示没有收到主动回包，
+ *   但 F4 已按步数、速度和安全余量估算本次位置运动到期，用兜底完成事件推进 MP157。
  */
 #define BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE     (0x14U)
 
 /**
  * @brief EVENT_REPORT 事件：执行器位置运动等待到位超时。
  *
- * 常见原因是 Emm42 Response 参数未设置为 Reached/Both、RX 未接好、地址错误或电机堵转。
+ * 该事件只用于位置帧发送失败、UART 读取错误或其它真实通信/驱动故障；
+ * 单纯没有主动到位回包时，F4 改用 `ACTUATOR_MOVE_DONE + ESTIMATED_DONE`。
  */
 #define BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT  (0x15U)
+
+/**
+ * @brief 执行器位置运动完成状态：按估算运动时间兜底完成。
+ *
+ * 该状态放在 `EVENT_REPORT detail_i32` 的低 16 位。
+ * 它不是故障码，表示 F4 没拿到 Emm42 主动到位回包，但按官方位置命令的
+ * 步数/速度估算已经超过运动时间和安全余量，允许 MP157 继续自动流程。
+ */
+#define BINARY_PROTOCOL_ACTUATOR_MOVE_STATUS_ESTIMATED_DONE (0x0005U)
 
 /**
  * @brief `WEIGHT_RESULT` 回包负载长度，单位字节。

@@ -540,6 +540,9 @@ static void test_event_report_actuator_move_contract(void)
     expect_int("event_report_length", (int)BINARY_PROTOCOL_EVENT_REPORT_PAYLOAD_LENGTH, 16);
     expect_int("event_actuator_move_done", (int)BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE, 0x14);
     expect_int("event_actuator_move_timeout", (int)BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT, 0x15);
+    expect_int("event_actuator_estimated_done_status",
+               (int)BINARY_PROTOCOL_ACTUATOR_MOVE_STATUS_ESTIMATED_DONE,
+               0x0005);
     expect_int("event_report_payload_code", (int)payload[2], (int)BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE);
     expect_u16("event_report_related_seq",
                (uint16_t)(payload[10] | ((uint16_t)payload[11] << 8)),

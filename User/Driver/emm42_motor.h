@@ -24,7 +24,8 @@ typedef enum
     EMM42_MOTOR_STATUS_ERROR,        /* UART 发送或底层 HAL 调用失败，调用者应输出阶段信息便于排查。 */
     EMM42_MOTOR_STATUS_INVALID_PARAM,/* 句柄、串口指针或模式参数非法，驱动不会发送任何字节。 */
     EMM42_MOTOR_STATUS_RANGE_ERROR,  /* 速度、加速度等数值超出协议允许范围，驱动拒绝组帧发送。 */
-    EMM42_MOTOR_STATUS_TIMEOUT       /* 等待电机驱动器到位回包超时，常见原因是 Response 未配置为 Reached/Both 或 RX 接线异常。 */
+    EMM42_MOTOR_STATUS_TIMEOUT,      /* 等待电机驱动器到位回包超时，常见原因是 Response 未配置为 Reached/Both 或 RX 接线异常。 */
+    EMM42_MOTOR_STATUS_ESTIMATED_DONE/* 未收到主动到位回包，但上层按步数、速度和安全余量估算本次位置运动已经完成。 */
 } EMM42_MotorStatus_t;
 
 /**

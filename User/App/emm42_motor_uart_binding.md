@@ -29,12 +29,12 @@
 | 文件 | 修改原因 | 影响 |
 |---|---|---|
 | `User/Driver/emm42_motor.c` | 把驱动注释从“传送带独占 USART6”改为“通用 UART + 地址句柄”。 | 驱动层不再写死业务电机和串口，方便 UART4 与 USART6 同时复用同一个驱动。 |
-| `User/Driver/emm42_motor.h` | 明确默认地址只是驱动默认值，实际地址由应用层覆盖。 | 防止后续把两个摄像头电机都留在默认 `0x01`。 |
+| `User/Driver/emm42_motor.h` | 明确默认地址只是驱动默认值，实际地址由应用层覆盖；新增 `EMM42_MOTOR_STATUS_ESTIMATED_DONE`。 | 防止后续把两个摄像头电机都留在默认 `0x01`；让 MP157 能区分真实主动回包到位和估算完成兜底。 |
 | `User/App/conveyor_motor_service.c` | 将传送带电机绑定到 `huart4`，默认地址 `0x01`；新增运行时配置队列命令。 | 传送带不再占用 `USART6`，并能接收 MP157 下发的地址、最小步长、常规速度和方向映射。 |
 | `User/App/conveyor_motor_service.h` | 更新传送带任务说明和 `ConveyorMotorService_RequestRuntimeConfig()` 声明。 | 二进制协议层可以安全投递参数，不直接抢 UART4。 |
 | `User/App/camera_motor_service.c` | 摄像头运动电机服务绑定 `huart6`，默认维护现场左右轴地址 `0x03` 和上下轴地址 `0x02`；新增运行时配置 FIFO 队列命令，STOP 队首优先。 | 可以通过 `CAMLAT/CAMZ` 文本命令调试摄像头左右轴和上下轴，也可以由 MP157 下发运行时参数。 |
 | `User/App/camera_motor_service.h` | 新增摄像头运行时参数接口声明。 | 供 FreeRTOS 创建任务、USART1 命令入口和二进制协议层调用。 |
-| `User/App/binary_protocol_service.c/.h` | 新增 `STEPPER_PARAM_SET 0x42`。 | MP157 参数页可把三台电机配置下发给 F4。 |
+| `User/App/binary_protocol_service.c/.h` | 新增 `STEPPER_PARAM_SET 0x42`；新增 `BINARY_PROTOCOL_ACTUATOR_MOVE_STATUS_ESTIMATED_DONE=5`。 | MP157 参数页可把三台电机配置下发给 F4；位置运动完成事件可在 `detail_i32` 低 16 位标记 `estimated-done`。 |
 | `User/App/weight_service.c` | 在 USART1 统一命令分发入口中加入 `CameraMotorService_HandleCommand()`。 | `CAMINFO/CAMSTOP/CAMLAT/CAMZ（CAMFWD 兼容）` 能从 USART1 串口助手或 MP157 下发。 |
 | `User/App/uart_command.c` | 更新 USART1 命令总表，补充摄像头电机命令。 | 打开串口底座文件即可查到 `CAM...` 命令用途。 |
 | `Core/Src/freertos.c` | 创建 `cameraMotorTask`，启动摄像头电机服务任务。 | 新服务真正进入 FreeRTOS 调度。 |
@@ -131,6 +131,7 @@
 | USART6 到摄像头左右轴 | 串口助手发送 `CAMLAT RIGHT 30`。 | 观察摄像头左右轴动作，再发 `CAMSTOP`。 | 只有地址 `0x03` 电机动作表示 ID 正确。 |
 | USART6 到摄像头上下轴 | 串口助手发送 `CAMZ UP 30`。 | 观察摄像头上下轴动作，再发 `CAMSTOP`。 | 只有地址 `0x02` 电机动作表示 ID 正确。 |
 | MP157 到 F4 步进参数 | MP157 Qt 发送 `STEPPER_PARAM_SET`。 | F4 回二进制 ACK；串口助手发送 `CAMINFO`。 | `CAMINFO` 中摄像头左右/上下轴地址、速度、方向映射与 MP157 参数页一致。 |
+| F4 到 MP157 位置完成 | MP157 Qt 发送 `ACTUATOR_POS_MOVE actuator=0/1/2 steps>0`。 | F4 先 ACK；收到 `[addr FD 9F 6B]` 时发 `EVENT_REPORT event=0x14 status=0`，未收到主动回包但估算到期时发 `event=0x14 status=5 estimated-done`。 | `related_seq` 必须匹配本次命令；若总是 `status=5`，检查张大头 Response 配置、RX 接线、地址和共地。 |
 
 ## 9. 修改记录
 
@@ -142,3 +143,4 @@
 | 2026-07-02 | 同步 `emm42_conveyor_code_guide.md` 和 `binary_protocol_service.md`，保证旧文档不再把传送带写成 `USART6/huart6`。 |
 | 2026-07-03 | 新增 MP157 `STEPPER_PARAM_SET` 运行时参数下发说明；三台电机速度范围按 Emm42 协议统一为 `0~5000 rpm`。 |
 | 2026-07-04 | 现场电机地址改为摄像头左右轴 `0x03`、摄像头上下轴 `0x02`；参数保存 ACK 后还要通过 `CAMINFO` 或 `Runtime config applied` 确认 F4 运行内存已应用。 |
+| 2026-07-05 | 复核张大头官方位置模式代码后，把位置完成机制调整为主动回包优先、估算完成兜底：`status=0` 表示收到 `[addr FD 9F 6B]`，`status=5 estimated-done` 表示按步数/速度估算完成，避免 MP157 在 Z 轴下降后等待不到主动回包而停住。 |
