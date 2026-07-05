@@ -114,6 +114,8 @@ typedef struct
     HX711_Status_t latest_status;       /* 最近一次 HX711 采样状态，用于拒绝超时或参数错误的样本。 */
     int32_t latest_raw_value;           /* 最近一次中值滤波后的原始计数，单位为 HX711 ADC counts。 */
     uint8_t *tare_ready;                /* 指向称重任务去皮完成标志，1 表示 offset 可用于标定。 */
+    uint16_t sample_id;                 /* 最近一次成功刷新快照的本地样本号，循环递增即可。 */
+    uint8_t filter_sample_count;        /* 当前中值滤波窗口内有效样本数量，用于上报 sample_count。 */
 } WeightService_BinaryContext_t;
 
 /**
@@ -125,7 +127,9 @@ static WeightService_BinaryContext_t g_weight_service_binary_context = {
     (HX711_Handle_t *)0,
     HX711_STATUS_INVALID_PARAM,
     0,
-    (uint8_t *)0
+    (uint8_t *)0,
+    0U,
+    0U
 };
 
 /**
@@ -362,12 +366,25 @@ static HX711_Status_t WeightService_ExecuteTare(HX711_Handle_t *hx711,
 static void WeightService_UpdateBinaryContext(HX711_Handle_t *hx711,
                                               HX711_Status_t latest_status,
                                               int32_t latest_raw_value,
-                                              uint8_t *tare_ready)
+                                              uint8_t *tare_ready,
+                                              const WeightService_Filter_t *filter)
 {
     g_weight_service_binary_context.hx711 = hx711;
     g_weight_service_binary_context.latest_status = latest_status;
     g_weight_service_binary_context.latest_raw_value = latest_raw_value;
     g_weight_service_binary_context.tare_ready = tare_ready;
+    if (filter != NULL)
+    {
+        g_weight_service_binary_context.filter_sample_count = filter->sample_count;
+    }
+    if (latest_status == HX711_STATUS_OK)
+    {
+        ++g_weight_service_binary_context.sample_id;
+        if (g_weight_service_binary_context.sample_id == 0U)
+        {
+            g_weight_service_binary_context.sample_id = 1U;
+        }
+    }
 }
 
 /**
@@ -481,6 +498,70 @@ WeightService_CalibrationResult_t WeightService_RequestCalibration(uint16_t know
 }
 
 /**
+ * @brief 获取称重任务最近一次快照。
+ * @param snapshot 输出称重快照，不能为空。
+ * @return uint8_t 1 表示快照可用于上报，0 表示称重上下文尚未建立。
+ *
+ * 主要流程：
+ * 1. 检查 HX711 句柄和去皮状态指针是否已经由 WeightService_Task 建立；
+ * 2. 复制最近一次原始值、样本号和窗口样本数；
+ * 3. 已标定时换算成 mg，未标定或未去皮时把判定置为 review；
+ * 4. 通过 option_bits 明确告诉 MP157 该快照是否已标定、已去皮和样本有效。
+ */
+uint8_t WeightService_GetLatestSnapshot(WeightService_Snapshot_t *snapshot)
+{
+    HX711_Handle_t *hx711;
+    uint8_t tare_ready;
+    uint8_t sample_valid;
+    int32_t net_weight_mg = 0;
+    uint32_t option_bits = 0U;
+
+    if (snapshot == NULL)
+    {
+        return 0U;
+    }
+
+    (void)memset(snapshot, 0, sizeof(*snapshot));
+    hx711 = g_weight_service_binary_context.hx711;
+    if ((hx711 == NULL) || (g_weight_service_binary_context.tare_ready == NULL))
+    {
+        return 0U;
+    }
+
+    tare_ready = *(g_weight_service_binary_context.tare_ready);
+    sample_valid = (g_weight_service_binary_context.latest_status == HX711_STATUS_OK) ? 1U : 0U;
+
+    if (HX711_IsCalibrated(hx711) != 0U)
+    {
+        float grams = HX711_ConvertToGrams(hx711,
+                                           g_weight_service_binary_context.latest_raw_value);
+        net_weight_mg = (int32_t)(grams * 1000.0f);
+        option_bits |= 0x00000001UL;
+    }
+
+    if (tare_ready != 0U)
+    {
+        option_bits |= 0x00000002UL;
+    }
+    if (sample_valid != 0U)
+    {
+        option_bits |= 0x00000004UL;
+    }
+
+    snapshot->sample_id = g_weight_service_binary_context.sample_id;
+    snapshot->stable = ((sample_valid != 0U) && (tare_ready != 0U)) ? 1U : 0U;
+    snapshot->decision = (snapshot->stable != 0U) ? 1U : 3U;
+    snapshot->gross_weight_mg = net_weight_mg;
+    snapshot->net_weight_mg = net_weight_mg;
+    snapshot->raw_adc = g_weight_service_binary_context.latest_raw_value;
+    snapshot->sample_count = g_weight_service_binary_context.filter_sample_count;
+    snapshot->stable_window_mg = 0U;
+    snapshot->duration_ms = WEIGHT_SERVICE_SAMPLE_PERIOD_MS;
+    snapshot->option_bits = option_bits;
+    return 1U;
+}
+
+/**
  * @brief 输出当前重量、净计数差值或错误信息。
  * @param hx711 HX711句柄指针，不能为空。
  * @param status 当前读数状态。
@@ -586,6 +667,8 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
         return;
     }
 
+    WeightService_UpdateBinaryContext(hx711, latest_status, latest_raw_value, tare_ready, filter);
+
     if (UartCommand_FetchRaw(raw_frame,
                              sizeof(raw_frame),
                              &raw_frame_length,
@@ -593,8 +676,6 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
     {
         return;
     }
-
-    WeightService_UpdateBinaryContext(hx711, latest_status, latest_raw_value, tare_ready);
 
     if (BinaryProtocolService_HandleFrame(raw_frame, raw_frame_length) != 0U)
     {

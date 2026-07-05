@@ -9,7 +9,7 @@
  * - 摄像头运动服务当前绑定 `USART6`，PC6(TX) 接两个摄像头 Emm42 RX，PC7(RX) 接两个摄像头 Emm42 TX；
  * - 摄像头左右电机地址为 `0x03`，摄像头上下电机地址为 `0x02`，两者共用 `USART6` 时必须靠地址区分；
  * - 所有 Emm42 串口均按 115200 8N1 接线，TX/RX 需要交叉连接，并且 F4 与电机驱动电源必须共地；
- * - 当前实现只负责发送命令帧，不解析电机回包；上层通过返回的 HAL 发送状态判断“是否成功发出”，不代表电机一定已经执行完成。
+ * - 位置模式现在会由上层任务轮询 `[addr FD 9F 6B]` 到位回包；普通发送函数的返回值仍只代表命令帧是否成功发出。
  *
  * 本文件会发送的 Emm42 命令帧：
  * | 函数 | 帧格式 | 参数效果 | 是否会让电机动作 |
@@ -57,6 +57,61 @@ static EMM42_MotorStatus_t EMM42_MotorTransmitFrame(const EMM42_MotorHandle_t *m
     }
 
     return EMM42_MOTOR_STATUS_OK;
+}
+
+/**
+ * @brief 把一个新字节推进到到位回包解析窗口。
+ * @param parser 解析器状态，不能为空。
+ * @param byte 本次从 UART 收到的一个字节。
+ *
+ * 主要流程：
+ * 1. 窗口未满时顺序填入；
+ * 2. 窗口已满时左移 1 字节，把最新字节放到末尾；
+ * 3. 上层随后检查窗口是否等于 `[addr FD 9F 6B]`。
+ */
+static void EMM42_MotorReachedAckParserPush(EMM42_MotorReachedAckParser_t *parser, uint8_t byte)
+{
+    if (parser == NULL)
+    {
+        return;
+    }
+
+    if (parser->filled < EMM42_MOTOR_REACHED_ACK_LENGTH)
+    {
+        parser->window[parser->filled] = byte;
+        parser->filled++;
+        return;
+    }
+
+    parser->window[0] = parser->window[1];
+    parser->window[1] = parser->window[2];
+    parser->window[2] = parser->window[3];
+    parser->window[3] = byte;
+}
+
+/**
+ * @brief 判断当前解析窗口是否为指定地址的 Emm42 位置到位回包。
+ * @param motor 电机句柄，用于取目标地址。
+ * @param parser 解析器状态。
+ * @return uint8_t 1 表示匹配，0 表示未匹配。
+ */
+static uint8_t EMM42_MotorReachedAckParserMatched(const EMM42_MotorHandle_t *motor,
+                                                  const EMM42_MotorReachedAckParser_t *parser)
+{
+    if ((motor == NULL) || (parser == NULL) || (parser->filled < EMM42_MOTOR_REACHED_ACK_LENGTH))
+    {
+        return 0U;
+    }
+
+    if ((parser->window[0] == motor->address) &&
+        (parser->window[1] == 0xFDU) &&
+        (parser->window[2] == EMM42_MOTOR_REACHED_ACK_STATUS) &&
+        (parser->window[3] == 0x6BU))
+    {
+        return 1U;
+    }
+
+    return 0U;
 }
 
 /**
@@ -287,6 +342,140 @@ EMM42_MotorStatus_t EMM42_MotorMoveRelativePosition(const EMM42_MotorHandle_t *m
     frame[12] = 0x6BU;
 
     return EMM42_MotorTransmitFrame(motor, frame, (uint16_t)sizeof(frame));
+}
+
+/**
+ * @brief 清空电机 UART 接收缓存中的旧字节。
+ * @param motor 电机句柄指针，不能为空。
+ * @return EMM42_MotorStatus_t 清空结果。
+ *
+ * 该函数只做非阻塞读取，最多丢弃 64 字节，避免异常噪声让任务长时间卡在清空环节。
+ */
+EMM42_MotorStatus_t EMM42_MotorFlushReceive(const EMM42_MotorHandle_t *motor)
+{
+    uint8_t byte;
+    uint8_t guard;
+    HAL_StatusTypeDef status;
+
+    if ((motor == NULL) || (motor->huart == NULL))
+    {
+        return EMM42_MOTOR_STATUS_INVALID_PARAM;
+    }
+
+    for (guard = 0U; guard < 64U; guard++)
+    {
+        status = HAL_UART_Receive(motor->huart, &byte, 1U, 0U);
+        if (status == HAL_OK)
+        {
+            continue;
+        }
+        if ((status == HAL_TIMEOUT) || (status == HAL_BUSY))
+        {
+            return EMM42_MOTOR_STATUS_OK;
+        }
+        return EMM42_MOTOR_STATUS_ERROR;
+    }
+
+    return EMM42_MOTOR_STATUS_OK;
+}
+
+/**
+ * @brief 重置 Emm42 到位回包解析器。
+ * @param parser 解析器状态，不能为空。
+ */
+void EMM42_MotorReachedAckParserReset(EMM42_MotorReachedAckParser_t *parser)
+{
+    if (parser == NULL)
+    {
+        return;
+    }
+
+    parser->window[0] = 0U;
+    parser->window[1] = 0U;
+    parser->window[2] = 0U;
+    parser->window[3] = 0U;
+    parser->filled = 0U;
+}
+
+/**
+ * @brief 非阻塞轮询一次 Emm42 到位回包。
+ * @param motor 电机句柄指针，不能为空。
+ * @param parser 到位回包解析器，不能为空。
+ * @param reached_flag 输出标志，1 表示已经识别到到位回包。
+ * @return EMM42_MotorStatus_t 轮询结果。
+ *
+ * 每次最多读取 16 个已到达字节，防止串口噪声导致本任务占用过久。
+ */
+EMM42_MotorStatus_t EMM42_MotorPollReachedAck(const EMM42_MotorHandle_t *motor,
+                                              EMM42_MotorReachedAckParser_t *parser,
+                                              uint8_t *reached_flag)
+{
+    uint8_t byte;
+    uint8_t guard;
+    HAL_StatusTypeDef status;
+
+    if ((motor == NULL) || (motor->huart == NULL) || (parser == NULL) || (reached_flag == NULL))
+    {
+        return EMM42_MOTOR_STATUS_INVALID_PARAM;
+    }
+
+    *reached_flag = 0U;
+    for (guard = 0U; guard < 16U; guard++)
+    {
+        status = HAL_UART_Receive(motor->huart, &byte, 1U, 0U);
+        if (status == HAL_OK)
+        {
+            EMM42_MotorReachedAckParserPush(parser, byte);
+            if (EMM42_MotorReachedAckParserMatched(motor, parser) != 0U)
+            {
+                *reached_flag = 1U;
+                return EMM42_MOTOR_STATUS_OK;
+            }
+            continue;
+        }
+
+        if ((status == HAL_TIMEOUT) || (status == HAL_BUSY))
+        {
+            return EMM42_MOTOR_STATUS_OK;
+        }
+
+        return EMM42_MOTOR_STATUS_ERROR;
+    }
+
+    return EMM42_MOTOR_STATUS_OK;
+}
+
+/**
+ * @brief 根据步数和转速估算等待到位回包的超时时间。
+ * @param pulse_count 相对移动步数，单位 step。
+ * @param velocity_rpm 位置运动速度，单位 RPM。
+ * @return uint32_t 建议超时时间，单位 ms。
+ */
+uint32_t EMM42_MotorEstimateReachedTimeoutMs(uint32_t pulse_count, uint16_t velocity_rpm)
+{
+    uint64_t numerator;
+    uint64_t denominator;
+    uint64_t estimate_ms;
+
+    if ((pulse_count == 0U) || (velocity_rpm == 0U))
+    {
+        return EMM42_MOTOR_REACHED_MIN_TIMEOUT_MS;
+    }
+
+    numerator = ((uint64_t)pulse_count) * 60000ULL;
+    denominator = ((uint64_t)EMM42_MOTOR_TIMEOUT_ESTIMATE_STEPS_PER_REV) * ((uint64_t)velocity_rpm);
+    estimate_ms = (numerator / denominator) + (uint64_t)EMM42_MOTOR_REACHED_TIMEOUT_MARGIN_MS;
+
+    if (estimate_ms < (uint64_t)EMM42_MOTOR_REACHED_MIN_TIMEOUT_MS)
+    {
+        estimate_ms = (uint64_t)EMM42_MOTOR_REACHED_MIN_TIMEOUT_MS;
+    }
+    if (estimate_ms > (uint64_t)EMM42_MOTOR_REACHED_MAX_TIMEOUT_MS)
+    {
+        estimate_ms = (uint64_t)EMM42_MOTOR_REACHED_MAX_TIMEOUT_MS;
+    }
+
+    return (uint32_t)estimate_ms;
 }
 
 /**

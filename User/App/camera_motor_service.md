@@ -4,7 +4,7 @@
 |---|---|
 | 模块位置 | `User/App/camera_motor_service.c`、`User/App/camera_motor_service.h` |
 | 模块用途 | 在 F407 上独占 `USART6 PC6/PC7`，串行控制摄像头左右轴和上下轴两台张大头 Emm42 步进电机。 |
-| 当前阶段 | `CAMLAT LEFT/RIGHT` 负责左右轴文本调试，`CAMZ UP/DOWN` 负责上下轴文本调试；MP157 通过 `STEPPER_PARAM_SET 0x42` 下发两台摄像头电机运行时地址、最小步长、常规速度和方向；`ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME` 分别支持位置微调、停止、持续速度模式和当前位置设零。 |
+| 当前阶段 | `CAMLAT LEFT/RIGHT` 负责左右轴文本调试，`CAMZ UP/DOWN` 负责上下轴文本调试；MP157 通过 `STEPPER_PARAM_SET 0x42` 下发两台摄像头电机运行时地址、最小步长、常规速度和方向；`ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME` 分别支持位置微调、停止、持续速度模式和当前位置设零；二进制位置运动会在张大头 Emm42 返回 `[addr FD 9F 6B]` 后上报 `EVENT_REPORT event=0x14`，超时上报 `event=0x15`。 |
 
 ## 本次修改文件
 
@@ -14,6 +14,8 @@
 | `User/App/camera_motor_service.h` | 对外声明左右轴点动、位置移动和设零接口，同时注明旧前进/后退接口只是兼容别名。 | 二进制协议层可以用新接口表达真实机构含义，旧调用点不会立刻编译失败。 |
 | `User/App/binary_protocol_service.c/.h` | 把 `role_id=2`、`actuator=1` 的注释和分发目标改为摄像头左右轴，编号不变。 | MP157/F4 二进制协议保持兼容，只改变业务语义。 |
 | `User/Driver/emm42_motor.c/.h` | 同步通用驱动注释中的摄像头左右轴地址 `0x03`、上下轴地址 `0x02`。 | 避免现场按旧地址文档接线或排查。 |
+| `User/App/camera_motor_service.c/.h` | 新增 `CameraMotorService_RequestLateralPositionWithReport()` 和 `CameraMotorService_RequestZPositionWithReport()`，并在任务循环中轮询 Emm42 到位回包。 | MP157 不再把 ACK 当成 Z 轴下降/回升完成，必须等 `ACTUATOR_MOVE_DONE` 后才复查 ROI 或启动机械臂。 |
+| `User/Driver/emm42_motor.c/.h` | 新增到位回包非阻塞解析器，识别 `[addr FD 9F 6B]`。 | 张大头 Response 必须配置为 `Reached` 或 `Both`，否则 F4 会等待超时并上报 `ACTUATOR_MOVE_TIMEOUT`。 |
 
 ## 硬件资源
 
@@ -30,8 +32,10 @@
 |---|---|---|
 | `CameraMotorService_RequestLateralJog(right_flag, speed_rpm)` | 请求左右轴持续点动，`right_flag=1` 右移，`0` 左移。 | `speed_rpm=0` 时使用当前运行时常规速度，最大 `5000 rpm`。 |
 | `CameraMotorService_RequestLateralPosition(right_flag, speed_rpm, pulse_count)` | 请求左右轴按相对位置模式移动固定步数。 | `pulse_count>0`；`speed_rpm=0` 时使用运行时常规速度。 |
+| `CameraMotorService_RequestLateralPositionWithReport(right_flag, speed_rpm, pulse_count, cycle_id, related_seq, actuator, direction)` | 请求左右轴位置运动，并把真实到位或超时事件回报 MP157。 | `related_seq` 必须来自原始 `ACTUATOR_POS_MOVE`，MP157 用它匹配事件。 |
 | `CameraMotorService_RequestLateralSetCurrentPositionZero()` | 请求左右轴停止后把当前位置设为零点。 | 供 `ACTUATOR_HOME actuator=1` 使用，不主动寻找限位。 |
 | `CameraMotorService_RequestZPosition(up_flag, speed_rpm, pulse_count)` | 请求上下轴固定步数下降或上升。 | 首页自动流程下降后检测，检测结束后回升。 |
+| `CameraMotorService_RequestZPositionWithReport(up_flag, speed_rpm, pulse_count, cycle_id, related_seq, actuator, direction)` | 请求上下轴位置运动，并把真实到位或超时事件回报 MP157。 | 首页自动流程必须等该事件；本地定时器只作为超时保护。 |
 | `CameraMotorService_RequestStopAll()` | 请求两个摄像头轴立即停止。 | STOP 队首优先，并递增 `stop_epoch` 丢弃旧运动命令。 |
 | `CameraMotorService_RequestRuntimeConfig(...)` | 更新左右轴和上下轴运行时地址、最小步长、常规速度和方向。 | 地址 `1~247` 且两轴不同；步长 `1~10000`；速度 `0~5000 rpm`；方向只能 `1/-1`。 |
 | `CameraMotorService_RequestForward...()` | 旧接口兼容包装。 | 只映射到左右轴；新代码不要再用它表达业务含义。 |
@@ -51,6 +55,7 @@
 | MP157 下发参数 | MP157 Qt 参数页 | `参数设置 -> 步进参数 -> 保存并下发` | F4 返回 `ACK acked_cmd=0x42 status=0`；随后 `CAMINFO` 可看到左右轴地址、步长、速度、方向变化。 | 若返回 `NACK error_code=5`，检查字段范围；若 `error_code=10`，检查摄像头电机任务队列是否已创建或队列是否已满。 |
 | MP157 左右轴持续运动 | MP157 Qt 手动三轴弹窗 | 切到 `摄像头左右电机`，点击 `左移` 或 `右移`，再点击停止。 | F4 先返回 `ACK acked_cmd=0x52 status=0`；停止时返回 `ACK acked_cmd=0x51 status=0`，左右轴停止。 | 若点击一次只动一下，确认 MP157 发的是 `ACTUATOR_VEL_MOVE`；若 STOP 后又动，确认已烧录包含 `stop_epoch` 的固件。 |
 | 自动 ROI 微调 | MP157 首页自动流程 | Z 轴下降并对焦等待后，ROI 复查 `errorY` 用传送带短步微调，`errorX` 用 `ACTUATOR_POS_MOVE actuator=1` 左右微调。 | X/Y 都进入死区后进入模型检测，检测完成后 Z 轴回升。 | 若现场仍按旧前后语义动作，检查 F4 是否还是旧固件、MP157 是否部署新 Qt 二进制。 |
+| Z 轴到位事件 | MP157 首页自动流程或二进制串口工具 | 发送 `ACTUATOR_POS_MOVE actuator=2 direction=0/1 steps>0`。 | F4 先返回 ACK；上下轴真实到位后返回 `EVENT_REPORT event=0x14 related_seq=<本次SEQ>`；若超时返回 `event=0x15`。 | 若只有 ACK 没 DONE，检查张大头 Response 是否为 `Reached/Both`、USART6 RX 是否接好、上下轴地址是否为 `0x02`、电源和共地。 |
 
 ## 读写验证
 
@@ -58,7 +63,7 @@
 |---|---|---|---|
 | USART1 文本到摄像头任务 | 发送 `CAMLAT LEFT 137`、`CAMLAT RIGHT 137` 或 `CAMZ UP 137`。 | 观察对应轴动作，再发送 `CAMSTOP`。 | 只有目标轴动作，说明文本分发和 `USART6` 地址区分正常。 |
 | MP157 二进制参数到摄像头任务 | 发送 `STEPPER_PARAM_SET 0x42`，role 2/3 分别填写摄像头左右和上下轴参数。 | F4 回 ACK 后发送 `CAMINFO`。 | `CAMINFO` 中 role 2/3 对应地址、速度、步长、方向与 MP157 参数页一致。 |
-| MP157 二进制运动到摄像头任务 | 发送 `ACTUATOR_VEL_MOVE actuator=1`、`ACTUATOR_POS_MOVE actuator=1/2` 或 `ACTUATOR_STOP actuator=1/2/0xFF`。 | 观察目标轴动作或停机，再查 ACK 详情。 | ACK `status=0` 且只有目标轴动作，说明协议层、队列和 `USART6` 地址区分正常。 |
+| MP157 二进制运动到摄像头任务 | 发送 `ACTUATOR_VEL_MOVE actuator=1`、`ACTUATOR_POS_MOVE actuator=1/2` 或 `ACTUATOR_STOP actuator=1/2/0xFF`。 | 观察目标轴动作或停机；位置命令除 ACK 外，还要等待 `EVENT_REPORT event=0x14/0x15`。 | ACK `status=0` 且只有目标轴动作，DONE 事件 `related_seq` 匹配原始命令，说明协议层、队列、`USART6` 地址区分和 Emm42 Response 正常。 |
 | STOP 后旧运动命令丢弃 | 快速连续发送 `ACTUATOR_VEL_MOVE actuator=1` 和 `ACTUATOR_STOP actuator=1`。 | 左右轴停止，USART1 日志至少出现 `Stop applied`；若 STOP 插队时旧运动命令还在队列中，应出现 `Drop stale motion after STOP`。 | 若停止后又继续动，检查 `CameraMotorService_PostCommand()` 是否给 STOP 递增 `stop_epoch`。 |
 
 ## 修改记录
@@ -70,3 +75,4 @@
 | 2026-07-04 | 现场默认地址为左右轴 `0x03`、上下轴 `0x02`；摄像头任务队列改为长度 4 的 FIFO，STOP 队首优先。 |
 | 2026-07-04 | 原前进/后退轴业务语义改为左右轴；新增 `CAMLAT LEFT/RIGHT` 主调试命令，`CAMFWD FORWARD/BACKWARD` 仅作为兼容别名。 |
 | 2026-07-04 | 自动检测流程调整为：传送带负责前后/Y 方向微调，左右轴负责 X 方向微调。 |
+| 2026-07-05 | 新增位置运动真实到位事件链：左右轴/Z 轴位置命令成功发送后，任务轮询 `[addr FD 9F 6B]`，到位上报 `EVENT_REPORT event=0x14`，超时上报 `event=0x15`；ACK 不再被当成运动完成。 |

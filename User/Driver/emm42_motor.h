@@ -23,7 +23,8 @@ typedef enum
     EMM42_MOTOR_STATUS_OK = 0,       /* 命令帧已经成功交给 HAL UART 发送，不代表电机运动一定已完成。 */
     EMM42_MOTOR_STATUS_ERROR,        /* UART 发送或底层 HAL 调用失败，调用者应输出阶段信息便于排查。 */
     EMM42_MOTOR_STATUS_INVALID_PARAM,/* 句柄、串口指针或模式参数非法，驱动不会发送任何字节。 */
-    EMM42_MOTOR_STATUS_RANGE_ERROR   /* 速度、加速度等数值超出协议允许范围，驱动拒绝组帧发送。 */
+    EMM42_MOTOR_STATUS_RANGE_ERROR,  /* 速度、加速度等数值超出协议允许范围，驱动拒绝组帧发送。 */
+    EMM42_MOTOR_STATUS_TIMEOUT       /* 等待电机驱动器到位回包超时，常见原因是 Response 未配置为 Reached/Both 或 RX 接线异常。 */
 } EMM42_MotorStatus_t;
 
 /**
@@ -78,6 +79,19 @@ typedef struct
 } EMM42_MotorHandle_t;
 
 /**
+ * @brief Emm42 到位回包解析器状态。
+ *
+ * 张大头 Emm42 位置模式在 Response=Reached 或 Both 时，到位后会回：
+ * `[addr][0xFD][0x9F][0x6B]`。
+ * 解析器用 4 字节滑动窗口识别这组字节，允许串口中夹杂“命令接收成功”等其它回包。
+ */
+typedef struct
+{
+    uint8_t window[4];           /* 最近收到的 4 个字节，按接收先后滑动更新。 */
+    uint8_t filled;              /* 当前窗口中已经填入的有效字节数量，最大为 4。 */
+} EMM42_MotorReachedAckParser_t;
+
+/**
  * @brief 默认电机地址。
  *
  * 张大头例程默认按地址 1 演示，因此驱动默认值仍保留为 1。
@@ -104,6 +118,39 @@ typedef struct
  * 电机命令帧很短，20ms 对 115200 波特率已经足够保守。
  */
 #define EMM42_MOTOR_DEFAULT_TX_TIMEOUT_MS      (20U)
+
+/**
+ * @brief Emm42 位置模式到位回包固定长度，单位字节。
+ */
+#define EMM42_MOTOR_REACHED_ACK_LENGTH         (4U)
+
+/**
+ * @brief Emm42 位置模式到位回包中的状态字节。
+ */
+#define EMM42_MOTOR_REACHED_ACK_STATUS         (0x9FU)
+
+/**
+ * @brief 估算位置运动超时所使用的默认每圈步数。
+ *
+ * 该值用于保护等待到位回包的最长时间，不用于实际运动控制。
+ * 如果现场驱动器细分和这里不一致，超时会偏保守，不会改变已发送给驱动器的步数。
+ */
+#define EMM42_MOTOR_TIMEOUT_ESTIMATE_STEPS_PER_REV (200U)
+
+/**
+ * @brief 位置运动到位等待的最小超时时间，单位 ms。
+ */
+#define EMM42_MOTOR_REACHED_MIN_TIMEOUT_MS     (1500U)
+
+/**
+ * @brief 位置运动到位等待的最大超时时间，单位 ms。
+ */
+#define EMM42_MOTOR_REACHED_MAX_TIMEOUT_MS     (60000U)
+
+/**
+ * @brief 位置运动估算时间之外的安全余量，单位 ms。
+ */
+#define EMM42_MOTOR_REACHED_TIMEOUT_MARGIN_MS  (5000U)
 
 /**
  * @brief 加载 Emm42 驱动默认配置。
@@ -206,6 +253,45 @@ EMM42_MotorStatus_t EMM42_MotorMoveRelativePosition(const EMM42_MotorHandle_t *m
                                                     uint8_t acceleration,
                                                     uint32_t pulse_count,
                                                     bool sync_flag);
+
+/**
+ * @brief 清空电机 UART 接收缓存中的旧字节。
+ * @param motor 电机句柄指针，不能为空。
+ * @return EMM42_MotorStatus_t 清空结果。
+ *
+ * 该函数用于发送位置命令前丢弃旧 ACK，避免上一条命令的残留回包被误当成本次到位。
+ * 它只读取当前已经到达 UART 的字节，不会等待新的数据。
+ */
+EMM42_MotorStatus_t EMM42_MotorFlushReceive(const EMM42_MotorHandle_t *motor);
+
+/**
+ * @brief 重置 Emm42 到位回包解析器。
+ * @param parser 解析器状态，不能为空。
+ *
+ * 每次发送新的位置模式命令前都应重置解析器，确保后续 `Poll` 只匹配本次运动的回包。
+ */
+void EMM42_MotorReachedAckParserReset(EMM42_MotorReachedAckParser_t *parser);
+
+/**
+ * @brief 非阻塞轮询一次 Emm42 到位回包。
+ * @param motor 电机句柄指针，不能为空。
+ * @param parser 到位回包解析器，不能为空。
+ * @param reached_flag 输出标志，1 表示本轮识别到 `[addr FD 9F 6B]`，0 表示尚未到位。
+ * @return EMM42_MotorStatus_t 轮询结果。
+ *
+ * 该函数不会长时间阻塞电机任务。上层任务应周期调用它，同时继续处理 STOP 等安全命令。
+ */
+EMM42_MotorStatus_t EMM42_MotorPollReachedAck(const EMM42_MotorHandle_t *motor,
+                                              EMM42_MotorReachedAckParser_t *parser,
+                                              uint8_t *reached_flag);
+
+/**
+ * @brief 根据步数和转速估算等待到位回包的超时时间。
+ * @param pulse_count 相对移动步数，单位 step。
+ * @param velocity_rpm 位置运动速度，单位 RPM；0 会按最小超时处理。
+ * @return uint32_t 建议超时时间，单位 ms。
+ */
+uint32_t EMM42_MotorEstimateReachedTimeoutMs(uint32_t pulse_count, uint16_t velocity_rpm);
 
 /**
  * @brief 将电机当前位置清零。

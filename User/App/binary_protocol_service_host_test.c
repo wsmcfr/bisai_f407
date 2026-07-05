@@ -265,19 +265,22 @@ static void test_decode_stepper_param_payload(void)
     payload[5] = 1U;
     write_u16_le(&payload[6], 20U);
     write_u16_le(&payload[8], 300U);
-    payload[10] = 1U;
+    write_u16_le(&payload[10], 40U);
+    payload[12] = 1U;
 
-    payload[11] = 2U;
-    payload[12] = 3U;
-    write_u16_le(&payload[13], 5U);
-    write_u16_le(&payload[15], 137U);
-    payload[17] = 1U;
+    payload[13] = 2U;
+    payload[14] = 3U;
+    write_u16_le(&payload[15], 5U);
+    write_u16_le(&payload[17], 137U);
+    write_u16_le(&payload[19], 0U);
+    payload[21] = 1U;
 
-    payload[18] = 3U;
-    payload[19] = 2U;
-    write_u16_le(&payload[20], 5U);
-    write_u16_le(&payload[22], 5000U);
-    payload[24] = 0xFFU;
+    payload[22] = 3U;
+    payload[23] = 2U;
+    write_u16_le(&payload[24], 5U);
+    write_u16_le(&payload[26], 5000U);
+    write_u16_le(&payload[28], 0U);
+    payload[30] = 0xFFU;
 
     ok = BinaryProtocolService_DecodeStepperParam(payload, (uint8_t)sizeof(payload), &stepper_param);
 
@@ -285,10 +288,13 @@ static void test_decode_stepper_param_payload(void)
     expect_u16("decode_stepper_param_cycle", stepper_param.cycle_id, 0x0000U);
     expect_int("decode_stepper_param_count", (int)stepper_param.motor_count, 3);
     expect_int("decode_stepper_param_role0", (int)stepper_param.motors[0].role_id, 1);
+    expect_u16("decode_stepper_param_scan0", stepper_param.motors[0].scan_speed_rpm, 40U);
     expect_int("decode_stepper_param_lateral_addr", (int)stepper_param.motors[1].address, 3);
     expect_u16("decode_stepper_param_speed1", stepper_param.motors[1].normal_speed_rpm, 137U);
+    expect_u16("decode_stepper_param_scan1", stepper_param.motors[1].scan_speed_rpm, 0U);
     expect_int("decode_stepper_param_z_addr", (int)stepper_param.motors[2].address, 2);
     expect_u16("decode_stepper_param_speed2", stepper_param.motors[2].normal_speed_rpm, 5000U);
+    expect_u16("decode_stepper_param_scan2", stepper_param.motors[2].scan_speed_rpm, 0U);
     expect_int("decode_stepper_param_direction2", (int)stepper_param.motors[2].direction, -1);
 }
 
@@ -340,6 +346,207 @@ static void test_decode_weight_calibration_rejects_wrong_length(void)
 }
 
 /**
+ * @brief 验证 MODEL_READY 使用独立命令号和固定 12 字节负载。
+ *
+ * 返回值：
+ *   无返回值；失败时记录断言失败。
+ */
+static void test_decode_model_ready_payload(void)
+{
+    uint8_t payload[BINARY_PROTOCOL_MODEL_READY_PAYLOAD_LENGTH];
+    BinaryProtocol_ModelReadyPayload_t model_ready;
+    uint8_t ok;
+
+    (void)memset(payload, 0, sizeof(payload));
+    write_u16_le(&payload[0], 0x0055U);
+    payload[2] = 1U;
+    payload[3] = 2U;
+    payload[4] = 3U;
+    payload[5] = 87U;
+    write_u16_le(&payload[6], 12U);
+    write_u16_le(&payload[8], 346U);
+    write_u16_le(&payload[10], 0x0007U);
+
+    ok = BinaryProtocolService_DecodeModelReady(payload,
+                                                (uint8_t)sizeof(payload),
+                                                &model_ready);
+
+    expect_int("model_ready_command_is_0x32",
+               (int)BINARY_PROTOCOL_CMD_MODEL_READY,
+               0x32);
+    expect_int("model_ready_not_weight_calibrate",
+               (int)(BINARY_PROTOCOL_CMD_MODEL_READY == BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE),
+               0);
+    expect_int("decode_model_ready_ok", (int)ok, 1);
+    expect_u16("decode_model_ready_cycle", model_ready.cycle_id, 0x0055U);
+    expect_int("decode_model_ready_result", (int)model_ready.model_result, 1);
+    expect_int("decode_model_ready_part_type", (int)model_ready.part_type, 2);
+    expect_int("decode_model_ready_defect_type", (int)model_ready.defect_type, 3);
+    expect_int("decode_model_ready_confidence", (int)model_ready.top1_confidence, 87);
+    expect_u16("decode_model_ready_image_seq", model_ready.image_seq, 12U);
+    expect_u16("decode_model_ready_model_ms", model_ready.model_ms, 346U);
+    expect_u16("decode_model_ready_options", model_ready.option_bits, 0x0007U);
+}
+
+/**
+ * @brief 验证 ARM_JOB_START 负载能正确解出任务和最终分拣提示。
+ *
+ * 返回值：
+ *   无返回值；失败时记录断言失败。
+ */
+static void test_decode_arm_job_start_payload(void)
+{
+    uint8_t payload[BINARY_PROTOCOL_ARM_JOB_START_PAYLOAD_LENGTH];
+    BinaryProtocol_ArmJobStartPayload_t arm_job;
+    uint8_t ok;
+
+    (void)memset(payload, 0, sizeof(payload));
+    write_u16_le(&payload[0], 0x0055U);
+    write_u16_le(&payload[2], 0x0102U);
+    payload[4] = 0U;
+    payload[5] = 2U;
+    payload[6] = 3U;
+    write_u16_le(&payload[7], 0x0007U);
+
+    ok = BinaryProtocolService_DecodeArmJobStart(payload,
+                                                 (uint8_t)sizeof(payload),
+                                                 &arm_job);
+
+    expect_int("decode_arm_job_ok", (int)ok, 1);
+    expect_u16("decode_arm_job_cycle", arm_job.cycle_id, 0x0055U);
+    expect_u16("decode_arm_job_id", arm_job.job_id, 0x0102U);
+    expect_int("decode_arm_job_profile", (int)arm_job.job_profile, 0);
+    expect_int("decode_arm_job_part_type", (int)arm_job.part_type, 2);
+    expect_int("decode_arm_job_final_bin", (int)arm_job.final_bin_hint, 3);
+    expect_u16("decode_arm_job_options", arm_job.option_bits, 0x0007U);
+}
+
+/**
+ * @brief 验证 WEIGHT_RESULT 上报负载长度和关键字段布局稳定。
+ *
+ * 返回值：
+ *   无返回值；失败时记录断言失败。
+ */
+static void test_decode_weight_result_payload(void)
+{
+    uint8_t payload[BINARY_PROTOCOL_WEIGHT_RESULT_PAYLOAD_LENGTH];
+    BinaryProtocol_WeightResultPayload_t weight_result;
+    uint8_t ok;
+
+    (void)memset(payload, 0, sizeof(payload));
+    write_u16_le(&payload[0], 0x0055U);
+    write_u16_le(&payload[2], 0x0009U);
+    payload[4] = 1U;
+    payload[5] = 1U;
+    payload[6] = 0x78U;
+    payload[7] = 0x56U;
+    payload[8] = 0x34U;
+    payload[9] = 0x12U;
+    payload[10] = 0x10U;
+    payload[11] = 0x27U;
+    payload[12] = 0x00U;
+    payload[13] = 0x00U;
+    payload[14] = 0x33U;
+    payload[15] = 0x22U;
+    payload[16] = 0x11U;
+    payload[17] = 0x00U;
+    write_u16_le(&payload[18], 10U);
+    write_u16_le(&payload[20], 200U);
+    write_u16_le(&payload[22], 1500U);
+    payload[24] = 0x44U;
+    payload[25] = 0x33U;
+    payload[26] = 0x22U;
+    payload[27] = 0x11U;
+
+    ok = BinaryProtocolService_DecodeWeightResult(payload,
+                                                  (uint8_t)sizeof(payload),
+                                                  &weight_result);
+
+    expect_int("decode_weight_result_ok", (int)ok, 1);
+    expect_u16("decode_weight_result_cycle", weight_result.cycle_id, 0x0055U);
+    expect_u16("decode_weight_result_sample", weight_result.sample_id, 9U);
+    expect_int("decode_weight_result_stable", (int)weight_result.stable, 1);
+    expect_int("decode_weight_result_decision", (int)weight_result.decision, 1);
+    expect_int("decode_weight_result_gross", (int)weight_result.gross_weight_mg, 0x12345678);
+    expect_int("decode_weight_result_net", (int)weight_result.net_weight_mg, 10000);
+    expect_int("decode_weight_result_raw", (int)weight_result.raw_adc, 0x00112233);
+    expect_u16("decode_weight_result_count", weight_result.sample_count, 10U);
+    expect_u16("decode_weight_result_window", weight_result.stable_window_mg, 200U);
+    expect_u16("decode_weight_result_duration", weight_result.duration_ms, 1500U);
+}
+
+/**
+ * @brief 验证 FINAL_SORT_RESULT 是 MP157 上传完成后独立下发的最终分拣命令。
+ *
+ * 返回值：
+ *   无返回值；失败时记录断言失败。
+ */
+static void test_decode_final_sort_result_payload(void)
+{
+    uint8_t payload[BINARY_PROTOCOL_FINAL_SORT_RESULT_PAYLOAD_LENGTH];
+    BinaryProtocol_FinalSortResultPayload_t final_sort;
+    uint8_t ok;
+
+    (void)memset(payload, 0, sizeof(payload));
+    write_u16_le(&payload[0], 0x0055U);
+    write_u16_le(&payload[2], 0x0102U);
+    payload[4] = 2U;
+    payload[5] = 2U;
+    payload[6] = 1U;
+    payload[7] = 91U;
+    write_u16_le(&payload[8], 0x0007U);
+
+    ok = BinaryProtocolService_DecodeFinalSortResult(payload,
+                                                     (uint8_t)sizeof(payload),
+                                                     &final_sort);
+
+    expect_int("final_sort_command_is_0x33",
+               (int)BINARY_PROTOCOL_CMD_FINAL_SORT_RESULT,
+               0x33);
+    expect_int("decode_final_sort_ok", (int)ok, 1);
+    expect_u16("decode_final_sort_cycle", final_sort.cycle_id, 0x0055U);
+    expect_u16("decode_final_sort_job", final_sort.job_id, 0x0102U);
+    expect_int("decode_final_sort_result", (int)final_sort.final_result, 2);
+    expect_int("decode_final_sort_bin", (int)final_sort.final_bin, 2);
+    expect_int("decode_final_sort_upload", (int)final_sort.upload_status, 1);
+    expect_int("decode_final_sort_confidence", (int)final_sort.final_confidence, 91);
+    expect_u16("decode_final_sort_options", final_sort.option_bits, 0x0007U);
+}
+
+/**
+ * @brief 验证 EVENT_REPORT 执行器运动完成事件的编号和字段布局稳定。
+ *
+ * 返回值：
+ *   无返回值；失败时记录断言失败。
+ */
+static void test_event_report_actuator_move_contract(void)
+{
+    uint8_t payload[BINARY_PROTOCOL_EVENT_REPORT_PAYLOAD_LENGTH];
+
+    (void)memset(payload, 0, sizeof(payload));
+    write_u16_le(&payload[0], 0x0055U);
+    payload[2] = BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE;
+    payload[3] = 3U;
+    payload[4] = 2U;
+    payload[5] = BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR;
+    payload[6] = 0x00U;
+    payload[7] = 0x00U;
+    payload[8] = 0x01U;
+    payload[9] = 0x02U;
+    write_u16_le(&payload[10], 0x1234U);
+    write_u16_le(&payload[12], 0x0000U);
+    write_u16_le(&payload[14], 0x0000U);
+
+    expect_int("event_report_length", (int)BINARY_PROTOCOL_EVENT_REPORT_PAYLOAD_LENGTH, 16);
+    expect_int("event_actuator_move_done", (int)BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE, 0x14);
+    expect_int("event_actuator_move_timeout", (int)BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT, 0x15);
+    expect_int("event_report_payload_code", (int)payload[2], (int)BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE);
+    expect_u16("event_report_related_seq",
+               (uint16_t)(payload[10] | ((uint16_t)payload[11] << 8)),
+               0x1234U);
+}
+
+/**
  * @brief 主机回归测试入口。
  * @return int 0 表示所有协议解码测试通过，1 表示至少一项失败。
  *
@@ -358,6 +565,11 @@ int main(void)
     test_decode_stepper_param_payload();
     test_decode_weight_calibration_payload();
     test_decode_weight_calibration_rejects_wrong_length();
+    test_decode_model_ready_payload();
+    test_decode_arm_job_start_payload();
+    test_decode_weight_result_payload();
+    test_decode_final_sort_result_payload();
+    test_event_report_actuator_move_contract();
 
     if (g_failed_count != 0)
     {

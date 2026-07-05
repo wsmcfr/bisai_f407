@@ -56,6 +56,47 @@ uint8_t RobotArmService_IsProtocolFrame(const uint8_t *frame_buffer, uint16_t fr
 uint8_t RobotArmService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_length);
 
 /**
+ * @brief 请求 ESP32S3 机械臂把 ROI 中的零件抓取并放到称重模块。
+ * @param cycle_id 当前 MP157-F4 自动检测流程号。
+ * @param job_id MP157 分配的机械臂任务号。
+ * @param part_type 零件类型，未知填 0。
+ * @param model_result MP157 模型结果，0=未知，1=良品，2=不良品，3=待复核。
+ * @return uint8_t 1 表示指令已进入机械臂发送队列，0 表示队列或参数异常。
+ */
+uint8_t RobotArmService_RequestPlaceWeight(uint16_t cycle_id,
+                                           uint16_t job_id,
+                                           uint8_t part_type,
+                                           uint8_t model_result);
+
+/**
+ * @brief 请求 ESP32S3 机械臂把零件从称重模块搬到电磁感应模块。
+ * @param cycle_id 当前 MP157-F4 自动检测流程号。
+ * @param job_id MP157 分配的机械臂任务号。
+ * @param part_type 零件类型，未知填 0。
+ * @param model_result MP157 模型结果，供 ESP32S3 选择动作细节。
+ * @return uint8_t 1 表示指令已进入机械臂发送队列，0 表示队列或参数异常。
+ */
+uint8_t RobotArmService_RequestPlaceLdc(uint16_t cycle_id,
+                                        uint16_t job_id,
+                                        uint8_t part_type,
+                                        uint8_t model_result);
+
+/**
+ * @brief 请求 ESP32S3 机械臂把零件从电磁感应模块搬到最终分拣区。
+ * @param cycle_id 当前 MP157-F4 自动检测流程号。
+ * @param job_id MP157 分配的机械臂任务号。
+ * @param part_type 零件类型，未知填 0。
+ * @param model_result MP157 模型结果。
+ * @param final_bin 最终分拣目标，1=良品，2=不良品，3=待复核。
+ * @return uint8_t 1 表示指令已进入机械臂发送队列，0 表示队列或参数异常。
+ */
+uint8_t RobotArmService_RequestFinalSort(uint16_t cycle_id,
+                                         uint16_t job_id,
+                                         uint8_t part_type,
+                                         uint8_t model_result,
+                                         uint8_t final_bin);
+
+/**
  * @brief 机械臂服务任务入口，负责把队列中的机械臂协议帧通过 USART3 发送给 ESP32。
  * @param argument FreeRTOS 任务参数，当前未使用。
  *

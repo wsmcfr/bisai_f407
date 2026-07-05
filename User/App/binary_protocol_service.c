@@ -3,12 +3,25 @@
 #ifndef BINARY_PROTOCOL_HOST_TEST
 #include "camera_motor_service.h"
 #include "conveyor_motor_service.h"
+#include "ldc1614_service.h"
+#include "robot_arm_service.h"
 #include "uart_command.h"
 #include "usart.h"
 #include "weight_service.h"
 #endif
 
 #include <string.h>
+
+/*
+ * F4 自动检测新增命令号速查：
+ *   BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE = 0x30U 只用于 HX711 称重标定；
+ *   BINARY_PROTOCOL_CMD_ARM_JOB_START = 0x31U 用于启动 ESP32S3 机械臂称重/电感动作；
+ *   BINARY_PROTOCOL_CMD_MODEL_READY = 0x32U 只用于缓存 MP157 模型和 SD 卡保存结果；
+ *   BINARY_PROTOCOL_CMD_FINAL_SORT_RESULT = 0x33U 用于上传成功或上传失败待复核后的最终分拣。
+ *
+ * 真实枚举仍定义在 binary_protocol_service.h；这里保留显式注释，方便现场静态契约检查
+ * 直接在实现文件中确认 MODEL_READY 没有继续复用 WEIGHT_CALIBRATE 的 0x30 命令号。
+ */
 
 /**
  * @brief `STEPPER_PARAM_SET` 中的电机角色编号：传送带电机。
@@ -94,8 +107,14 @@ typedef struct
     uint16_t tx_sequence;                 /* F4 发送 ACK/NACK/状态帧时使用的本地序号，每发一帧自增。 */
     uint16_t last_rx_sequence;            /* 最近一次成功解析到的 MP157 帧序号，用于状态上报和排查重复帧。 */
     uint16_t fault_bits;                  /* 当前 F4 已知故障位图，会进入 STATUS_REPORT，供 MP157 二进制查询。 */
+    uint16_t arm_job_id;                  /* MP157 下发的机械臂任务号，用于 WEIGHT/LDC/CYCLE_DONE 串联同一件。 */
+    uint16_t model_image_seq;             /* MP157 本地保存图片序号，用于把模型结果和 SD 卡文件对齐。 */
     uint8_t state;                        /* F4 当前协议主状态，首轮使用简化状态：0=IDLE，1=SCANNING，2=TRACKING，3=CENTERED，11=STOPPED。 */
     uint8_t paused_state;                 /* 暂停前的主状态，用于 RESUME_CYCLE 决定是否回扫描或等待新的视觉坐标。 */
+    uint8_t model_result;                 /* MP157 最近一次 MODEL_READY 下发的模型综合结果。 */
+    uint8_t model_part_type;              /* MP157 最近一次 MODEL_READY 下发的零件类型。 */
+    uint8_t model_defect_type;            /* MP157 最近一次 MODEL_READY 下发的缺陷类型。 */
+    uint8_t final_bin_hint;               /* MP157 或 F4 根据模型结果得到的最终分拣目标。 */
 } BinaryProtocol_Runtime_t;
 
 #ifndef BINARY_PROTOCOL_HOST_TEST
@@ -106,6 +125,12 @@ typedef struct
  * 因此该运行时状态只在真实 F4 固件编译时启用，避免主机测试产生无意义 warning。
  */
 static BinaryProtocol_Runtime_t g_binary_protocol_runtime = {
+    0U,
+    0U,
+    0U,
+    0U,
+    0U,
+    0U,
     0U,
     0U,
     0U,
@@ -148,6 +173,7 @@ static uint32_t BinaryProtocolService_ReadU32Le(const uint8_t *data)
            ((uint32_t)data[3] << 24);
 }
 
+#ifndef BINARY_PROTOCOL_HOST_TEST
 /**
  * @brief 按小端序写入一个 i32。
  * @param data 指向输出最低字节地址，不能为空。
@@ -162,6 +188,20 @@ static void BinaryProtocolService_WriteI32Le(uint8_t *data, int32_t value)
     data[2] = (uint8_t)((raw_value >> 16) & 0xFFU);
     data[3] = (uint8_t)((raw_value >> 24) & 0xFFU);
 }
+
+/**
+ * @brief 按小端序写入一个 u32。
+ * @param data 指向输出最低字节地址，不能为空。
+ * @param value 需要写入的无符号 32 位整数。
+ */
+static void BinaryProtocolService_WriteU32Le(uint8_t *data, uint32_t value)
+{
+    data[0] = (uint8_t)(value & 0xFFU);
+    data[1] = (uint8_t)((value >> 8) & 0xFFU);
+    data[2] = (uint8_t)((value >> 16) & 0xFFU);
+    data[3] = (uint8_t)((value >> 24) & 0xFFU);
+}
+#endif
 
 /**
  * @brief 按小端序写入一个 u16。
@@ -600,9 +640,10 @@ uint8_t BinaryProtocolService_DecodeBeltManual(const uint8_t *payload,
  * @param decoded_payload 解码输出对象。
  * @return uint8_t 1 表示解码成功，0 表示长度或参数非法。
  *
- * 负载固定 25 字节：
+ * 负载固定 31 字节：
  * cycle_id:u16、motor_count:u8、flags:u8，
- * 然后三条记录，每条为 role_id:u8、address:u8、min_step:u16、normal_speed_rpm:u16、direction:i8。
+ * 然后三条记录，每条为 role_id:u8、address:u8、min_step:u16、
+ * normal_speed_rpm:u16、scan_speed_rpm:u16、direction:i8。
  */
 uint8_t BinaryProtocolService_DecodeStepperParam(const uint8_t *payload,
                                                  uint8_t payload_length,
@@ -625,12 +666,13 @@ uint8_t BinaryProtocolService_DecodeStepperParam(const uint8_t *payload,
 
     for (index = 0U; index < 3U; ++index)
     {
-        offset = (uint8_t)(4U + (index * 7U));
+        offset = (uint8_t)(4U + (index * 9U));
         decoded_payload->motors[index].role_id = payload[offset];
         decoded_payload->motors[index].address = payload[offset + 1U];
         decoded_payload->motors[index].min_step = BinaryProtocolService_ReadU16Le(&payload[offset + 2U]);
         decoded_payload->motors[index].normal_speed_rpm = BinaryProtocolService_ReadU16Le(&payload[offset + 4U]);
-        decoded_payload->motors[index].direction = (int8_t)payload[offset + 6U];
+        decoded_payload->motors[index].scan_speed_rpm = BinaryProtocolService_ReadU16Le(&payload[offset + 6U]);
+        decoded_payload->motors[index].direction = (int8_t)payload[offset + 8U];
     }
 
     return 1U;
@@ -775,7 +817,152 @@ uint8_t BinaryProtocolService_DecodeWeightCalibration(const uint8_t *payload,
     return 1U;
 }
 
+/**
+ * @brief 解码 MODEL_READY 负载。
+ * @param payload 原始负载。
+ * @param payload_length 原始负载长度。
+ * @param decoded_payload 解码输出对象。
+ * @return uint8_t 1 表示解码成功，0 表示长度或参数非法。
+ *
+ * 负载固定 12 字节：
+ * cycle_id:u16、model_result:u8、part_type:u8、defect_type:u8、top1_confidence:u8、
+ * image_seq:u16、model_ms:u16、option_bits:u16。
+ */
+uint8_t BinaryProtocolService_DecodeModelReady(const uint8_t *payload,
+                                               uint8_t payload_length,
+                                               BinaryProtocol_ModelReadyPayload_t *decoded_payload)
+{
+    if ((payload == NULL) ||
+        (decoded_payload == NULL) ||
+        (payload_length != BINARY_PROTOCOL_MODEL_READY_PAYLOAD_LENGTH))
+    {
+        return 0U;
+    }
+
+    (void)memset(decoded_payload, 0, sizeof(*decoded_payload));
+    decoded_payload->cycle_id = BinaryProtocolService_ReadU16Le(&payload[0]);
+    decoded_payload->model_result = payload[2];
+    decoded_payload->part_type = payload[3];
+    decoded_payload->defect_type = payload[4];
+    decoded_payload->top1_confidence = payload[5];
+    decoded_payload->image_seq = BinaryProtocolService_ReadU16Le(&payload[6]);
+    decoded_payload->model_ms = BinaryProtocolService_ReadU16Le(&payload[8]);
+    decoded_payload->option_bits = BinaryProtocolService_ReadU16Le(&payload[10]);
+    return 1U;
+}
+
+/**
+ * @brief 解码 ARM_JOB_START 负载。
+ * @param payload 原始负载。
+ * @param payload_length 原始负载长度。
+ * @param decoded_payload 解码输出对象。
+ * @return uint8_t 1 表示解码成功，0 表示长度或参数非法。
+ *
+ * 负载固定 9 字节：
+ * cycle_id:u16、job_id:u16、job_profile:u8、part_type:u8、final_bin_hint:u8、option_bits:u16。
+ */
+uint8_t BinaryProtocolService_DecodeArmJobStart(const uint8_t *payload,
+                                                uint8_t payload_length,
+                                                BinaryProtocol_ArmJobStartPayload_t *decoded_payload)
+{
+    if ((payload == NULL) ||
+        (decoded_payload == NULL) ||
+        (payload_length != BINARY_PROTOCOL_ARM_JOB_START_PAYLOAD_LENGTH))
+    {
+        return 0U;
+    }
+
+    (void)memset(decoded_payload, 0, sizeof(*decoded_payload));
+    decoded_payload->cycle_id = BinaryProtocolService_ReadU16Le(&payload[0]);
+    decoded_payload->job_id = BinaryProtocolService_ReadU16Le(&payload[2]);
+    decoded_payload->job_profile = payload[4];
+    decoded_payload->part_type = payload[5];
+    decoded_payload->final_bin_hint = payload[6];
+    decoded_payload->option_bits = BinaryProtocolService_ReadU16Le(&payload[7]);
+    return 1U;
+}
+
+/**
+ * @brief 解码 FINAL_SORT_RESULT 负载。
+ * @param payload 原始负载。
+ * @param payload_length 原始负载长度。
+ * @param decoded_payload 解码输出对象。
+ * @return uint8_t 1 表示解码成功，0 表示长度或参数非法。
+ *
+ * 负载固定 10 字节：
+ * cycle_id:u16、job_id:u16、final_result:u8、final_bin:u8、
+ * upload_status:u8、final_confidence:u8、option_bits:u16。
+ */
+uint8_t BinaryProtocolService_DecodeFinalSortResult(const uint8_t *payload,
+                                                    uint8_t payload_length,
+                                                    BinaryProtocol_FinalSortResultPayload_t *decoded_payload)
+{
+    if ((payload == NULL) ||
+        (decoded_payload == NULL) ||
+        (payload_length != BINARY_PROTOCOL_FINAL_SORT_RESULT_PAYLOAD_LENGTH))
+    {
+        return 0U;
+    }
+
+    (void)memset(decoded_payload, 0, sizeof(*decoded_payload));
+    decoded_payload->cycle_id = BinaryProtocolService_ReadU16Le(&payload[0]);
+    decoded_payload->job_id = BinaryProtocolService_ReadU16Le(&payload[2]);
+    decoded_payload->final_result = payload[4];
+    decoded_payload->final_bin = payload[5];
+    decoded_payload->upload_status = payload[6];
+    decoded_payload->final_confidence = payload[7];
+    decoded_payload->option_bits = BinaryProtocolService_ReadU16Le(&payload[8]);
+    return 1U;
+}
+
+/**
+ * @brief 解码 WEIGHT_RESULT 负载。
+ * @param payload 原始负载。
+ * @param payload_length 原始负载长度。
+ * @param decoded_payload 解码输出对象。
+ * @return uint8_t 1 表示解码成功，0 表示长度或参数非法。
+ *
+ * 该函数主要供主机测试和 MP157 侧对照字段布局使用，F4 正常发送时由
+ * BinaryProtocolService_SendWeightResult() 负责反向编码。
+ */
+uint8_t BinaryProtocolService_DecodeWeightResult(const uint8_t *payload,
+                                                 uint8_t payload_length,
+                                                 BinaryProtocol_WeightResultPayload_t *decoded_payload)
+{
+    if ((payload == NULL) ||
+        (decoded_payload == NULL) ||
+        (payload_length != BINARY_PROTOCOL_WEIGHT_RESULT_PAYLOAD_LENGTH))
+    {
+        return 0U;
+    }
+
+    (void)memset(decoded_payload, 0, sizeof(*decoded_payload));
+    decoded_payload->cycle_id = BinaryProtocolService_ReadU16Le(&payload[0]);
+    decoded_payload->sample_id = BinaryProtocolService_ReadU16Le(&payload[2]);
+    decoded_payload->stable = payload[4];
+    decoded_payload->decision = payload[5];
+    decoded_payload->gross_weight_mg = (int32_t)BinaryProtocolService_ReadU32Le(&payload[6]);
+    decoded_payload->net_weight_mg = (int32_t)BinaryProtocolService_ReadU32Le(&payload[10]);
+    decoded_payload->raw_adc = (int32_t)BinaryProtocolService_ReadU32Le(&payload[14]);
+    decoded_payload->sample_count = BinaryProtocolService_ReadU16Le(&payload[18]);
+    decoded_payload->stable_window_mg = BinaryProtocolService_ReadU16Le(&payload[20]);
+    decoded_payload->duration_ms = BinaryProtocolService_ReadU16Le(&payload[22]);
+    decoded_payload->option_bits = BinaryProtocolService_ReadU32Le(&payload[24]);
+    return 1U;
+}
+
 #ifndef BINARY_PROTOCOL_HOST_TEST
+/**
+ * @brief 判断 cycle_id 是否匹配当前有效流程的内部前置声明。
+ *
+ * ARMCC 5 默认按 C89 规则处理未提前声明的函数：
+ * 如果 `BinaryProtocolService_HandleArmStageDone()` 在函数定义前调用本函数，
+ * 编译器会先生成一个返回 int 的隐式外部声明，后面再看到 `static uint8_t`
+ * 定义时就会报“declaration is incompatible”。这里提前声明真实签名，
+ * 只解决编译顺序问题，不改变任何自动检测流程逻辑。
+ */
+static uint8_t BinaryProtocolService_IsActiveCycle(uint16_t cycle_id);
+
 /**
  * @brief 通过 USART1 发送一帧二进制协议。
  * @param command 命令字。
@@ -904,6 +1091,320 @@ void BinaryProtocolService_ReportFault(uint16_t fault_code,
     BinaryProtocolService_WriteU16Le(&payload[12], related_seq);
     BinaryProtocolService_WriteU16Le(&payload[14], g_binary_protocol_runtime.fault_bits);
     BinaryProtocolService_SendFrame(BINARY_PROTOCOL_CMD_FAULT_REPORT, payload, (uint8_t)sizeof(payload));
+}
+
+/**
+ * @brief 主动发送 EVENT_REPORT。
+ * @param cycle_id 当前流程 ID。
+ * @param event_code 事件编号，例如机械臂阶段已下发或等待传感器。
+ * @param step_code 当前自动流程步骤编号。
+ * @param source 事件来源，建议复用 fault_source 的来源编号。
+ * @param detail_i32 事件细节，例如动作组号、阶段号或底层状态。
+ * @param related_seq 关联的 MP157 命令序号，没有时填 0。
+ *
+ * EVENT_REPORT 用于给 MP157 更新底部流程状态，不代表本轮数据已经收齐。
+ */
+void BinaryProtocolService_SendEventReport(uint16_t cycle_id,
+                                           uint8_t event_code,
+                                           uint8_t step_code,
+                                           uint8_t source,
+                                           int32_t detail_i32,
+                                           uint16_t related_seq)
+{
+    uint8_t payload[BINARY_PROTOCOL_EVENT_REPORT_PAYLOAD_LENGTH];
+
+    BinaryProtocolService_WriteU16Le(&payload[0], cycle_id);
+    payload[2] = event_code;
+    payload[3] = g_binary_protocol_runtime.state;
+    payload[4] = step_code;
+    payload[5] = source;
+    BinaryProtocolService_WriteI32Le(&payload[6], detail_i32);
+    BinaryProtocolService_WriteU16Le(&payload[10], related_seq);
+    BinaryProtocolService_WriteU16Le(&payload[12], g_binary_protocol_runtime.fault_bits);
+    BinaryProtocolService_WriteU16Le(&payload[14], 0U);
+    BinaryProtocolService_SendFrame(BINARY_PROTOCOL_CMD_EVENT_REPORT, payload, (uint8_t)sizeof(payload));
+}
+
+/**
+ * @brief 打包执行器运动事件的 detail_i32 字段。
+ * @param actuator 执行器编号：0=传送带，1=左右轴，2=上下轴。
+ * @param direction 逻辑方向：由 `ACTUATOR_POS_MOVE` 原始 direction 字段传入。
+ * @param status_code 底层状态码，0 表示到位成功，其它值用于超时或驱动错误。
+ * @return int32_t 返回可直接放入 EVENT_REPORT detail_i32 的压缩值。
+ *
+ * 字段布局：
+ * - bit31..24：actuator；
+ * - bit23..16：direction；
+ * - bit15..0 ：status_code。
+ *
+ * 这样 MP157 在只看到 EVENT_REPORT 时，也能判断本事件对应哪根轴、哪个方向和哪种底层状态。
+ */
+int32_t BinaryProtocolService_BuildActuatorMoveDetail(uint8_t actuator,
+                                                      uint8_t direction,
+                                                      uint16_t status_code)
+{
+    uint32_t detail;
+
+    detail = (((uint32_t)actuator) << 24) |
+             (((uint32_t)direction) << 16) |
+             ((uint32_t)status_code);
+    return (int32_t)detail;
+}
+
+/**
+ * @brief 主动发送 WEIGHT_RESULT。
+ * @param result 称重结果负载，不能为空。
+ *
+ * 该函数只负责字段打包和发帧，不主动读取 HX711。
+ * 调用方必须在 ESP32S3 确认“已放到称重模块”之后再读取称重快照并调用本函数。
+ */
+void BinaryProtocolService_SendWeightResult(const BinaryProtocol_WeightResultPayload_t *result)
+{
+    uint8_t payload[BINARY_PROTOCOL_WEIGHT_RESULT_PAYLOAD_LENGTH];
+
+    if (result == NULL)
+    {
+        return;
+    }
+
+    BinaryProtocolService_WriteU16Le(&payload[0], result->cycle_id);
+    BinaryProtocolService_WriteU16Le(&payload[2], result->sample_id);
+    payload[4] = result->stable;
+    payload[5] = result->decision;
+    BinaryProtocolService_WriteI32Le(&payload[6], result->gross_weight_mg);
+    BinaryProtocolService_WriteI32Le(&payload[10], result->net_weight_mg);
+    BinaryProtocolService_WriteI32Le(&payload[14], result->raw_adc);
+    BinaryProtocolService_WriteU16Le(&payload[18], result->sample_count);
+    BinaryProtocolService_WriteU16Le(&payload[20], result->stable_window_mg);
+    BinaryProtocolService_WriteU16Le(&payload[22], result->duration_ms);
+    BinaryProtocolService_WriteU32Le(&payload[24], result->option_bits);
+    BinaryProtocolService_SendFrame(BINARY_PROTOCOL_CMD_WEIGHT_RESULT, payload, (uint8_t)sizeof(payload));
+}
+
+/**
+ * @brief 主动发送 LDC_RESULT。
+ * @param result 电感检测结果负载，不能为空。
+ *
+ * 该函数只负责字段打包和发帧，不主动访问 I2C。
+ * 调用方必须在 ESP32S3 确认“已放到电感模块”之后再读取 LDC 快照并调用本函数。
+ */
+void BinaryProtocolService_SendLdcResult(const BinaryProtocol_LdcResultPayload_t *result)
+{
+    uint8_t payload[BINARY_PROTOCOL_LDC_RESULT_PAYLOAD_LENGTH];
+
+    if (result == NULL)
+    {
+        return;
+    }
+
+    BinaryProtocolService_WriteU16Le(&payload[0], result->cycle_id);
+    BinaryProtocolService_WriteU16Le(&payload[2], result->sample_id);
+    payload[4] = result->channel_mask;
+    payload[5] = result->decision;
+    payload[6] = result->status;
+    payload[7] = result->reserved;
+    BinaryProtocolService_WriteU32Le(&payload[8], result->ch0_raw);
+    BinaryProtocolService_WriteI32Le(&payload[12], result->ch0_delta);
+    BinaryProtocolService_WriteU32Le(&payload[16], result->ch1_raw);
+    BinaryProtocolService_WriteI32Le(&payload[20], result->ch1_delta);
+    BinaryProtocolService_WriteU16Le(&payload[24], result->duration_ms);
+    BinaryProtocolService_WriteU16Le(&payload[26], result->option_bits);
+    BinaryProtocolService_SendFrame(BINARY_PROTOCOL_CMD_LDC_RESULT, payload, (uint8_t)sizeof(payload));
+}
+
+/**
+ * @brief 主动发送 CYCLE_DONE。
+ * @param result 本轮完成结果负载，不能为空。
+ *
+ * MP157 收到 CYCLE_DONE 后，说明模型、称重、电感和机械臂搬运链路已经收齐，
+ * 此时才允许把 SD 卡里的本轮完整记录一次性上传云端。
+ */
+void BinaryProtocolService_SendCycleDone(const BinaryProtocol_CycleDonePayload_t *result)
+{
+    uint8_t payload[BINARY_PROTOCOL_CYCLE_DONE_PAYLOAD_LENGTH];
+
+    if (result == NULL)
+    {
+        return;
+    }
+
+    BinaryProtocolService_WriteU16Le(&payload[0], result->cycle_id);
+    BinaryProtocolService_WriteU16Le(&payload[2], result->job_id);
+    payload[4] = result->final_bin;
+    payload[5] = result->model_result;
+    payload[6] = result->weight_decision;
+    payload[7] = result->ldc_decision;
+    payload[8] = result->f4_state;
+    payload[9] = result->fault_level;
+    BinaryProtocolService_WriteU16Le(&payload[10], result->fault_bits);
+    BinaryProtocolService_WriteU16Le(&payload[12], result->duration_ms);
+    BinaryProtocolService_WriteU16Le(&payload[14], result->option_bits);
+    BinaryProtocolService_SendFrame(BINARY_PROTOCOL_CMD_CYCLE_DONE, payload, (uint8_t)sizeof(payload));
+}
+
+/**
+ * @brief ESP32S3 机械臂阶段完成后由机械臂服务回调本函数。
+ * @param cycle_id 完成帧中的流程 ID。
+ * @param job_id 完成帧中的机械臂任务号。
+ * @param stage_id 完成的机械臂阶段：1=放称重，2=放电感，3=最终分拣。
+ * @param result ESP32S3 阶段结果，0 表示成功。
+ * @param detail_code ESP32S3 补充原因码。
+ * @param elapsed_ms 本阶段耗时。
+ * @param arm_fault_bits ESP32S3 机械臂故障位。
+ *
+ * 阶段推进规则：
+ * 1. stage1 成功后读取 HX711 快照，发送 WEIGHT_RESULT，再通知机械臂放到电感模块；
+ * 2. stage2 成功后读取 LDC1614 快照，发送 LDC_RESULT，然后等待 MP157 上传完成后下发 FINAL_SORT_RESULT；
+ * 3. stage3 成功后发送 CYCLE_DONE，表示本轮最终分拣完成，可以进入下一件。
+ */
+void BinaryProtocolService_HandleArmStageDone(uint16_t cycle_id,
+                                              uint16_t job_id,
+                                              uint8_t stage_id,
+                                              uint8_t result,
+                                              uint16_t detail_code,
+                                              uint16_t elapsed_ms,
+                                              uint16_t arm_fault_bits)
+{
+    if ((BinaryProtocolService_IsActiveCycle(cycle_id) == 0U) ||
+        ((g_binary_protocol_runtime.arm_job_id != 0U) &&
+         (g_binary_protocol_runtime.arm_job_id != job_id)))
+    {
+        BinaryProtocolService_ReportFault(detail_code,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)job_id,
+                                          0U);
+        return;
+    }
+
+    if (result != 0U)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_ReportFault(detail_code,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_STOP,
+                                          (int32_t)result,
+                                          0U);
+        return;
+    }
+
+    if (stage_id == 1U)
+    {
+        WeightService_Snapshot_t weight_snapshot;
+        BinaryProtocol_WeightResultPayload_t weight_payload;
+
+        (void)memset(&weight_payload, 0, sizeof(weight_payload));
+        weight_payload.cycle_id = cycle_id;
+        if (WeightService_GetLatestSnapshot(&weight_snapshot) != 0U)
+        {
+            weight_payload.sample_id = weight_snapshot.sample_id;
+            weight_payload.stable = weight_snapshot.stable;
+            weight_payload.decision = weight_snapshot.decision;
+            weight_payload.gross_weight_mg = weight_snapshot.gross_weight_mg;
+            weight_payload.net_weight_mg = weight_snapshot.net_weight_mg;
+            weight_payload.raw_adc = weight_snapshot.raw_adc;
+            weight_payload.sample_count = weight_snapshot.sample_count;
+            weight_payload.stable_window_mg = weight_snapshot.stable_window_mg;
+            weight_payload.duration_ms = weight_snapshot.duration_ms;
+            weight_payload.option_bits = weight_snapshot.option_bits;
+        }
+        else
+        {
+            weight_payload.decision = 3U;
+            weight_payload.option_bits = 0U;
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY);
+        }
+
+        BinaryProtocolService_SendWeightResult(&weight_payload);
+        if (RobotArmService_RequestPlaceLdc(cycle_id,
+                                            job_id,
+                                            g_binary_protocol_runtime.model_part_type,
+                                            g_binary_protocol_runtime.model_result) == 0U)
+        {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+            BinaryProtocolService_ReportFault(2U,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                              BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                              (int32_t)job_id,
+                                              0U);
+            return;
+        }
+
+        g_binary_protocol_runtime.state = 8U;
+        BinaryProtocolService_SendEventReport(cycle_id,
+                                              4U,
+                                              8U,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                              (int32_t)job_id,
+                                              0U);
+    }
+    else if (stage_id == 2U)
+    {
+        Ldc1614Service_Snapshot_t ldc_snapshot;
+        BinaryProtocol_LdcResultPayload_t ldc_payload;
+
+        (void)memset(&ldc_payload, 0, sizeof(ldc_payload));
+        ldc_payload.cycle_id = cycle_id;
+        if (Ldc1614Service_GetLatestSnapshot(&ldc_snapshot) != 0U)
+        {
+            ldc_payload.sample_id = ldc_snapshot.sample_id;
+            ldc_payload.channel_mask = ldc_snapshot.channel_mask;
+            ldc_payload.decision = ldc_snapshot.decision;
+            ldc_payload.status = ldc_snapshot.status;
+            ldc_payload.ch0_raw = ldc_snapshot.ch0_raw;
+            ldc_payload.ch0_delta = ldc_snapshot.ch0_delta;
+            ldc_payload.ch1_raw = ldc_snapshot.ch1_raw;
+            ldc_payload.ch1_delta = ldc_snapshot.ch1_delta;
+            ldc_payload.duration_ms = ldc_snapshot.duration_ms;
+            ldc_payload.option_bits = ldc_snapshot.option_bits;
+        }
+        else
+        {
+            ldc_payload.decision = 3U;
+            ldc_payload.status = 1U;
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_LDC_NOT_READY);
+        }
+
+        BinaryProtocolService_SendLdcResult(&ldc_payload);
+        g_binary_protocol_runtime.state = 9U;
+        BinaryProtocolService_SendEventReport(cycle_id,
+                                              5U,
+                                              9U,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_LDC,
+                                              0,
+                                              0U);
+    }
+    else if (stage_id == 3U)
+    {
+        BinaryProtocol_CycleDonePayload_t cycle_payload;
+
+        (void)memset(&cycle_payload, 0, sizeof(cycle_payload));
+        cycle_payload.cycle_id = cycle_id;
+        cycle_payload.job_id = job_id;
+        cycle_payload.final_bin = g_binary_protocol_runtime.final_bin_hint;
+        cycle_payload.model_result = g_binary_protocol_runtime.model_result;
+        cycle_payload.weight_decision = 0U;
+        cycle_payload.ldc_decision = 0U;
+        cycle_payload.f4_state = 7U;
+        cycle_payload.fault_level = (g_binary_protocol_runtime.fault_bits == 0U) ? 0U : 2U;
+        cycle_payload.fault_bits = (uint16_t)(g_binary_protocol_runtime.fault_bits | arm_fault_bits);
+        cycle_payload.duration_ms = elapsed_ms;
+        cycle_payload.option_bits = 0U;
+        BinaryProtocolService_SendCycleDone(&cycle_payload);
+
+        g_binary_protocol_runtime.active_cycle_id = 0U;
+        g_binary_protocol_runtime.arm_job_id = 0U;
+        g_binary_protocol_runtime.state = 0U;
+        g_binary_protocol_runtime.paused_state = 0U;
+    }
+    else
+    {
+        BinaryProtocolService_ReportFault(stage_id,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)detail_code,
+                                          0U);
+    }
 }
 
 /**
@@ -1057,7 +1558,7 @@ static uint8_t BinaryProtocolService_FindStepperMotor(const BinaryProtocol_Stepp
  * 1. 首版参数下发不绑定流程，所以 cycle_id 必须为 0；
  * 2. motor_count 固定为 3，flags 固定为 0；
  * 3. role_id 必须刚好覆盖 1/2/3，不能重复；
- * 4. 每条记录都必须满足地址、步长、速度和方向范围。
+ * 4. 每条记录都必须满足地址、步长、常规速度、扫描速度和方向范围。
  */
 static uint8_t BinaryProtocolService_ValidateStepperParam(const BinaryProtocol_StepperParamPayload_t *payload,
                                                           uint16_t *detail)
@@ -1125,6 +1626,12 @@ static uint8_t BinaryProtocolService_ValidateStepperParam(const BinaryProtocol_S
         if (motor->normal_speed_rpm > BINARY_PROTOCOL_STEPPER_SPEED_MAX_RPM)
         {
             *detail = motor->normal_speed_rpm;
+            return 0U;
+        }
+
+        if (motor->scan_speed_rpm > BINARY_PROTOCOL_STEPPER_SPEED_MAX_RPM)
+        {
+            *detail = motor->scan_speed_rpm;
             return 0U;
         }
 
@@ -1700,7 +2207,7 @@ static void BinaryProtocolService_HandleBeltManual(const BinaryProtocol_Frame_t 
  * @param frame 已解析帧。
  *
  * 该命令把 MP157 参数页中的三台 Emm42 参数同步到 F4 运行内存：
- * 1. role_id=1 投递给传送带任务；
+ * 1. role_id=1 投递给传送带任务，包含上料扫描速度和视觉对中/短步速度两档；
  * 2. role_id=2/3 一次性投递给摄像头电机任务，其中 role_id=2 是左右轴；
  * 3. 成功只表示 F4 任务已接收运行时参数，不表示写入 F4 Flash 或 Emm42 EEPROM。
  */
@@ -1753,6 +2260,7 @@ static void BinaryProtocolService_HandleStepperParam(const BinaryProtocol_Frame_
     if (ConveyorMotorService_RequestRuntimeConfig(conveyor_motor.address,
                                                   conveyor_motor.min_step,
                                                   conveyor_motor.normal_speed_rpm,
+                                                  conveyor_motor.scan_speed_rpm,
                                                   conveyor_motor.direction) == 0U)
     {
         BinaryProtocolService_SendNack(payload.cycle_id,
@@ -1834,21 +2342,33 @@ static void BinaryProtocolService_HandleActuatorPosMove(const BinaryProtocol_Fra
 
     if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CONVEYOR)
     {
-        accepted = ConveyorMotorService_RequestPosition((payload.direction != 0U) ? 1U : 0U,
-                                                        payload.speed_rpm,
-                                                        payload.steps);
+        accepted = ConveyorMotorService_RequestPositionWithReport((payload.direction != 0U) ? 1U : 0U,
+                                                                  payload.speed_rpm,
+                                                                  payload.steps,
+                                                                  payload.cycle_id,
+                                                                  frame->sequence,
+                                                                  payload.actuator,
+                                                                  payload.direction);
     }
     else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL)
     {
-        accepted = CameraMotorService_RequestLateralPosition((payload.direction != 0U) ? 1U : 0U,
-                                                             payload.speed_rpm,
-                                                             payload.steps);
+        accepted = CameraMotorService_RequestLateralPositionWithReport((payload.direction != 0U) ? 1U : 0U,
+                                                                       payload.speed_rpm,
+                                                                       payload.steps,
+                                                                       payload.cycle_id,
+                                                                       frame->sequence,
+                                                                       payload.actuator,
+                                                                       payload.direction);
     }
     else if (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_Z)
     {
-        accepted = CameraMotorService_RequestZPosition((payload.direction != 0U) ? 1U : 0U,
-                                                       payload.speed_rpm,
-                                                       payload.steps);
+        accepted = CameraMotorService_RequestZPositionWithReport((payload.direction != 0U) ? 1U : 0U,
+                                                                 payload.speed_rpm,
+                                                                 payload.steps,
+                                                                 payload.cycle_id,
+                                                                 frame->sequence,
+                                                                 payload.actuator,
+                                                                 payload.direction);
     }
     else
     {
@@ -2142,6 +2662,262 @@ static BinaryProtocol_ErrorCode_t BinaryProtocolService_MapWeightCalibrationErro
 }
 
 /**
+ * @brief 把模型结果转换成保守的最终分拣目标。
+ * @param model_result 模型综合结果，1=good，2=bad，3=review，其它为 unknown。
+ * @return uint8_t 1=良品盘，2=不良品盘，3=待复核盘。
+ *
+ * 未知结果一律进入待复核盘，避免把没有完整模型结论的零件误放到良品盘。
+ */
+static uint8_t BinaryProtocolService_ModelResultToFinalBin(uint8_t model_result)
+{
+    if (model_result == 1U)
+    {
+        return 1U;
+    }
+
+    if (model_result == 2U)
+    {
+        return 2U;
+    }
+
+    return 3U;
+}
+
+/**
+ * @brief 处理 MODEL_READY。
+ * @param frame 已解析帧。
+ *
+ * MP157 在 ROI 居中、Z 轴下降、等待 3 秒、模型检测并保存 SD 卡记录后发送本命令。
+ * F4 只缓存模型结果，供后续机械臂最终分拣使用；本命令不会触发 ESP32 动作，也不会上传云端。
+ */
+static void BinaryProtocolService_HandleModelReady(const BinaryProtocol_Frame_t *frame)
+{
+    BinaryProtocol_ModelReadyPayload_t payload;
+
+    if (BinaryProtocolService_DecodeModelReady(frame->payload, frame->payload_length, &payload) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_PAYLOAD_LENGTH,
+                                       frame->payload_length);
+        return;
+    }
+
+    if (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_CYCLE_MISMATCH,
+                                       payload.cycle_id);
+        return;
+    }
+
+    if ((payload.model_result > 3U) || (payload.top1_confidence > 100U))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.model_result);
+        return;
+    }
+
+    g_binary_protocol_runtime.model_result = payload.model_result;
+    g_binary_protocol_runtime.model_part_type = payload.part_type;
+    g_binary_protocol_runtime.model_defect_type = payload.defect_type;
+    g_binary_protocol_runtime.model_image_seq = payload.image_seq;
+    g_binary_protocol_runtime.final_bin_hint = BinaryProtocolService_ModelResultToFinalBin(payload.model_result);
+    g_binary_protocol_runtime.state = 4U;
+
+    BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U);
+    BinaryProtocolService_SendEventReport(payload.cycle_id,
+                                          1U,
+                                          4U,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_UART,
+                                          (int32_t)payload.model_ms,
+                                          frame->sequence);
+}
+
+/**
+ * @brief 处理 ARM_JOB_START。
+ * @param frame 已解析帧。
+ *
+ * MP157 必须等上下轴回升 ACK 后再发本命令。
+ * F4 接受后先通知 ESP32S3 把 ROI 中的零件放到称重模块；
+ * 后续 ESP32S3 完成回包到来后，F4 再读取 HX711/LDC 并发送 WEIGHT_RESULT/LDC_RESULT/CYCLE_DONE。
+ */
+static void BinaryProtocolService_HandleArmJobStart(const BinaryProtocol_Frame_t *frame)
+{
+    BinaryProtocol_ArmJobStartPayload_t payload;
+
+    if (BinaryProtocolService_DecodeArmJobStart(frame->payload, frame->payload_length, &payload) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_PAYLOAD_LENGTH,
+                                       frame->payload_length);
+        return;
+    }
+
+    if (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_CYCLE_MISMATCH,
+                                       payload.cycle_id);
+        return;
+    }
+
+    if ((payload.job_profile > 3U) ||
+        (payload.final_bin_hint > 3U) ||
+        ((payload.option_bits & 0xFFF8U) != 0U))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.option_bits);
+        return;
+    }
+
+    if (RobotArmService_RequestPlaceWeight(payload.cycle_id,
+                                           payload.job_id,
+                                           payload.part_type,
+                                           g_binary_protocol_runtime.model_result) == 0U)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_HARDWARE_FAULT,
+                                       payload.job_id);
+        return;
+    }
+
+    g_binary_protocol_runtime.arm_job_id = payload.job_id;
+    g_binary_protocol_runtime.final_bin_hint = 0U;
+    g_binary_protocol_runtime.state = 5U;
+
+    BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U);
+    BinaryProtocolService_SendEventReport(payload.cycle_id,
+                                          2U,
+                                          5U,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          (int32_t)payload.job_id,
+                                          frame->sequence);
+}
+
+/**
+ * @brief 处理 FINAL_SORT_RESULT。
+ * @param frame 已解析帧。
+ *
+ * MP157 在完整上传成功后按模型/云端结果发送本命令。
+ * 如果网络问题导致上传失败但本地历史已保存，MP157 也会发送本命令，
+ * 但 upload_status 必须为 2，final_result/final_bin 必须都是待复核，
+ * F4 此时只允许 ESP32S3 把零件放入待复核盘，便于网络恢复后从历史记录重新上传。
+ */
+static void BinaryProtocolService_HandleFinalSortResult(const BinaryProtocol_Frame_t *frame)
+{
+    BinaryProtocol_FinalSortResultPayload_t payload;
+
+    if (BinaryProtocolService_DecodeFinalSortResult(frame->payload,
+                                                    frame->payload_length,
+                                                    &payload) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_PAYLOAD_LENGTH,
+                                       frame->payload_length);
+        return;
+    }
+
+    if (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U)
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_CYCLE_MISMATCH,
+                                       payload.cycle_id);
+        return;
+    }
+
+    if ((g_binary_protocol_runtime.arm_job_id != 0U) &&
+        (payload.job_id != g_binary_protocol_runtime.arm_job_id))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_CYCLE_MISMATCH,
+                                       payload.job_id);
+        return;
+    }
+
+    if ((payload.final_result == 0U) ||
+        (payload.final_result > 3U) ||
+        (payload.final_bin == 0U) ||
+        (payload.final_bin > 3U) ||
+        (payload.final_confidence > 100U))
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       payload.final_bin);
+        return;
+    }
+
+    if ((payload.upload_status != 1U) &&
+        !((payload.upload_status == 2U) &&
+          (payload.final_result == 3U) &&
+          (payload.final_bin == 3U)))
+    {
+        /*
+         * upload_status=1 表示完整数据已上传成功，可以按最终结果分拣。
+         * upload_status=2 表示上传失败但本地已保存，只能进入待复核盘。
+         * 其它组合一律拒绝，避免云端缺数据时零件被放进良品/不良品盘。
+         */
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_STATE_NOT_ALLOWED,
+                                       payload.upload_status);
+        return;
+    }
+
+    if (RobotArmService_RequestFinalSort(payload.cycle_id,
+                                         payload.job_id,
+                                         g_binary_protocol_runtime.model_part_type,
+                                         payload.final_result,
+                                         payload.final_bin) == 0U)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_HARDWARE_FAULT,
+                                       payload.final_bin);
+        return;
+    }
+
+    g_binary_protocol_runtime.model_result = payload.final_result;
+    g_binary_protocol_runtime.final_bin_hint = payload.final_bin;
+    g_binary_protocol_runtime.state = 6U;
+
+    BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U);
+    BinaryProtocolService_SendEventReport(payload.cycle_id,
+                                          3U,
+                                          6U,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          (int32_t)payload.final_bin,
+                                          frame->sequence);
+}
+
+/**
  * @brief 处理 WEIGHT_CALIBRATE。
  * @param frame 已解析帧。
  *
@@ -2274,6 +3050,18 @@ uint8_t BinaryProtocolService_HandleFrame(const uint8_t *frame_buffer, uint16_t 
 
         case BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE:
             BinaryProtocolService_HandleWeightCalibration(&frame);
+            break;
+
+        case BINARY_PROTOCOL_CMD_ARM_JOB_START:
+            BinaryProtocolService_HandleArmJobStart(&frame);
+            break;
+
+        case BINARY_PROTOCOL_CMD_MODEL_READY:
+            BinaryProtocolService_HandleModelReady(&frame);
+            break;
+
+        case BINARY_PROTOCOL_CMD_FINAL_SORT_RESULT:
+            BinaryProtocolService_HandleFinalSortResult(&frame);
             break;
 
         case BINARY_PROTOCOL_CMD_QUERY_STATUS:

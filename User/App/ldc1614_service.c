@@ -368,6 +368,19 @@ static const int8_t g_ldc1614_detect_direction[LDC1614_SERVICE_CHANNEL_COUNT] =
 };
 
 /**
+ * @brief 最近一次可供 MP157-F4 二进制协议读取的 LDC 稳定测量快照。
+ *
+ * 该快照在 Ldc1614Service_ReportMeasurementResult() 中更新；
+ * F4 收到 ESP32S3 “已放到电感模块”完成帧后，直接复制这里的数据打包 LDC_RESULT。
+ */
+static Ldc1614Service_Snapshot_t g_ldc1614_latest_snapshot = {0};
+
+/**
+ * @brief LDC 快照是否已经至少更新过一次。
+ */
+static uint8_t g_ldc1614_latest_snapshot_valid = 0U;
+
+/**
  * @brief 清空滤波器状态。
  * @param filter 滤波器对象指针，不能为空。
  */
@@ -1350,6 +1363,8 @@ static void Ldc1614Service_ReportMeasurementResult(LDC1614_ChannelContext_t *cha
 {
     uint32_t stable_delta;
     int32_t directional_delta;
+    uint8_t channel_bit;
+    uint8_t channel_decision;
 
     if (channel_context == NULL)
     {
@@ -1362,16 +1377,16 @@ static void Ldc1614Service_ReportMeasurementResult(LDC1614_ChannelContext_t *cha
 
     if (channel_context->reference_enabled == 0U)
     {
+        channel_decision = 3U;
         my_printf(&huart1,
                   "[RESULT][LDC] %s stable_delta=%lu, reference=unset\r\n",
                   channel_context->label,
                   (unsigned long)stable_delta);
-        return;
     }
-
-    if (Ldc1614Service_AbsoluteDifference(stable_delta, channel_context->reference_delta) <=
-        channel_context->defect_tolerance)
+    else if (Ldc1614Service_AbsoluteDifference(stable_delta, channel_context->reference_delta) <=
+             channel_context->defect_tolerance)
     {
+        channel_decision = 1U;
         my_printf(&huart1,
                   "[RESULT][LDC] %s OK, stable_delta=%lu, reference=%lu\r\n",
                   channel_context->label,
@@ -1380,12 +1395,104 @@ static void Ldc1614Service_ReportMeasurementResult(LDC1614_ChannelContext_t *cha
     }
     else
     {
+        channel_decision = 2U;
         my_printf(&huart1,
                   "[RESULT][LDC] %s DEFECT, stable_delta=%lu, reference=%lu\r\n",
                   channel_context->label,
                   (unsigned long)stable_delta,
                   (unsigned long)channel_context->reference_delta);
     }
+
+    channel_bit = (uint8_t)(1U << (uint8_t)channel_context->channel);
+
+    taskENTER_CRITICAL();
+    if (channel_context->channel == LDC1614_CHANNEL_0)
+    {
+        g_ldc1614_latest_snapshot.channel_mask = 0U;
+        g_ldc1614_latest_snapshot.decision = 0U;
+        g_ldc1614_latest_snapshot.status = 0U;
+        g_ldc1614_latest_snapshot.ch0_raw = 0UL;
+        g_ldc1614_latest_snapshot.ch0_delta = 0;
+        g_ldc1614_latest_snapshot.ch1_raw = 0UL;
+        g_ldc1614_latest_snapshot.ch1_delta = 0;
+        g_ldc1614_latest_snapshot.option_bits = 0U;
+    }
+
+    ++g_ldc1614_latest_snapshot.sample_id;
+    if (g_ldc1614_latest_snapshot.sample_id == 0U)
+    {
+        g_ldc1614_latest_snapshot.sample_id = 1U;
+    }
+
+    g_ldc1614_latest_snapshot.channel_mask =
+        (uint8_t)(g_ldc1614_latest_snapshot.channel_mask | channel_bit);
+    g_ldc1614_latest_snapshot.status = 0U;
+    g_ldc1614_latest_snapshot.duration_ms =
+        (uint16_t)(LDC1614_SERVICE_SETTLE_DELAY_MS +
+                   (LDC1614_SERVICE_MEASURE_SAMPLE_COUNT * LDC1614_SERVICE_INTB_WAIT_TIMEOUT_MS));
+    g_ldc1614_latest_snapshot.option_bits =
+        (uint16_t)(g_ldc1614_latest_snapshot.option_bits | 0x0002U);
+
+    if (channel_context->reference_enabled != 0U)
+    {
+        g_ldc1614_latest_snapshot.option_bits =
+            (uint16_t)(g_ldc1614_latest_snapshot.option_bits | 0x0001U);
+    }
+
+    if (channel_context->channel == LDC1614_CHANNEL_0)
+    {
+        g_ldc1614_latest_snapshot.ch0_raw = stable_sample;
+        g_ldc1614_latest_snapshot.ch0_delta = (int32_t)stable_delta;
+    }
+    else if (channel_context->channel == LDC1614_CHANNEL_1)
+    {
+        g_ldc1614_latest_snapshot.ch1_raw = stable_sample;
+        g_ldc1614_latest_snapshot.ch1_delta = (int32_t)stable_delta;
+    }
+
+    if ((g_ldc1614_latest_snapshot.decision == 2U) || (channel_decision == 2U))
+    {
+        g_ldc1614_latest_snapshot.decision = 2U;
+    }
+    else if ((g_ldc1614_latest_snapshot.decision == 3U) || (channel_decision == 3U))
+    {
+        g_ldc1614_latest_snapshot.decision = 3U;
+    }
+    else
+    {
+        g_ldc1614_latest_snapshot.decision = 1U;
+    }
+
+    g_ldc1614_latest_snapshot_valid = 1U;
+    taskEXIT_CRITICAL();
+}
+
+/**
+ * @brief 获取 LDC1614 服务最近一次稳定测量快照。
+ * @param snapshot 输出电感快照，不能为空。
+ * @return uint8_t 1 表示已有可上报快照，0 表示尚未产生稳定测量结果。
+ *
+ * 该函数不阻塞、不访问 I2C，只复制 LDC 任务最近维护的结构化结果。
+ * 调用方应把返回 0 当作“传感器数据未准备好”，并向 MP157 上报待复核或故障。
+ */
+uint8_t Ldc1614Service_GetLatestSnapshot(Ldc1614Service_Snapshot_t *snapshot)
+{
+    if (snapshot == NULL)
+    {
+        return 0U;
+    }
+
+    taskENTER_CRITICAL();
+    if (g_ldc1614_latest_snapshot_valid == 0U)
+    {
+        taskEXIT_CRITICAL();
+        (void)memset(snapshot, 0, sizeof(*snapshot));
+        return 0U;
+    }
+
+    *snapshot = g_ldc1614_latest_snapshot;
+    taskEXIT_CRITICAL();
+    return 1U;
 }
 
 /**

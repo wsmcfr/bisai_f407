@@ -45,7 +45,7 @@ extern "C" {
  * | `0x22` | BELT_STOP_CENTERED | MP157 -> F4 | 停止传送带，表示零件已进入中心 ROI。 |
  * | `0x40` | QUERY_STATUS | MP157 -> F4 | 查询 F4 协议状态和传送带状态，成功回 STATUS_REPORT。 |
  * | `0x41` | BELT_MANUAL_CONTROL | MP157 -> F4 | 手动调试传送带扫描/停止，成功回 ACK。 |
- * | `0x42` | STEPPER_PARAM_SET | MP157 -> F4 | 下发三台 Emm42 的地址、最小步长、常规速度和方向，成功回 ACK。 |
+ * | `0x42` | STEPPER_PARAM_SET | MP157 -> F4 | 下发三台 Emm42 的地址、最小步长、常规/对中速度、传送带上料速度和方向，成功回 ACK。 |
  * | `0x80` | ACK | F4 -> MP157 | 确认命令被接受。 |
  * | `0x81` | NACK | F4 -> MP157 | 拒绝命令并返回错误码。 |
  * | `0x82` | STATUS_REPORT | F4 -> MP157 | 查询成功后的结构化状态回包。 |
@@ -148,9 +148,10 @@ extern "C" {
  * @brief `STEPPER_PARAM_SET` 命令负载长度，单位字节。
  *
  * 固定格式：cycle_id:u16、motor_count:u8、flags:u8、
- * 然后三条 7 字节电机记录：role_id、address、min_step、normal_speed_rpm、direction。
+ * 然后三条 9 字节电机记录：
+ * role_id、address、min_step、normal_speed_rpm、scan_speed_rpm、direction。
  */
-#define BINARY_PROTOCOL_STEPPER_PARAM_PAYLOAD_LENGTH (25U)
+#define BINARY_PROTOCOL_STEPPER_PARAM_PAYLOAD_LENGTH (31U)
 
 /**
  * @brief `ACTUATOR_POS_MOVE` 命令负载长度，单位字节。
@@ -191,6 +192,80 @@ extern "C" {
 #define BINARY_PROTOCOL_WEIGHT_CALIBRATION_PAYLOAD_LENGTH (5U)
 
 /**
+ * @brief `MODEL_READY` 命令负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、model_result:u8、part_type:u8、defect_type:u8、
+ * top1_confidence:u8、image_seq:u16、model_ms:u16、option_bits:u16。
+ * MP157 完成本地模型检测和 SD 卡保存后发送本命令，F4 只缓存结果，不上传云端。
+ */
+#define BINARY_PROTOCOL_MODEL_READY_PAYLOAD_LENGTH   (12U)
+
+/**
+ * @brief `ARM_JOB_START` 命令负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、job_id:u16、job_profile:u8、part_type:u8、
+ * final_bin_hint:u8、option_bits:u16。
+ * MP157 等 Z 轴回升 ACK 后发送本命令，F4 再通知 ESP32S3 机械臂抓取。
+ */
+#define BINARY_PROTOCOL_ARM_JOB_START_PAYLOAD_LENGTH (9U)
+
+/**
+ * @brief `FINAL_SORT_RESULT` 命令负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、job_id:u16、final_result:u8、final_bin:u8、
+ * upload_status:u8、final_confidence:u8、option_bits:u16。
+ * MP157 必须在完整数据和图片上传完成后再发送本命令，F4 才通知 ESP32S3 最终分拣。
+ */
+#define BINARY_PROTOCOL_FINAL_SORT_RESULT_PAYLOAD_LENGTH (10U)
+
+/**
+ * @brief `EVENT_REPORT` 回包负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、event_code:u8、state:u8、step_code:u8、source:u8、
+ * detail_i32:i32、related_seq:u16、fault_bits:u16、reserved:u16。
+ */
+#define BINARY_PROTOCOL_EVENT_REPORT_PAYLOAD_LENGTH  (16U)
+
+/**
+ * @brief EVENT_REPORT 事件：执行器位置运动已经真实到位。
+ *
+ * F4 只有在对应张大头 Emm42 返回 `[addr FD 9F 6B]` 后才能发送该事件。
+ */
+#define BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE     (0x14U)
+
+/**
+ * @brief EVENT_REPORT 事件：执行器位置运动等待到位超时。
+ *
+ * 常见原因是 Emm42 Response 参数未设置为 Reached/Both、RX 未接好、地址错误或电机堵转。
+ */
+#define BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT  (0x15U)
+
+/**
+ * @brief `WEIGHT_RESULT` 回包负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、sample_id:u16、stable:u8、decision:u8、
+ * gross_weight_mg:i32、net_weight_mg:i32、raw_adc:i32、sample_count:u16、
+ * stable_window_mg:u16、duration_ms:u16、option_bits:u32。
+ */
+#define BINARY_PROTOCOL_WEIGHT_RESULT_PAYLOAD_LENGTH (28U)
+
+/**
+ * @brief `LDC_RESULT` 回包负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、sample_id:u16、channel_mask:u8、decision:u8、status:u8、reserved:u8、
+ * ch0_raw:u32、ch0_delta:i32、ch1_raw:u32、ch1_delta:i32、duration_ms:u16、option_bits:u16。
+ */
+#define BINARY_PROTOCOL_LDC_RESULT_PAYLOAD_LENGTH    (28U)
+
+/**
+ * @brief `CYCLE_DONE` 回包负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、job_id:u16、final_bin:u8、model_result:u8、weight_decision:u8、
+ * ldc_decision:u8、f4_state:u8、fault_level:u8、fault_bits:u16、duration_ms:u16、option_bits:u16。
+ */
+#define BINARY_PROTOCOL_CYCLE_DONE_PAYLOAD_LENGTH    (16U)
+
+/**
  * @brief `ACK` 命令负载长度，单位字节。
  */
 #define BINARY_PROTOCOL_ACK_PAYLOAD_LENGTH           (7U)
@@ -225,8 +300,9 @@ typedef enum
     BINARY_PROTOCOL_CMD_VISION_LOST = 0x21U,        /* 视觉丢失命令，F4 根据原因回扫描或停机。 */
     BINARY_PROTOCOL_CMD_BELT_STOP_CENTERED = 0x22U, /* 零件已进中心 ROI，要求 F4 停止传送带。 */
     BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE = 0x30U,   /* 称重标定命令，使用已知砝码更新 HX711 运行时比例系数。 */
-    BINARY_PROTOCOL_CMD_MODEL_READY = BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE, /* 历史名称兼容：旧 MP157 曾临时用 0x30 做占位。 */
-    BINARY_PROTOCOL_CMD_ARM_JOB_START = 0x31U,      /* 机械臂任务开始，首轮仅保留命令字。 */
+    BINARY_PROTOCOL_CMD_ARM_JOB_START = 0x31U,      /* 机械臂任务开始，F4 通知 ESP32S3 抓取并依次放称重/电感/分拣。 */
+    BINARY_PROTOCOL_CMD_MODEL_READY = 0x32U,        /* MP157 模型检测和 SD 卡保存完成，F4 缓存模型结果但不触发云端上传。 */
+    BINARY_PROTOCOL_CMD_FINAL_SORT_RESULT = 0x33U,  /* MP157 完整上传后下发最终分拣结果，F4 再通知 ESP32S3 放入对应盘。 */
     BINARY_PROTOCOL_CMD_QUERY_STATUS = 0x40U,       /* 查询 F4 和传送带结构化状态，成功返回 STATUS_REPORT。 */
     BINARY_PROTOCOL_CMD_BELT_MANUAL_CONTROL = 0x41U, /* 手动调试传送带扫描/停止，成功返回 ACK。 */
     BINARY_PROTOCOL_CMD_STEPPER_PARAM_SET = 0x42U,  /* 下发三台 Emm42 运行时参数，成功返回 ACK。 */
@@ -440,7 +516,8 @@ typedef struct
     uint8_t role_id;                              /* 电机角色：1=传送带，2=摄像头左右，3=摄像头上下。 */
     uint8_t address;                              /* Emm42 地址，允许 1~247。 */
     uint16_t min_step;                            /* 最小步长，单位 step，允许 1~10000。 */
-    uint16_t normal_speed_rpm;                    /* 常规速度，单位 RPM，允许 0~5000。 */
+    uint16_t normal_speed_rpm;                    /* 常规/对中速度，单位 RPM，允许 0~5000。 */
+    uint16_t scan_speed_rpm;                      /* 传送带上料扫描速度，单位 RPM；非传送带角色当前保留为 0。 */
     int8_t direction;                             /* 方向映射，1=正向，-1=反向。 */
 } BinaryProtocol_StepperMotorConfig_t;
 
@@ -511,6 +588,103 @@ typedef struct
     uint8_t flags;                                /* 保留标志位，首版固定填 0，不能表示自动去皮或持久化。 */
 } BinaryProtocol_WeightCalibrationPayload_t;
 
+/**
+ * @brief `MODEL_READY` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前单件自动检测流程 ID，必须匹配 active_cycle_id。 */
+    uint8_t model_result;                         /* 模型综合结果：0=unknown，1=good，2=bad，3=review/uncertain。 */
+    uint8_t part_type;                            /* 零件类型枚举，F4 只缓存并转发给 ESP32S3 和云端上下文。 */
+    uint8_t defect_type;                          /* 缺陷类型枚举，F4 不判定，只随事件上下文保留。 */
+    uint8_t top1_confidence;                      /* 模型 top1 置信度百分制，范围 0~100。 */
+    uint16_t image_seq;                           /* MP157 本地图片/检测序号，用于和 SD 卡记录对齐。 */
+    uint16_t model_ms;                            /* MP157 本地模型耗时，单位 ms。 */
+    uint16_t option_bits;                         /* 扩展选项位，首版由 MP157 填本地检测能力位图。 */
+} BinaryProtocol_ModelReadyPayload_t;
+
+/**
+ * @brief `ARM_JOB_START` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前单件自动检测流程 ID。 */
+    uint16_t job_id;                              /* MP157 分配的机械臂任务号，用于跨阶段追踪。 */
+    uint8_t job_profile;                          /* 机械臂动作方案，0=默认动作组或默认轨迹。 */
+    uint8_t part_type;                            /* 零件类型，未知填 0。 */
+    uint8_t final_bin_hint;                       /* 历史预留字段；最终分拣必须等待 FINAL_SORT_RESULT，不能在这里执行。 */
+    uint16_t option_bits;                         /* 选项位，首版 bit0=称重，bit1=电感，bit2=最终分拣。 */
+} BinaryProtocol_ArmJobStartPayload_t;
+
+/**
+ * @brief `FINAL_SORT_RESULT` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前单件自动检测流程 ID。 */
+    uint16_t job_id;                              /* 机械臂任务号，必须和 ARM_JOB_START 缓存的任务号一致。 */
+    uint8_t final_result;                         /* MP157 综合判定：1=good，2=bad，3=review/uncertain。 */
+    uint8_t final_bin;                            /* 最终分拣盘：1=良品盘，2=不良品盘，3=待复核盘。 */
+    uint8_t upload_status;                        /* 上传状态：1=完整数据已上传成功；2=上传失败但本地已保存，此时只能放待复核盘。 */
+    uint8_t final_confidence;                     /* MP157 综合置信度百分制，范围 0~100。 */
+    uint16_t option_bits;                         /* 扩展位，首版填 0 或能力位，不直接改变机械臂动作。 */
+} BinaryProtocol_FinalSortResultPayload_t;
+
+/**
+ * @brief `WEIGHT_RESULT` 回包负载。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前单件流程 ID。 */
+    uint16_t sample_id;                           /* 称重样本序号或 F4 本地递增编号。 */
+    uint8_t stable;                               /* 1 表示称重窗口稳定，0 表示只能作为待复核数据。 */
+    uint8_t decision;                             /* 称重判定：0=unknown，1=pass，2=fail，3=review。 */
+    int32_t gross_weight_mg;                      /* 毛重，单位 mg。 */
+    int32_t net_weight_mg;                        /* 净重，单位 mg。 */
+    int32_t raw_adc;                              /* HX711 原始 ADC 计数。 */
+    uint16_t sample_count;                        /* 本次稳定窗口样本数量。 */
+    uint16_t stable_window_mg;                    /* 稳定窗口波动范围，单位 mg。 */
+    uint16_t duration_ms;                         /* 本次称重耗时，单位 ms。 */
+    uint32_t option_bits;                         /* 扩展位或标定状态，MP157 保存到 SD 卡和云端上下文。 */
+} BinaryProtocol_WeightResultPayload_t;
+
+/**
+ * @brief `LDC_RESULT` 回包负载。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前单件流程 ID。 */
+    uint16_t sample_id;                           /* 电感样本序号或 F4 本地递增编号。 */
+    uint8_t channel_mask;                         /* 有效通道位图，bit0=CH0，bit1=CH1。 */
+    uint8_t decision;                             /* 电感判定：0=unknown，1=pass，2=fail，3=review。 */
+    uint8_t status;                               /* LDC 服务状态或底层错误码。 */
+    uint8_t reserved;                             /* 保留字段，发送时填 0。 */
+    uint32_t ch0_raw;                             /* CH0 最近稳定原始值。 */
+    int32_t ch0_delta;                            /* CH0 相对基线变化量。 */
+    uint32_t ch1_raw;                             /* CH1 最近稳定原始值。 */
+    int32_t ch1_delta;                            /* CH1 相对基线变化量。 */
+    uint16_t duration_ms;                         /* 本次电感检测耗时，单位 ms。 */
+    uint16_t option_bits;                         /* 扩展位，MP157 保存到上下文。 */
+} BinaryProtocol_LdcResultPayload_t;
+
+/**
+ * @brief `CYCLE_DONE` 回包负载。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前单件流程 ID。 */
+    uint16_t job_id;                              /* 机械臂任务号。 */
+    uint8_t final_bin;                            /* 最终分拣目标：1=良品，2=不良品，3=待复核。 */
+    uint8_t model_result;                         /* 本轮缓存的模型结果。 */
+    uint8_t weight_decision;                      /* 本轮称重判定。 */
+    uint8_t ldc_decision;                         /* 本轮电感判定。 */
+    uint8_t f4_state;                             /* F4 协议状态。 */
+    uint8_t fault_level;                          /* 0=无故障，1=提示，2=告警，3=停机。 */
+    uint16_t fault_bits;                          /* 当前 F4 故障位图。 */
+    uint16_t duration_ms;                         /* F4 侧动作耗时，单位 ms。 */
+    uint16_t option_bits;                         /* 扩展位。 */
+} BinaryProtocol_CycleDonePayload_t;
+
 uint8_t BinaryProtocolService_IsBinaryFrame(const uint8_t *frame_buffer, uint16_t frame_length);
 uint16_t BinaryProtocolService_Crc16CcittFalse(const uint8_t *data, uint16_t length);
 BinaryProtocol_ParseStatus_t BinaryProtocolService_ParseFrame(const uint8_t *frame_buffer,
@@ -567,6 +741,18 @@ uint8_t BinaryProtocolService_DecodeActuatorHome(const uint8_t *payload,
 uint8_t BinaryProtocolService_DecodeWeightCalibration(const uint8_t *payload,
                                                       uint8_t payload_length,
                                                       BinaryProtocol_WeightCalibrationPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeModelReady(const uint8_t *payload,
+                                               uint8_t payload_length,
+                                               BinaryProtocol_ModelReadyPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeArmJobStart(const uint8_t *payload,
+                                                uint8_t payload_length,
+                                                BinaryProtocol_ArmJobStartPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeFinalSortResult(const uint8_t *payload,
+                                                    uint8_t payload_length,
+                                                    BinaryProtocol_FinalSortResultPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeWeightResult(const uint8_t *payload,
+                                                 uint8_t payload_length,
+                                                 BinaryProtocol_WeightResultPayload_t *decoded_payload);
 uint8_t BinaryProtocolService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_length);
 void BinaryProtocolService_SetFaultBit(uint16_t fault_bit);
 void BinaryProtocolService_ClearFaultBit(uint16_t fault_bit);
@@ -575,6 +761,25 @@ void BinaryProtocolService_ReportFault(uint16_t fault_code,
                                        uint8_t severity,
                                        int32_t detail_i32,
                                        uint16_t related_seq);
+void BinaryProtocolService_SendEventReport(uint16_t cycle_id,
+                                           uint8_t event_code,
+                                           uint8_t step_code,
+                                           uint8_t source,
+                                           int32_t detail_i32,
+                                           uint16_t related_seq);
+int32_t BinaryProtocolService_BuildActuatorMoveDetail(uint8_t actuator,
+                                                      uint8_t direction,
+                                                      uint16_t status_code);
+void BinaryProtocolService_SendWeightResult(const BinaryProtocol_WeightResultPayload_t *payload);
+void BinaryProtocolService_SendLdcResult(const BinaryProtocol_LdcResultPayload_t *payload);
+void BinaryProtocolService_SendCycleDone(const BinaryProtocol_CycleDonePayload_t *payload);
+void BinaryProtocolService_HandleArmStageDone(uint16_t cycle_id,
+                                              uint16_t job_id,
+                                              uint8_t stage_id,
+                                              uint8_t result,
+                                              uint16_t detail_code,
+                                              uint16_t elapsed_ms,
+                                              uint16_t arm_fault_bits);
 
 #ifdef __cplusplus
 }

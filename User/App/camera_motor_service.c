@@ -173,6 +173,25 @@ typedef struct
 } CameraMotor_RuntimeConfigSet_t;
 
 /**
+ * @brief 摄像头位置运动完成事件的等待上下文。
+ *
+ * 左右轴和上下轴共用 USART6，本结构明确记录当前等待的是哪根轴、
+ * 哪个 MP157 命令序号以及用于识别 `[addr FD 9F 6B]` 的解析器。
+ */
+typedef struct
+{
+    uint8_t active_flag;                    /* 1 表示当前有一条摄像头位置运动正在等待到位回包。 */
+    CameraMotor_Axis_t axis;                /* 当前等待的目标轴，决定轮询时匹配左右轴地址还是 Z 轴地址。 */
+    uint16_t cycle_id;                      /* MP157 自动检测流程 ID，完成/超时事件原样返回。 */
+    uint16_t related_seq;                   /* 原始 ACTUATOR_POS_MOVE 帧序号，MP157 用它解除等待。 */
+    uint8_t actuator;                       /* 协议执行器编号，左右轴为 1，上下轴为 2。 */
+    uint8_t direction;                      /* 原始协议方向字段，写入 detail_i32 便于诊断。 */
+    TickType_t start_tick;                  /* 开始等待到位回包的 tick，用差值判断超时并兼容 tick 回绕。 */
+    TickType_t timeout_ticks;               /* 本次允许等待的 tick 数，由步数和转速估算。 */
+    EMM42_MotorReachedAckParser_t parser;   /* 到位回包滑动窗口解析器。 */
+} CameraMotor_PendingMoveReport_t;
+
+/**
  * @brief 摄像头电机任务队列命令。
  */
 typedef struct
@@ -183,6 +202,11 @@ typedef struct
     uint16_t speed_rpm;                   /* 请求转速，单位 RPM；0 表示使用当前轴的运行时默认速度。 */
     uint32_t pulse_count;                 /* 位置模式相对移动步数，单位 step；只有 POSITION 命令使用。 */
     uint32_t stop_epoch;                  /* STOP 代际编号，用于丢弃 STOP 之前还没执行的旧运动命令。 */
+    uint8_t report_enabled;               /* 1 表示本位置命令完成后要用 EVENT_REPORT 回报 MP157。 */
+    uint16_t report_cycle_id;             /* 完成事件所属流程 ID，由二进制协议层从原始帧带入。 */
+    uint16_t report_related_seq;          /* 完成事件关联的原始帧序号，MP157 按该序号解除等待。 */
+    uint8_t report_actuator;              /* 完成事件里的执行器编号，左右轴为 1，上下轴为 2。 */
+    uint8_t report_direction;             /* 完成事件里的方向字段，按 MP157 原始 direction 回填。 */
     CameraMotor_RuntimeConfigSet_t config; /* CONFIG 命令携带的新运行时参数，其它命令忽略该字段。 */
 } CameraMotor_Command_t;
 
@@ -192,6 +216,7 @@ typedef struct
 typedef struct
 {
     CameraMotor_RuntimeConfigSet_t config; /* 当前生效的两个摄像头轴运行时参数，只在摄像头任务内直接读写。 */
+    CameraMotor_PendingMoveReport_t pending_move; /* 当前等待到位事件的位置运动上下文。 */
 } CameraMotor_Runtime_t;
 
 /**
@@ -457,6 +482,204 @@ static uint8_t CameraMotorService_PostCommand(const CameraMotor_Command_t *comma
 }
 
 /**
+ * @brief 向 MP157 发送摄像头运动轴的位置完成或超时事件。
+ * @param cycle_id 自动检测流程 ID。
+ * @param related_seq 原始 ACTUATOR_POS_MOVE 帧序号。
+ * @param actuator 协议执行器编号，左右轴为 1，上下轴为 2。
+ * @param direction 原始协议方向字段。
+ * @param event_code `ACTUATOR_MOVE_DONE` 或 `ACTUATOR_MOVE_TIMEOUT`。
+ * @param status_code 底层状态码，0 表示成功，其它值说明失败来源。
+ */
+static void CameraMotorService_SendMoveReport(uint16_t cycle_id,
+                                              uint16_t related_seq,
+                                              uint8_t actuator,
+                                              uint8_t direction,
+                                              uint8_t event_code,
+                                              uint16_t status_code)
+{
+    int32_t detail_i32;
+
+    detail_i32 = BinaryProtocolService_BuildActuatorMoveDetail(actuator,
+                                                               direction,
+                                                               status_code);
+    BinaryProtocolService_SendEventReport(cycle_id,
+                                          event_code,
+                                          0U,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR,
+                                          detail_i32,
+                                          related_seq);
+}
+
+/**
+ * @brief 清除摄像头电机位置运动等待上下文。
+ * @param runtime 摄像头电机运行时状态，不能为空。
+ *
+ * STOP_ALL、JOG、SET_ZERO、CONFIG 或新位置命令都会改变总线运动语义，
+ * 所以执行这些动作前清空旧 pending，防止旧回包误推进 MP157 自动流程。
+ */
+static void CameraMotorService_ClearPendingMoveReport(CameraMotor_Runtime_t *runtime)
+{
+    if (runtime == NULL)
+    {
+        return;
+    }
+
+    runtime->pending_move.active_flag = 0U;
+    runtime->pending_move.axis = CAMERA_MOTOR_AXIS_LATERAL;
+    runtime->pending_move.cycle_id = 0U;
+    runtime->pending_move.related_seq = 0U;
+    runtime->pending_move.actuator = 0U;
+    runtime->pending_move.direction = 0U;
+    runtime->pending_move.start_tick = 0U;
+    runtime->pending_move.timeout_ticks = 0U;
+    EMM42_MotorReachedAckParserReset(&runtime->pending_move.parser);
+}
+
+/**
+ * @brief 根据已成功下发的位置命令启动摄像头轴到位等待。
+ * @param runtime 摄像头电机运行时状态，不能为空。
+ * @param command 已成功执行的位置命令，不能为空。
+ * @param speed_rpm 实际下发速度，单位 RPM。
+ */
+static void CameraMotorService_StartPendingMoveReport(CameraMotor_Runtime_t *runtime,
+                                                      const CameraMotor_Command_t *command,
+                                                      uint16_t speed_rpm)
+{
+    uint32_t timeout_ms;
+    TickType_t timeout_ticks;
+
+    if ((runtime == NULL) || (command == NULL) || (command->report_enabled == 0U))
+    {
+        return;
+    }
+
+    CameraMotorService_ClearPendingMoveReport(runtime);
+    timeout_ms = EMM42_MotorEstimateReachedTimeoutMs(command->pulse_count, speed_rpm);
+    timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    if (timeout_ticks == 0U)
+    {
+        timeout_ticks = 1U;
+    }
+
+    runtime->pending_move.active_flag = 1U;
+    runtime->pending_move.axis = command->axis;
+    runtime->pending_move.cycle_id = command->report_cycle_id;
+    runtime->pending_move.related_seq = command->report_related_seq;
+    runtime->pending_move.actuator = command->report_actuator;
+    runtime->pending_move.direction = command->report_direction;
+    runtime->pending_move.start_tick = xTaskGetTickCount();
+    runtime->pending_move.timeout_ticks = timeout_ticks;
+    EMM42_MotorReachedAckParserReset(&runtime->pending_move.parser);
+}
+
+/**
+ * @brief 摄像头位置命令执行失败时，主动给 MP157 发超时/失败事件。
+ * @param command 原始队列命令，不能为空。
+ * @param status_code 失败状态码。
+ *
+ * MP157 已经拿到 ACK 后会等待 DONE/TIMEOUT；
+ * 如果 F4 发送位置帧前失败，必须用本函数解除等待。
+ */
+static void CameraMotorService_ReportPositionCommandFailure(const CameraMotor_Command_t *command,
+                                                            uint16_t status_code)
+{
+    if ((command == NULL) || (command->report_enabled == 0U))
+    {
+        return;
+    }
+
+    BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
+    CameraMotorService_SendMoveReport(command->report_cycle_id,
+                                      command->report_related_seq,
+                                      command->report_actuator,
+                                      command->report_direction,
+                                      BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT,
+                                      status_code);
+}
+
+/**
+ * @brief 周期轮询摄像头轴 Emm42 到位回包并上报 MP157。
+ * @param lateral_motor 左右轴电机句柄，不能为空。
+ * @param z_motor 上下轴电机句柄，不能为空。
+ * @param runtime 摄像头电机运行时状态，不能为空。
+ *
+ * 因为两个摄像头轴共用 USART6，本函数一次只处理一个 pending。
+ * 解析器会匹配目标轴地址，只有 `[目标地址 FD 9F 6B]` 才算真实到位。
+ */
+static void CameraMotorService_PollPendingMoveReport(const EMM42_MotorHandle_t *lateral_motor,
+                                                     const EMM42_MotorHandle_t *z_motor,
+                                                     CameraMotor_Runtime_t *runtime)
+{
+    const EMM42_MotorHandle_t *target_motor;
+    EMM42_MotorStatus_t status;
+    uint8_t reached_flag;
+    TickType_t current_tick;
+
+    if ((lateral_motor == NULL) ||
+        (z_motor == NULL) ||
+        (runtime == NULL) ||
+        (runtime->pending_move.active_flag == 0U))
+    {
+        return;
+    }
+
+    target_motor = (runtime->pending_move.axis == CAMERA_MOTOR_AXIS_Z) ? z_motor : lateral_motor;
+    status = EMM42_MotorPollReachedAck(target_motor,
+                                       &runtime->pending_move.parser,
+                                       &reached_flag);
+    if (status != EMM42_MOTOR_STATUS_OK)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
+        BinaryProtocolService_ReportFault((uint16_t)status,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)status,
+                                          runtime->pending_move.related_seq);
+        CameraMotorService_SendMoveReport(runtime->pending_move.cycle_id,
+                                          runtime->pending_move.related_seq,
+                                          runtime->pending_move.actuator,
+                                          runtime->pending_move.direction,
+                                          BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT,
+                                          (uint16_t)status);
+        CameraMotorService_ClearPendingMoveReport(runtime);
+        return;
+    }
+
+    if (reached_flag != 0U)
+    {
+        BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
+        CameraMotorService_SendMoveReport(runtime->pending_move.cycle_id,
+                                          runtime->pending_move.related_seq,
+                                          runtime->pending_move.actuator,
+                                          runtime->pending_move.direction,
+                                          BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE,
+                                          (uint16_t)EMM42_MOTOR_STATUS_OK);
+        CameraMotorService_ClearPendingMoveReport(runtime);
+        return;
+    }
+
+    current_tick = xTaskGetTickCount();
+    if ((current_tick - runtime->pending_move.start_tick) >= runtime->pending_move.timeout_ticks)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
+        BinaryProtocolService_ReportFault((uint16_t)EMM42_MOTOR_STATUS_TIMEOUT,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          BinaryProtocolService_BuildActuatorMoveDetail(runtime->pending_move.actuator,
+                                                                                       runtime->pending_move.direction,
+                                                                                       (uint16_t)EMM42_MOTOR_STATUS_TIMEOUT),
+                                          runtime->pending_move.related_seq);
+        CameraMotorService_SendMoveReport(runtime->pending_move.cycle_id,
+                                          runtime->pending_move.related_seq,
+                                          runtime->pending_move.actuator,
+                                          runtime->pending_move.direction,
+                                          BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT,
+                                          (uint16_t)EMM42_MOTOR_STATUS_TIMEOUT);
+        CameraMotorService_ClearPendingMoveReport(runtime);
+    }
+}
+
+/**
  * @brief 请求摄像头左右轴点动。
  * @param right_flag 1 表示右移方向，0 表示左移方向。
  * @param speed_rpm 点动速度，单位 RPM，传 0 使用默认值。
@@ -531,6 +754,46 @@ uint8_t CameraMotorService_RequestLateralPosition(uint8_t right_flag,
 }
 
 /**
+ * @brief 请求摄像头左右轴位置运动，并在到位或超时时通过 EVENT_REPORT 回告 MP157。
+ * @param right_flag 1 表示右移方向，0 表示左移方向。
+ * @param speed_rpm 位置运动速度，单位 RPM，传 0 使用默认值。
+ * @param pulse_count 相对移动步数，单位 step。
+ * @param cycle_id 自动检测流程 ID。
+ * @param related_seq 原始 ACTUATOR_POS_MOVE 帧序号。
+ * @param actuator 协议执行器编号。
+ * @param direction 原始协议方向字段。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或服务未就绪。
+ */
+uint8_t CameraMotorService_RequestLateralPositionWithReport(uint8_t right_flag,
+                                                            uint16_t speed_rpm,
+                                                            uint32_t pulse_count,
+                                                            uint16_t cycle_id,
+                                                            uint16_t related_seq,
+                                                            uint8_t actuator,
+                                                            uint8_t direction)
+{
+    CameraMotor_Command_t command;
+
+    if (pulse_count == 0U)
+    {
+        return 0U;
+    }
+
+    (void)memset(&command, 0, sizeof(command));
+    command.type = CAMERA_MOTOR_COMMAND_POSITION;
+    command.axis = CAMERA_MOTOR_AXIS_LATERAL;
+    command.direction = (right_flag != 0U) ? EMM42_MOTOR_DIRECTION_CW : EMM42_MOTOR_DIRECTION_CCW;
+    command.speed_rpm = CameraMotorService_LimitJogSpeed(speed_rpm);
+    command.pulse_count = pulse_count;
+    command.report_enabled = 1U;
+    command.report_cycle_id = cycle_id;
+    command.report_related_seq = related_seq;
+    command.report_actuator = actuator;
+    command.report_direction = direction;
+    return CameraMotorService_PostCommand(&command);
+}
+
+/**
  * @brief 旧版前进/后退位置接口兼容包装。
  * @param forward_flag 旧语义中的前进标志，1 映射为右移，0 映射为左移。
  * @param speed_rpm 位置运动速度，单位 RPM，传 0 使用默认值。
@@ -568,6 +831,46 @@ uint8_t CameraMotorService_RequestZPosition(uint8_t up_flag,
     command.direction = (up_flag != 0U) ? EMM42_MOTOR_DIRECTION_CW : EMM42_MOTOR_DIRECTION_CCW;
     command.speed_rpm = CameraMotorService_LimitJogSpeed(speed_rpm);
     command.pulse_count = pulse_count;
+    return CameraMotorService_PostCommand(&command);
+}
+
+/**
+ * @brief 请求摄像头上下轴位置运动，并在到位或超时时通过 EVENT_REPORT 回告 MP157。
+ * @param up_flag 1 表示上升方向，0 表示下降方向。
+ * @param speed_rpm 位置运动速度，单位 RPM，传 0 使用默认值。
+ * @param pulse_count 相对移动步数，单位 step。
+ * @param cycle_id 自动检测流程 ID。
+ * @param related_seq 原始 ACTUATOR_POS_MOVE 帧序号。
+ * @param actuator 协议执行器编号。
+ * @param direction 原始协议方向字段。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或服务未就绪。
+ */
+uint8_t CameraMotorService_RequestZPositionWithReport(uint8_t up_flag,
+                                                      uint16_t speed_rpm,
+                                                      uint32_t pulse_count,
+                                                      uint16_t cycle_id,
+                                                      uint16_t related_seq,
+                                                      uint8_t actuator,
+                                                      uint8_t direction)
+{
+    CameraMotor_Command_t command;
+
+    if (pulse_count == 0U)
+    {
+        return 0U;
+    }
+
+    (void)memset(&command, 0, sizeof(command));
+    command.type = CAMERA_MOTOR_COMMAND_POSITION;
+    command.axis = CAMERA_MOTOR_AXIS_Z;
+    command.direction = (up_flag != 0U) ? EMM42_MOTOR_DIRECTION_CW : EMM42_MOTOR_DIRECTION_CCW;
+    command.speed_rpm = CameraMotorService_LimitJogSpeed(speed_rpm);
+    command.pulse_count = pulse_count;
+    command.report_enabled = 1U;
+    command.report_cycle_id = cycle_id;
+    command.report_related_seq = related_seq;
+    command.report_actuator = actuator;
+    command.report_direction = direction;
     return CameraMotorService_PostCommand(&command);
 }
 
@@ -1093,11 +1396,14 @@ static void CameraMotorService_ApplyCommand(const CameraMotor_Command_t *command
                   "[INFO][CAM] Drop stale motion after STOP. type=%u, axis=%s\r\n",
                   (unsigned int)command->type,
                   CameraMotorService_GetAxisName(command->axis));
+        CameraMotorService_ReportPositionCommandFailure(command,
+                                                        (uint16_t)EMM42_MOTOR_STATUS_TIMEOUT);
         return;
     }
 
     if (command->type == CAMERA_MOTOR_COMMAND_STOP_ALL)
     {
+        CameraMotorService_ClearPendingMoveReport(runtime);
         status = EMM42_MotorStopNow(lateral_motor, false);
         if (status != EMM42_MOTOR_STATUS_OK)
         {
@@ -1135,6 +1441,7 @@ static void CameraMotorService_ApplyCommand(const CameraMotor_Command_t *command
 
     if (command->type == CAMERA_MOTOR_COMMAND_CONFIG)
     {
+        CameraMotorService_ClearPendingMoveReport(runtime);
         /*
          * 配置切换只改 F4 运行内存，不写电机 EEPROM。
          * 先按旧地址尝试停机，再更新两个句柄地址，保证后续命令走新地址。
@@ -1188,6 +1495,7 @@ static void CameraMotorService_ApplyCommand(const CameraMotor_Command_t *command
 
     if (command->type == CAMERA_MOTOR_COMMAND_SET_ZERO)
     {
+        CameraMotorService_ClearPendingMoveReport(runtime);
         status = EMM42_MotorStopNow(target_motor, false);
         if (status != EMM42_MOTOR_STATUS_OK)
         {
@@ -1235,6 +1543,7 @@ static void CameraMotorService_ApplyCommand(const CameraMotor_Command_t *command
 
     if (command->type == CAMERA_MOTOR_COMMAND_POSITION)
     {
+        CameraMotorService_ClearPendingMoveReport(runtime);
         if (speed_rpm == 0U)
         {
             BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
@@ -1246,6 +1555,25 @@ static void CameraMotorService_ApplyCommand(const CameraMotor_Command_t *command
             my_printf(&huart1,
                       "[ERROR][CAM] position speed is zero. axis=%s\r\n",
                       CameraMotorService_GetAxisName(command->axis));
+            CameraMotorService_ReportPositionCommandFailure(command,
+                                                            (uint16_t)EMM42_MOTOR_STATUS_RANGE_ERROR);
+            return;
+        }
+
+        status = EMM42_MotorFlushReceive(target_motor);
+        if (status != EMM42_MOTOR_STATUS_OK)
+        {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
+            BinaryProtocolService_ReportFault((uint16_t)status,
+                                              BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR,
+                                              BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                              (int32_t)status,
+                                              command->report_related_seq);
+            my_printf(&huart1,
+                      "[ERROR][CAM] position rx flush failed. axis=%s, status=%d\r\n",
+                      CameraMotorService_GetAxisName(command->axis),
+                      (int)status);
+            CameraMotorService_ReportPositionCommandFailure(command, (uint16_t)status);
             return;
         }
 
@@ -1268,14 +1596,18 @@ static void CameraMotorService_ApplyCommand(const CameraMotor_Command_t *command
                       CameraMotorService_GetAxisName(command->axis),
                       (unsigned long)command->pulse_count,
                       (int)status);
+            CameraMotorService_ReportPositionCommandFailure(command, (uint16_t)status);
             return;
         }
 
         CameraMotorService_UpdateActionSnapshot(command->axis,
                                                 mapped_direction,
                                                 speed_rpm);
+        CameraMotorService_StartPendingMoveReport(runtime, command, speed_rpm);
         return;
     }
+
+    CameraMotorService_ClearPendingMoveReport(runtime);
 
     if (speed_rpm == 0U)
     {
@@ -1347,6 +1679,7 @@ void CameraMotorService_Task(void *argument)
 
     (void)argument;
     runtime.config = CameraMotorService_GetDefaultConfigSet();
+    CameraMotorService_ClearPendingMoveReport(&runtime);
     CameraMotorService_UpdateConfigSnapshot(&runtime.config);
 
     if (g_camera_motor_command_queue == NULL)
@@ -1413,5 +1746,7 @@ void CameraMotorService_Task(void *argument)
         {
             CameraMotorService_ApplyCommand(&command, &lateral_motor, &z_motor, &runtime);
         }
+
+        CameraMotorService_PollPendingMoveReport(&lateral_motor, &z_motor, &runtime);
     }
 }

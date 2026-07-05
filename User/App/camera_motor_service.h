@@ -74,6 +74,28 @@ uint8_t CameraMotorService_RequestLateralPosition(uint8_t right_flag,
                                                   uint32_t pulse_count);
 
 /**
+ * @brief 请求摄像头左右轴位置运动，并在真实到位或超时时向 MP157 上报事件。
+ * @param right_flag 1 表示按工程约定的右移方向移动，0 表示按工程约定的左移方向移动。
+ * @param speed_rpm 位置运动速度，单位 RPM，传 0 时使用该轴默认速度。
+ * @param pulse_count 相对移动步数，单位 step，范围 1~4294967295。
+ * @param cycle_id 自动检测流程 ID，用于让 MP157 匹配本轮流程。
+ * @param related_seq 原始 `ACTUATOR_POS_MOVE` 帧序号，用于让 MP157 匹配具体命令。
+ * @param actuator 协议执行器编号，左右轴固定为 1。
+ * @param direction 原始协议方向字段，按 MP157 下发值原样回填到完成事件。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或摄像头电机服务尚未就绪。
+ *
+ * 注意：协议 ACK 只说明请求已投递，真实物理完成必须等待
+ * `EVENT_REPORT/ACTUATOR_MOVE_DONE`。
+ */
+uint8_t CameraMotorService_RequestLateralPositionWithReport(uint8_t right_flag,
+                                                            uint16_t speed_rpm,
+                                                            uint32_t pulse_count,
+                                                            uint16_t cycle_id,
+                                                            uint16_t related_seq,
+                                                            uint8_t actuator,
+                                                            uint8_t direction);
+
+/**
  * @brief 旧版前进/后退位置接口兼容包装。
  * @param forward_flag 旧命名参数，1 会映射为右移，0 会映射为左移。
  * @param speed_rpm 位置运动速度，单位 RPM，传 0 时使用该轴默认速度。
@@ -94,6 +116,27 @@ uint8_t CameraMotorService_RequestForwardPosition(uint8_t forward_flag,
 uint8_t CameraMotorService_RequestZPosition(uint8_t up_flag,
                                             uint16_t speed_rpm,
                                             uint32_t pulse_count);
+
+/**
+ * @brief 请求摄像头上下轴位置运动，并在真实到位或超时时向 MP157 上报事件。
+ * @param up_flag 1 表示按工程约定的上升方向移动，0 表示按工程约定的下降方向移动。
+ * @param speed_rpm 位置运动速度，单位 RPM，传 0 时使用该轴默认速度。
+ * @param pulse_count 相对移动步数，单位 step，范围 1~4294967295。
+ * @param cycle_id 自动检测流程 ID，用于让 MP157 匹配本轮流程。
+ * @param related_seq 原始 `ACTUATOR_POS_MOVE` 帧序号，用于让 MP157 匹配具体命令。
+ * @param actuator 协议执行器编号，上下轴固定为 2。
+ * @param direction 原始协议方向字段，按 MP157 下发值原样回填到完成事件。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或摄像头电机服务尚未就绪。
+ *
+ * MP157 自动流程必须等该接口对应的 DONE 事件后，才能认为 Z 轴下降或回升真正完成。
+ */
+uint8_t CameraMotorService_RequestZPositionWithReport(uint8_t up_flag,
+                                                      uint16_t speed_rpm,
+                                                      uint32_t pulse_count,
+                                                      uint16_t cycle_id,
+                                                      uint16_t related_seq,
+                                                      uint8_t actuator,
+                                                      uint8_t direction);
 
 /**
  * @brief 请求摄像头左右轴把当前位置设为新的零点。

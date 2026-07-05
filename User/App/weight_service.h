@@ -24,6 +24,26 @@ typedef enum
 } WeightService_CalibrationResult_t;
 
 /**
+ * @brief 供二进制自动流程读取的称重快照。
+ *
+ * 该结构只保存最近一次称重任务已经采到的数据，不主动等待新样本。
+ * F4 应在 ESP32S3 确认“零件已放到称重模块并放稳”后读取它，再打包 WEIGHT_RESULT。
+ */
+typedef struct
+{
+    uint16_t sample_id;              /* 称重任务本地递增样本号，用于 MP157 判断是否拿到新快照。 */
+    uint8_t stable;                  /* 1 表示最近样本有效且去皮完成，0 表示只能作为待复核数据。 */
+    uint8_t decision;                /* 0=unknown，1=pass，2=fail，3=review；首版未做重量阈值时稳定即 pass。 */
+    int32_t gross_weight_mg;         /* 毛重，单位 mg；当前无独立毛重模型时与净重保持同量级。 */
+    int32_t net_weight_mg;           /* 净重，单位 mg，由 HX711 标定系数换算。 */
+    int32_t raw_adc;                 /* 最近一次中值滤波后的 HX711 原始计数。 */
+    uint16_t sample_count;           /* 当前滤波窗口有效样本数量。 */
+    uint16_t stable_window_mg;       /* 稳定窗口估计波动，首版无窗口统计时填 0。 */
+    uint16_t duration_ms;            /* 本次快照对应采样周期估计耗时，单位 ms。 */
+    uint32_t option_bits;            /* bit0=HX711已标定，bit1=去皮完成，bit2=最近样本有效。 */
+} WeightService_Snapshot_t;
+
+/**
  * @brief 电子称应用任务入口。
  * @param argument FreeRTOS任务参数，当前未使用。
  *
@@ -49,6 +69,15 @@ void WeightService_Task(void *argument);
  */
 WeightService_CalibrationResult_t WeightService_RequestCalibration(uint16_t known_weight_g,
                                                                    uint16_t *detail);
+
+/**
+ * @brief 获取称重任务最近一次快照。
+ * @param snapshot 输出称重快照，不能为空。
+ * @return uint8_t 1 表示快照有效，0 表示称重任务尚未建立上下文。
+ *
+ * 该函数不阻塞、不触发 HX711 新采样，只复制 WeightService_Task 最近维护的结果。
+ */
+uint8_t WeightService_GetLatestSnapshot(WeightService_Snapshot_t *snapshot);
 
 #ifdef __cplusplus
 }

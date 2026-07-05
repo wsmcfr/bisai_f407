@@ -10,12 +10,12 @@
 
 | 文件 | 类型 | 修改原因 |
 |---|---|---|
-| `User/App/binary_protocol_service.h` | 修改 | 定义协议帧格式、命令字、错误码、负载结构、CRC/解帧/分发接口；新增 `STEPPER_PARAM_SET(0x42)` 和 25 字节步进参数负载，新增 `WEIGHT_CALIBRATE(0x30)` 和 5 字节称重标定负载；新增 `ACTUATOR_POS_MOVE(0x50)`、`ACTUATOR_STOP(0x51)`、`ACTUATOR_VEL_MOVE(0x52)`、`ACTUATOR_HOME(0x53)` 执行器负载。 |
+| `User/App/binary_protocol_service.h` | 修改 | 定义协议帧格式、命令字、错误码、负载结构、CRC/解帧/分发接口；新增 `STEPPER_PARAM_SET(0x42)` 和 31 字节步进参数负载，单条电机记录 9 字节，包含传送带对中/短步速度 `normal_speed_rpm` 和上料扫描速度 `scan_speed_rpm`；新增 `WEIGHT_CALIBRATE(0x30)` 和 5 字节称重标定负载；新增 `ACTUATOR_POS_MOVE(0x50)`、`ACTUATOR_STOP(0x51)`、`ACTUATOR_VEL_MOVE(0x52)`、`ACTUATOR_HOME(0x53)` 执行器负载。 |
 | `User/App/binary_protocol_service.c` | 修改 | 实现 CRC16-CCITT-FALSE、组帧、解帧、负载解码、ACK/NACK 发送和命令分发；新增三台步进电机参数校验和分发，新增称重标定解码与 `WeightService_RequestCalibration()` 调用；新增三轴位置运动、速度连续运动、停止和当前位置设零分发，并保证成功 ACK 的 `status=0`。 |
 | `User/App/uart_command.h` | 修改 | 增加 `UartCommand_SendRaw()`，用于发送包含 `0x00` 的二进制 ACK/NACK 帧。 |
 | `User/App/uart_command.c` | 修改 | 让二进制原始帧发送和 `my_printf()` 共用 USART1 发送互斥锁，避免文本日志和二进制帧交叉。 |
 | `User/App/conveyor_motor_service.h` | 修改 | 增加 `ConveyorMotorService_RequestScan/Stop/Track()` 和 `ConveyorMotorService_RequestRuntimeConfig()` 公共入口，供协议服务投递传送带控制和参数配置请求；新增 `RequestJog/RequestPosition/RequestSetCurrentPositionZero` 执行器接口。 |
-| `User/App/conveyor_motor_service.c` | 修改 | 复用已有队列和状态机实现公共入口；新增运行时地址、最小步长、常规速度和方向配置，避免二进制协议层直接操作 Emm42 串口；新增 JOG、相对位置和当前位置设零命令处理。 |
+| `User/App/conveyor_motor_service.c` | 修改 | 复用已有队列和状态机实现公共入口；新增运行时地址、最小步长、对中/短步速度、上料扫描速度和方向配置，避免二进制协议层直接操作 Emm42 串口；新增 JOG、相对位置和当前位置设零命令处理。 |
 | `User/App/camera_motor_service.h` | 修改 | 增加 `CameraMotorService_RequestRuntimeConfig()`，供 `STEPPER_PARAM_SET` 一次性更新摄像头左右轴和上下轴参数；新增左右轴/上下轴 JOG、位置移动和当前位置设零接口。 |
 | `User/App/camera_motor_service.c` | 修改 | 摄像头电机任务新增运行时参数配置队列命令；默认点动速度支持 MP157 下发的 `0~5000 rpm`；新增左右轴速度连续运动、左右轴/上下轴相对位置移动和当前位置设零。 |
 | `User/Driver/emm42_motor.c`、`User/Driver/emm42_motor.h` | 修改 | 新增 `EMM42_MotorMoveRelativePosition()` 和 `EMM42_MotorResetCurrentPositionToZero()`，分别发送张大头 Emm42 `0xFD` 相对位置帧和 `[addr 0A 6D 6B]` 当前位置清零帧。 |
@@ -70,7 +70,7 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | `0x30` | `WEIGHT_CALIBRATE` | 校验 5 字节负载，调用称重服务用已知砝码更新 HX711 运行时比例系数；成功回 `ACK`，未去皮、克重越界或采样异常回 `NACK`。 |
 | `0x40` | `QUERY_STATUS` | 查询 F4 协议状态和传送带状态，成功直接回 `STATUS_REPORT`。 |
 | `0x41` | `BELT_MANUAL_CONTROL` | 手动调试传送带扫描/停止，成功回 `ACK`，失败回 `NACK`。 |
-| `0x42` | `STEPPER_PARAM_SET` | 校验并下发三台 Emm42 的地址、最小步长、常规速度和方向；成功只更新 F4 运行内存，不写 F4 Flash，也不写 Emm42 EEPROM。 |
+| `0x42` | `STEPPER_PARAM_SET` | 校验并下发三台 Emm42 的地址、最小步长、常规/对中速度、传送带上料扫描速度和方向；成功只更新 F4 运行内存，不写 F4 Flash，也不写 Emm42 EEPROM。 |
 | `0x50` | `ACTUATOR_POS_MOVE` | 校验执行器、方向、速度和步数后，把传送带、摄像头左右轴或摄像头上下轴投递到相对位置模式；成功回 `ACK status=0`。 |
 | `0x51` | `ACTUATOR_STOP` | 停止指定执行器；`actuator=0xFF` 停止传送带、摄像头左右轴和摄像头上下轴；成功回 `ACK status=0`。 |
 | `0x52` | `ACTUATOR_VEL_MOVE` | 手动调试速度连续运动，只允许传送带和摄像头左右轴，直到收到 `ACTUATOR_STOP`；上下轴速度连续运动会返回 `NACK`。 |
@@ -83,9 +83,9 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | 0 | `cycle_id` | `u16` | 固定 `0` | 参数下发不绑定某一轮自动检测流程。 |
 | 2 | `motor_count` | `u8` | 固定 `3` | 三台步进电机记录。 |
 | 3 | `flags` | `u8` | 固定 `0` | 首版不表示持久化，也不写 EEPROM。 |
-| 4 | `motor[0]` | 7 字节记录 | 见下表 | 电机记录顺序不作为业务依据，F4 按 `role_id` 识别。 |
-| 11 | `motor[1]` | 7 字节记录 | 见下表 | 同上。 |
-| 18 | `motor[2]` | 7 字节记录 | 见下表 | 同上。 |
+| 4 | `motor[0]` | 9 字节记录 | 见下表 | 电机记录顺序不作为业务依据，F4 按 `role_id` 识别。 |
+| 13 | `motor[1]` | 9 字节记录 | 见下表 | 同上。 |
+| 22 | `motor[2]` | 9 字节记录 | 见下表 | 同上。 |
 
 单条电机记录格式：
 
@@ -94,8 +94,16 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | 0 | `role_id` | `u8` | `1/2/3` | `1=conveyor`，`2=camera_lateral`，`3=camera_z`，三条记录必须刚好覆盖且不能重复。 |
 | 1 | `address` | `u8` | `1~247` | Emm42 普通站号地址。 |
 | 2 | `min_step` | `u16` | `1~10000` | 最小步长，当前 F4 保存给后续位置步进命令使用。 |
-| 4 | `normal_speed_rpm` | `u16` | `0~5000` | 常规速度；传送带用于扫描速度，摄像头轴用于默认点动速度，`0` 表示默认运动保持停止。 |
-| 6 | `direction` | `i8` | `1` 或 `-1` | 方向映射，`-1` 会反转该电机逻辑方向。 |
+| 4 | `normal_speed_rpm` | `u16` | `0~5000` | 常规/对中速度；传送带用于零件入画后的 TRACK 和短步微调，摄像头轴用于自动流程和手动位置动作的默认速度，`0` 表示默认运动保持停止。 |
+| 6 | `scan_speed_rpm` | `u16` | `0~5000` | 传送带上料扫描速度，只对 `role_id=1` 生效；摄像头左右轴和上下轴首版填 `0`。 |
+| 8 | `direction` | `i8` | `1` 或 `-1` | 方向映射，`-1` 会反转该电机逻辑方向。 |
+
+速度生效关系：
+
+| 字段 | 传送带 | 摄像头左右轴 | 摄像头上下轴 |
+|---|---|---|---|
+| `normal_speed_rpm` | 零件入画后的视觉 TRACK 速度上限，以及 `ACTUATOR_POS_MOVE actuator=0 speed_rpm=0` 时的短步速度。 | `ACTUATOR_POS_MOVE/VEL_MOVE` 省略速度时的默认速度，自动 ROI X 微调也使用它。 | `ACTUATOR_POS_MOVE actuator=2 speed_rpm=0` 时的下探/回升速度。 |
+| `scan_speed_rpm` | `START_CYCLE/BELTSCAN` 等上料扫描阶段速度。 | 首版不使用，建议 MP157 固定填 `0`。 | 首版不使用，建议 MP157 固定填 `0`。 |
 
 ## `WEIGHT_CALIBRATE` 负载
 
@@ -164,7 +172,7 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | Keil 工程包含新文件 | `E:\hal\bisai_f407_project` | `Select-String -Path MDK-ARM\bisai_f407_project.uvprojx -Pattern "binary_protocol_service.c"` | 能看到 `../User/App/binary_protocol_service.c`。 | 如果查不到，Keil 不会编译新模块，需要重新加入工程文件。 |
 | 二进制握手 | MP157 串口工具 | 发送合法 `HELLO` 或 `HEARTBEAT` 帧 | F4 返回 `ACK 0x80` 二进制帧，负载 7 字节。 | 若无 ACK，检查帧头、帧尾、CRC 和 `BinaryProtocolService_HandleFrame()` 是否已在 `weight_service.c` 中优先调用。 |
 | 二进制状态查询 | MP157 串口工具 | 发送合法 `QUERY_STATUS 0x40` 帧，`query_mask=0x03` | F4 返回 `STATUS_REPORT 0x82`，负载 24 字节，能看到传送带模式、速度、误差和故障位。 | 若收到 `NACK`，按 `error_code` 排查；若无帧，先查 USART1 TX/RX、共地、波特率和 F4 是否烧录最新固件。 |
-| 步进参数下发 | MP157 Qt 参数页或串口工具 | 发送合法 `STEPPER_PARAM_SET 0x42` 帧，速度分别覆盖 `0`、`137`、`5000` 等值 | F4 返回 `ACK 0x80`，`acked_cmd=0x42`、`status=0`；随后 `CAMINFO` 可看到摄像头轴运行时地址、步长、速度和方向映射。 | 若收到 `NACK error_code=5`，按 detail 查字段范围；若 `error_code=10`，检查传送带任务或摄像头电机任务队列是否已创建。 |
+| 步进参数下发 | MP157 Qt 参数页或串口工具 | 发送合法 `STEPPER_PARAM_SET 0x42` 帧，负载 31 字节；传送带记录可设 `normal_speed_rpm=137、scan_speed_rpm=60`，摄像头两轴 `scan_speed_rpm=0`。 | F4 返回 `ACK 0x80`，`acked_cmd=0x42`、`status=0`；随后 `BELTINFO` 可看到 `track=137 rpm, scan=60 rpm`，`CAMINFO` 可看到摄像头轴运行时地址、步长、速度和方向映射。 | 若收到 `NACK error_code=4`，检查是否仍按旧 25 字节/7 字节记录发送；若收到 `NACK error_code=5`，按 detail 查字段范围；若 `error_code=10`，检查传送带任务或摄像头电机任务队列是否已创建。 |
 | 称重标定 | MP157 Qt 参数页或串口工具 | 发送合法 `WEIGHT_CALIBRATE 0x30` 帧，payload 为 `00 00 E8 03 00` 表示 `cycle_id=0, known_weight_g=1000, flags=0` | F4 已去皮且最近一次 HX711 采样有效时返回 `ACK 0x80`，`acked_cmd=0x30`、`status=0`。 | 若收到 `NACK error_code=6`，先确认空载去皮成功；若 `error_code=5`，检查克重是否 1~5000 且 flags/cycle_id 是否为 0；若 `error_code=10`，查 HX711 接线、供电和最近采样状态。 |
 | 重复开始不空 ACK | MP157 串口工具或 Qt 首页 | 在 F4 未断电且同一 `cycle_id` 仍有效时再次发送 `START_CYCLE` | F4 重新投递传送带 `SCAN`，并返回 `ACK status=0 state=SCANNING`。 | 若 Qt 显示 `ACK重复帧`，说明 F4 仍按旧语义返回 `status=1`；若 status=0 但电机不动，继续查 UART4 接线、电机地址、使能和供电。 |
 | 手动速度连续运动 | MP157 Qt 手动三轴弹窗或串口工具 | 发送合法 `ACTUATOR_VEL_MOVE actuator=0/1 direction=0/1 speed_rpm>0`，再发送对应 `ACTUATOR_STOP`。 | 传送带或左右轴持续运动，直到 STOP；成功 ACK 必须是 `acked_cmd=0x52 status=0`，停止 ACK 必须是 `acked_cmd=0x51 status=0`。 | 若 MP157 显示失败且 `status=1/2`，说明 F4 仍把 actuator 填进 ACK status，需要重新烧录；若上下轴速度模式被拒绝，这是预期，应改用位置固定步数。 |
@@ -180,7 +188,7 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | MP157 -> F4 二进制帧 | MP157 或串口工具向 USART1 写入 `A5 5A ... 6B`。 | F4 只用二进制 `ACK/NACK/STATUS_REPORT/FAULT_REPORT` 表达正确、错误和故障。 |
 | F4 -> MP157 ACK/NACK/STATUS/FAULT | `BinaryProtocolService_SendFrame()` 调用 `UartCommand_SendRaw()` 原样发送。 | MP157 按相同帧格式解析；若串口助手查看，必须用 HEX 显示。 |
 | 协议层 -> 传送带 | `START_CYCLE/PAUSE_CYCLE/RESUME_CYCLE/VISION_POS/STOP_CYCLE/BELT_MANUAL_CONTROL` 调用 `ConveyorMotorService_Request...()` 写入传送带队列。 | 发送二进制 `QUERY_STATUS` 查看 desired/applied/error/speed/centered，也可观察 Emm42 实际动作。 |
-| 协议层 -> 三台步进电机运行参数 | `STEPPER_PARAM_SET` 调用 `ConveyorMotorService_RequestRuntimeConfig()` 和 `CameraMotorService_RequestRuntimeConfig()` 写入各自任务队列。 | F4 回 `ACK` 只表示运行内存已接收；发送 `CAMINFO` 可读摄像头两个轴参数，传送带参数会影响下一次 `BELTSCAN/START_CYCLE` 扫描速度和方向。 |
+| 协议层 -> 三台步进电机运行参数 | `STEPPER_PARAM_SET` 调用 `ConveyorMotorService_RequestRuntimeConfig()` 和 `CameraMotorService_RequestRuntimeConfig()` 写入各自任务队列。 | F4 回 `ACK` 只表示运行内存已接收；发送 `BELTINFO` 可读传送带 `track/scan` 双速度，发送 `CAMINFO` 可读摄像头两个轴参数。传送带 `scan_speed_rpm` 影响下一次 `BELTSCAN/START_CYCLE` 上料扫描，`normal_speed_rpm` 影响 TRACK 和短步微调。 |
 | 协议层 -> 三台执行器运动 | `ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE` 调用传送带或摄像头电机服务的 JOG、POSITION、STOP 接口。 | 观察目标电机动作，并核对 ACK `status=0`；传送带还可用 `QUERY_STATUS` 查看 JOG/POSITION 状态，摄像头轴用 `CAMINFO` 看最近动作。 |
 | 协议层 -> Emm42 当前位置清零 | `ACTUATOR_HOME` 调用 `ConveyorMotorService_RequestSetCurrentPositionZero()`、`CameraMotorService_RequestLateralSetCurrentPositionZero()` 或 `CameraMotorService_RequestZSetCurrentPositionZero()`。 | F4 回 `ACK status=0` 后，目标电机不会转动；若再用相对位置移动，驱动器以新的当前位置作为位置基准。 |
 | 协议层 -> HX711 称重标定 | `WEIGHT_CALIBRATE` 调用 `WeightService_RequestCalibration()`，复用称重任务最近一次去皮状态和采样值。 | F4 回 `ACK` 表示 HX711 运行时 `scale_counts_per_g` 已更新；该值当前不写 Flash，F4 断电后需要重新标定或后续扩展持久化。 |
@@ -195,7 +203,7 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | MP157 显示 `ACK重复帧` | 说明 F4 返回了 `ACK status=1`，Qt 不再把它当作新的启动成功；先确认 F4 是否已经烧录“重复 `START_CYCLE` 重新投递 `SCAN`”的固件，再按 `STOP_CYCLE` 或复位 F4 清理旧流程。 |
 | Qt 首页显示自动流程 ACK 但传送带仍不动 | 先看 ACK 详情必须是 `status=0 state=SCANNING`；再发送二进制 `QUERY_STATUS` 看 `desired/applied/speed`；如果 `speed=60 rpm` 但电机不动，重点查 `UART4 PC10/PC11` 是否接到传送带驱动、TX/RX 是否交叉、F4 与电机是否共地、传送带 Emm42 地址是否为 `0x01`。 |
 | 传送带方向越调越远 | 上方来料时 MP157 会发送 `axis_px=center_y`、`target_px=height/2`，零件刚入画通常是负误差；当前 F4 要求 `CONVEYOR_MOTOR_POSITIVE_ERROR_IS_CW=0U`，让负误差沿扫描方向继续送入 ROI 中心。若现场又反向，先查该宏、运行时 direction 是否被参数页反转，以及 MP157 发送的 `axis_px` 是否仍选对传送带运动方向坐标。 |
-| 视觉跟踪速度太快、停在 ROI 前后反复往返 | 当前 F4 已把跟踪上限降到 `80 rpm`、加速度降到 `2`、低速爬行区扩大到 `50 px`、中心死区扩大到 `24 px`。若仍过冲，优先继续降低 `CONVEYOR_MOTOR_TRACK_MAX_SPEED_RPM` 到 `60 rpm`；若停得太早，再把 `CONVEYOR_MOTOR_CENTER_DEADBAND_PX` 从 `24` 缩到 `20` 或 `18`。 |
+| 视觉跟踪速度太快、停在 ROI 前后反复往返 | 当前 TRACK 速度上限优先由 MP157 参数页传送带 `normal_speed_rpm` 控制，F4 的 `CONVEYOR_MOTOR_TRACK_MAX_SPEED_RPM` 只作为默认值参与上电初始配置。若现场仍过冲，先在参数页降低传送带 `对中速度` 并确认 `BELTINFO track=<新值>`；若已经很慢仍停不准，再调整中心死区、低速爬行区或机械减速曲线。 |
 | 小误差持续发坐标但传送带不动 | 这是误差刚超过死区、但低速命令不足以克服静摩擦的典型现象；当前 F4 已把中心死区从 `18 px` 放大到 `24 px`，并把最小跟踪速度从 `10 rpm` 提高到 `20 rpm`。若 `BELTTRACK 25` 仍不动，继续把 `CONVEYOR_MOTOR_TRACK_MIN_SPEED_RPM` 提到 `25U`；若开始轻微过冲，先保持 `20 rpm`，只把死区缩回 `20 px`。 |
 | 步进参数保存后 F4 没变化 | 确认 Qt 弹窗点的是 `保存并下发`，界面显示的下发 ID 是否为现场期望值，例如 `左右=3，上下=2`；F4 是否返回 `ACK acked_cmd=0x42`；随后用 `CAMINFO` 或 USART1 `Runtime config applied` 日志确认运行时地址已变；代码已写不等于 F4 已烧录生效，必须重新编译并下载 F407 固件。 |
 | 手动传送带或左右轴按一次后没有持续运动 | 确认 Qt 发的是 `ACTUATOR_VEL_MOVE 0x52`，不是旧的 `ACTUATOR_POS_MOVE`；确认 ACK `status=0`，再查传送带/左右轴电机供电、地址和 UART。 |
@@ -227,3 +235,4 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | 2026-07-04 | 修正执行器命令成功 ACK：`ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME` 成功时统一返回 `status=0`，不能把 `actuator` 写入 ACK `status`，避免 MP157 把左右轴/上下轴成功回包误判为失败。 |
 | 2026-07-04 | 摄像头轴默认地址按现场实物改为左右轴 `0x03`、上下轴 `0x02`；摄像头电机服务队列改为短 FIFO，STOP 队首优先，避免 `STEPPER_PARAM_SET` 已 ACK 但 CONFIG 被下一条手动动作覆盖。 |
 | 2026-07-04 | 修正左右轴停止键无效：摄像头电机服务新增 `stop_epoch`，STOP 后自动丢弃旧 JOG/POSITION/HOME 运动命令，避免旧队列命令在 STOP 后重新启动左右轴。 |
+| 2026-07-05 | `STEPPER_PARAM_SET 0x42` 扩展为 31 字节负载、三条 9 字节电机记录；新增 `scan_speed_rpm`，传送带 SCAN 使用上料速度，TRACK/短步使用 `normal_speed_rpm`，摄像头两轴继续使用常规速度。 |

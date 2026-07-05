@@ -145,6 +145,34 @@
 #define ROBOT_ARM_SERVICE_CMD_SERVOS_RESET     (0x0CU)
 
 /**
+ * @brief ESP32S3 机械臂“ROI 抓取并放到称重模块”的动作组编号。
+ *
+ * 当前 F4 侧先按 LeArm 动作组方式下发，ESP32S3 负责人可把该编号映射到真实轨迹。
+ * 若后续切换到 `A5 5A` 机械臂协议，只需要保留本函数入口并替换内部组帧实现。
+ */
+#define ROBOT_ARM_SERVICE_ACTION_PLACE_WEIGHT  (10U)
+
+/**
+ * @brief ESP32S3 机械臂“从称重模块放到电磁感应模块”的动作组编号。
+ */
+#define ROBOT_ARM_SERVICE_ACTION_PLACE_LDC     (11U)
+
+/**
+ * @brief ESP32S3 机械臂“从电磁感应模块放到良品区”的动作组编号。
+ */
+#define ROBOT_ARM_SERVICE_ACTION_SORT_GOOD     (12U)
+
+/**
+ * @brief ESP32S3 机械臂“从电磁感应模块放到不良品区”的动作组编号。
+ */
+#define ROBOT_ARM_SERVICE_ACTION_SORT_BAD      (13U)
+
+/**
+ * @brief ESP32S3 机械臂“从电磁感应模块放到待复核区”的动作组编号。
+ */
+#define ROBOT_ARM_SERVICE_ACTION_SORT_REVIEW   (14U)
+
+/**
  * @brief 自定义 STM32 通讯模式命令号。
  *
  * ESP32 出厂固件原始协议没有“串口切换到 STM32 模式”的命令。
@@ -636,6 +664,129 @@ uint8_t RobotArmService_Init(void)
     g_robot_arm_frame_queue = xQueueCreate(ROBOT_ARM_SERVICE_QUEUE_LENGTH,
                                            sizeof(RobotArmService_Frame_t));
     return (g_robot_arm_frame_queue != NULL) ? 1U : 0U;
+}
+
+/**
+ * @brief 把一个自动检测业务动作组投递到 ESP32S3 发送队列。
+ * @param action_group_id ESP32S3 需要运行的动作组编号。
+ * @param cycle_id 当前自动检测流程号，仅用于 F4 日志和排障。
+ * @param job_id 当前机械臂任务号，仅用于 F4 日志和排障。
+ * @param part_type 零件类型，当前 LeArm 帧暂不携带，保留给后续 A5 机械臂协议。
+ * @param model_result 模型结果，当前 LeArm 帧暂不携带，保留给后续 A5 机械臂协议。
+ * @param final_bin 最终分拣目标，非分拣阶段填 0。
+ * @return uint8_t 1 表示投递成功，0 表示队列未就绪或已满。
+ *
+ * 当前 ESP32S3 固件不用本仓库实现，因此 F4 侧先定义稳定的业务入口和动作组编号。
+ * 后续 ESP32S3 只要保证动作组 10/11/12/13/14 分别完成称重、电感和分拣动作即可联调。
+ */
+static uint8_t RobotArmService_EnqueueBusinessAction(uint8_t action_group_id,
+                                                     uint16_t cycle_id,
+                                                     uint16_t job_id,
+                                                     uint8_t part_type,
+                                                     uint8_t model_result,
+                                                     uint8_t final_bin)
+{
+    RobotArmService_Frame_t queued_frame;
+    BaseType_t queue_status;
+
+    if (RobotArmService_Init() == 0U)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        return 0U;
+    }
+
+    (void)memset(&queued_frame, 0, sizeof(queued_frame));
+    queued_frame.data[0] = ROBOT_ARM_SERVICE_FRAME_HEADER;
+    queued_frame.data[1] = ROBOT_ARM_SERVICE_FRAME_HEADER;
+    queued_frame.data[2] = 0x05U;
+    queued_frame.data[3] = ROBOT_ARM_SERVICE_CMD_ACTION_GROUP_RUN;
+    queued_frame.data[4] = action_group_id;
+    queued_frame.data[5] = 0x01U;
+    queued_frame.data[6] = 0x00U;
+    queued_frame.length = 7U;
+
+    queue_status = xQueueSend(g_robot_arm_frame_queue, &queued_frame, 0U);
+    if (queue_status != pdTRUE)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_ReportFault((uint16_t)action_group_id,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)job_id,
+                                          0U);
+        return 0U;
+    }
+
+    BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+    my_printf(&huart1,
+              "[ARM] Auto action queued: group=%u, cycle=%u, job=%u, part=%u, model=%u, bin=%u.\r\n",
+              (unsigned int)action_group_id,
+              (unsigned int)cycle_id,
+              (unsigned int)job_id,
+              (unsigned int)part_type,
+              (unsigned int)model_result,
+              (unsigned int)final_bin);
+    return 1U;
+}
+
+/**
+ * @brief 请求 ESP32S3 机械臂把 ROI 中的零件放到称重模块。
+ */
+uint8_t RobotArmService_RequestPlaceWeight(uint16_t cycle_id,
+                                           uint16_t job_id,
+                                           uint8_t part_type,
+                                           uint8_t model_result)
+{
+    return RobotArmService_EnqueueBusinessAction(ROBOT_ARM_SERVICE_ACTION_PLACE_WEIGHT,
+                                                 cycle_id,
+                                                 job_id,
+                                                 part_type,
+                                                 model_result,
+                                                 0U);
+}
+
+/**
+ * @brief 请求 ESP32S3 机械臂把零件从称重模块放到电磁感应模块。
+ */
+uint8_t RobotArmService_RequestPlaceLdc(uint16_t cycle_id,
+                                        uint16_t job_id,
+                                        uint8_t part_type,
+                                        uint8_t model_result)
+{
+    return RobotArmService_EnqueueBusinessAction(ROBOT_ARM_SERVICE_ACTION_PLACE_LDC,
+                                                 cycle_id,
+                                                 job_id,
+                                                 part_type,
+                                                 model_result,
+                                                 0U);
+}
+
+/**
+ * @brief 请求 ESP32S3 机械臂把零件放到最终分拣区。
+ */
+uint8_t RobotArmService_RequestFinalSort(uint16_t cycle_id,
+                                         uint16_t job_id,
+                                         uint8_t part_type,
+                                         uint8_t model_result,
+                                         uint8_t final_bin)
+{
+    uint8_t action_group_id = ROBOT_ARM_SERVICE_ACTION_SORT_REVIEW;
+
+    if (final_bin == 1U)
+    {
+        action_group_id = ROBOT_ARM_SERVICE_ACTION_SORT_GOOD;
+    }
+    else if (final_bin == 2U)
+    {
+        action_group_id = ROBOT_ARM_SERVICE_ACTION_SORT_BAD;
+    }
+
+    return RobotArmService_EnqueueBusinessAction(action_group_id,
+                                                 cycle_id,
+                                                 job_id,
+                                                 part_type,
+                                                 model_result,
+                                                 final_bin);
 }
 
 /**

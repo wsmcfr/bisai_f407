@@ -105,6 +105,28 @@ uint8_t ConveyorMotorService_RequestPosition(uint8_t forward_flag,
                                              uint32_t pulse_count);
 
 /**
+ * @brief 请求传送带按相对位置模式移动，并在真实到位或超时时向 MP157 上报事件。
+ * @param forward_flag 1 表示工程默认前进方向，0 表示工程默认后退方向。
+ * @param speed_rpm 位置运动速度，单位 RPM，传 0 使用运行参数常规速度。
+ * @param pulse_count 相对移动步数，单位 step，必须大于 0。
+ * @param cycle_id 自动检测流程 ID，用于让 MP157 匹配本轮流程。
+ * @param related_seq 原始 `ACTUATOR_POS_MOVE` 帧序号，用于让 MP157 匹配具体命令。
+ * @param actuator 协议执行器编号，传送带固定为 0，但保留入参便于 detail 字段一致打包。
+ * @param direction 原始协议方向字段，按 MP157 下发值原样回填到完成事件。
+ * @return uint8_t 1 表示请求已投递，0 表示参数非法或任务队列尚未创建。
+ *
+ * 注意：协议 ACK 只说明本函数投递成功，不说明电机已经到位。
+ * 真正到位必须等待 F4 后续发送 `EVENT_REPORT/ACTUATOR_MOVE_DONE`。
+ */
+uint8_t ConveyorMotorService_RequestPositionWithReport(uint8_t forward_flag,
+                                                       uint16_t speed_rpm,
+                                                       uint32_t pulse_count,
+                                                       uint16_t cycle_id,
+                                                       uint16_t related_seq,
+                                                       uint8_t actuator,
+                                                       uint8_t direction);
+
+/**
  * @brief 请求传送带把当前位置设为新的零点。
  * @return uint8_t 1 表示请求已投递，0 表示传送带任务尚未就绪。
  *
@@ -117,7 +139,8 @@ uint8_t ConveyorMotorService_RequestSetCurrentPositionZero(void);
  * @brief 更新传送带步进电机运行参数。
  * @param address Emm42 电机地址，允许 1~247。
  * @param min_step 最小步长，单位 step，当前保存给后续位置步进命令使用。
- * @param normal_speed_rpm 常规扫描速度，单位 RPM，允许 0~5000，0 表示保存后保持停止。
+ * @param normal_speed_rpm 视觉对中/短步位置速度，单位 RPM，允许 0~5000，0 表示对应动作保持停止。
+ * @param scan_speed_rpm 上料扫描速度，单位 RPM，允许 0~5000，0 表示扫描阶段保持停止。
  * @param direction 方向映射，正数表示按工程默认正向，负数表示反向。
  * @return uint8_t 1 表示请求已投递，0 表示参数非法或传送带任务尚未就绪。
  *
@@ -127,6 +150,7 @@ uint8_t ConveyorMotorService_RequestSetCurrentPositionZero(void);
 uint8_t ConveyorMotorService_RequestRuntimeConfig(uint8_t address,
                                                   uint16_t min_step,
                                                   uint16_t normal_speed_rpm,
+                                                  uint16_t scan_speed_rpm,
                                                   int8_t direction);
 
 /**
