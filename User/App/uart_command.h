@@ -39,7 +39,7 @@ uint8_t UartCommand_Fetch(char *command_buffer, uint16_t buffer_size, uint32_t t
  * @param timeout_ms 等待命令的超时时间，单位毫秒。传0表示立即返回。
  * @return uint8_t 1表示成功取到一帧数据，0表示当前没有新数据或参数非法。
  *
- * 该接口保留二进制数据中的 `0x00`，用于机械臂 `55 55 ...` 协议透传；
+ * 该接口保留二进制数据中的 `0x00`，用于 `A5 5A ... 6B` 这类带零字节的正式二进制帧；
  * 文本命令仍可继续使用 `UartCommand_Fetch()` 自动补 `\0` 后再解析。
  */
 uint8_t UartCommand_FetchRaw(uint8_t *frame_buffer,

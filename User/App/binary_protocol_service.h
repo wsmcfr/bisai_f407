@@ -16,7 +16,7 @@ extern "C" {
  * - 本协议用于 MP157-F4 正式主链路，错误返回只允许 `NACK/FAULT_REPORT` 二进制帧；
  * - 现有 `STATUS/GET/BELT...` ASCII 文本命令只保留作为断开 MP157 后的现场维护入口；
  * - 正式接 MP157 时，USART1 文本输出默认静默，不能用 `[OK]`、`[ERROR]`、`READY` 判断成功失败；
- * - F4 收到 USART1 原始帧后，应先判断是否为 `A5 5A ... 6B` 二进制帧，再回退到机械臂 `55 55 ...` 或 ASCII 文本命令。
+ * - F4 收到 USART1 原始帧后，应先判断是否为 MP157-F4 `A5 5A ... 6B` 二进制帧，机械臂动作由 `ARM_JOB_START/FINAL_SORT_RESULT` 触发后再从 USART3 下发给 ESP32S3。
  *
  * 帧格式：
  * | 字段 | 字节数 | 说明 |
@@ -623,7 +623,7 @@ typedef struct
 {
     uint16_t cycle_id;                            /* 当前单件自动检测流程 ID。 */
     uint16_t job_id;                              /* MP157 分配的机械臂任务号，用于跨阶段追踪。 */
-    uint8_t job_profile;                          /* 机械臂动作方案，0=默认动作组或默认轨迹。 */
+    uint8_t job_profile;                          /* 机械臂动作方案，0=ESP32S3 默认正式协议轨迹。 */
     uint8_t part_type;                            /* 零件类型，未知填 0。 */
     uint8_t final_bin_hint;                       /* 历史预留字段；最终分拣必须等待 FINAL_SORT_RESULT，不能在这里执行。 */
     uint16_t option_bits;                         /* 选项位，首版 bit0=称重，bit1=电感，bit2=最终分拣。 */

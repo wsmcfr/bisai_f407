@@ -10,401 +10,310 @@
 #include <string.h>
 
 /**
- * @brief LeArm 机械臂串口协议速查。
+ * @brief F4 与 ESP32S3 机械臂正式二进制协议说明。
  *
- * 通信链路：
- * 1. 上位机/MP157/串口助手 -> STM32 USART1：115200 8N1，用于输入命令和查看 `[ARM]` 日志；
- * 2. STM32 USART3 -> ESP32 LeArm：115200 8N1，PD8(TX) 接 ESP32 PA5(GPIO33/RX)，PD9(RX) 接 ESP32 PA4(GPIO32/TX)，两板必须共地；
- * 3. ESP32 固件必须使用 `Serial.begin(115200, SERIAL_8N1, PA5, PA4)`，否则 Type-C 能通信不代表 STM32 外部串口能通信。
+ * 本文件只使用 `A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD CRC_L CRC_H 6B`
+ * 正式协议，不再发送旧动作组兼容帧。
  *
- * 帧格式：
- * - 固定格式：`55 55 Length CMD Params...`
- * - 总字节数：`Length + 2`，其中两个 `55` 不计入 Length；
- * - STM32 允许串口助手在帧后追加 `0D 0A`，但只会把 `Length + 2` 个协议字节转发给 ESP32；
- * - 除查询/读取/下载确认类命令外，多数运动命令不会回包，判断是否执行主要看机械臂动作和 STM32 `[ARM]` 日志。
- *
- * 用户可直接从 USART1 发送的常用 HEX 命令：
- * | HEX 命令 | 作用 | 是否会让机械臂动作 | 期望回包/现象 |
- * | --- | --- | --- | --- |
- * | `55 55 02 18` | 进入/确认 STM32 通讯模式，自定义命令；ESP32 端会关闭蓝牙占用并 ACK | 否 | 修改过的 ESP32 固件回 `55 55 03 18 00` |
- * | `55 55 02 01` | 查询 ESP32 LeArm 固件版本和舵机类型 | 否 | 回 `55 55 04 01 <servo_type> <software_version>` |
- * | `55 55 02 0C` | 复位机械臂姿态 | 是 | 通常无回包，机械臂回默认姿态 |
- * | `55 55 02 07` | 停止当前动作组 | 是 | 通常无回包，正在运行的动作组停止 |
- * | `55 55 02 0D` | 读取 6 个舵机当前位置 | 否 | 回 `55 55 14 0D ...`，包含各舵机 ID 和位置低/高字节 |
- * | `55 55 05 06 03 01 00` | 运行 3 号动作组 1 次 | 是 | 通常无回包，前提是 ESP32 内部已存在 3 号动作组 |
- *
- * 维护要求：
- * - 如果后续新增 CMD，必须在本注释表里同步写清楚“能发什么、有什么效果、有没有回包”；
- * - 启动阶段只能自动发送无运动诊断帧，禁止在启动握手里直接运行抓取动作。
+ * 链路约定：
+ * 1. STM32F407 USART3 TX/RX 与 ESP32S3 UART RX/TX 交叉连接；
+ * 2. 两端固定 `115200 8N1`，必须共地，电平必须为 3.3V TTL；
+ * 3. F4 是主控，只在 MP157 自动流程推进到机械臂阶段时发送动作命令；
+ * 4. ESP32S3 收到合法命令后先回 `ARM_ACK`，动作真实完成后再回 `ARM_STAGE_DONE`；
+ * 5. F4 只有收到对应阶段 `ARM_STAGE_DONE result=0` 后，才继续读取称重、电感或上报整轮完成。
  */
 
 /**
  * @brief 机械臂协议帧队列深度。
  *
- * 队列只缓存上位机/MP157 短时间连续下发的几帧动作命令。
- * 如果队列过深，机械臂可能执行明显滞后的旧动作；因此这里保持较小深度，优先保证动作响应的实时性。
+ * 队列只缓存短时间连续到来的机械臂业务命令。
+ * 队列过深会让机械臂执行滞后的旧动作，因此保持较小深度。
  */
-#define ROBOT_ARM_SERVICE_QUEUE_LENGTH       (4U)
+#define ROBOT_ARM_SERVICE_QUEUE_LENGTH              (4U)
 
 /**
- * @brief USART3 单帧发送超时时间，单位为毫秒。
+ * @brief USART3 单帧发送超时时间，单位毫秒。
  *
- * LeArm 动作组控制帧通常只有数个字节，200ms 对当前 115200 波特率已经非常宽裕。
- * 若超过该时间仍未发送完成，通常说明串口状态异常，应丢弃本帧并等待下一帧。
+ * 正式机械臂帧最长不超过 58 字节，115200 波特率下 200ms 已有足够余量。
  */
-#define ROBOT_ARM_SERVICE_TX_TIMEOUT_MS      (200U)
+#define ROBOT_ARM_SERVICE_TX_TIMEOUT_MS             (200U)
 
 /**
- * @brief 等待 ESP32 首字节回包的超时时间，单位为毫秒。
+ * @brief 等待 ESP32S3 ACK 首字节的超时时间，单位毫秒。
  *
- * 机械臂出厂协议中“查询版本/读取舵机”等命令会通过同一串口回包。
- * 首字节等待时间需要覆盖 ESP32 主循环 10ms 延时和命令处理耗时，因此给到 80ms。
+ * ACK 只表示 ESP32S3 已经接收并接受命令，应快速返回；超过该时间说明链路或固件状态异常。
  */
-#define ROBOT_ARM_SERVICE_RX_FIRST_TIMEOUT_MS (80U)
+#define ROBOT_ARM_SERVICE_ACK_TIMEOUT_MS            (500U)
 
 /**
- * @brief ESP32 回包后续字节读取超时时间，单位为毫秒。
+ * @brief 读取一帧内后续字节的短超时时间，单位毫秒。
  *
- * 一旦收到第一个字节，后续字节理论上会连续到达。
- * 这里使用较短超时来判断一帧回包已经结束，避免机械臂任务长期阻塞。
+ * 首字节到达后，同一帧后续字节应连续出现；短超时可避免任务被坏帧长时间拖住。
  */
-#define ROBOT_ARM_SERVICE_RX_NEXT_TIMEOUT_MS  (5U)
+#define ROBOT_ARM_SERVICE_RX_NEXT_TIMEOUT_MS        (10U)
 
 /**
- * @brief ESP32 单次回包最大诊断缓存长度，单位为字节。
+ * @brief 寻找正式帧头时允许跳过的前置噪声字节数量。
  *
- * 当前只需要观察查询版本、读取舵机等短回包。
- * 缓存保持较小，避免机械臂任务栈承担不必要的长帧压力。
+ * 串口分析中如果看到前导 `FF` 或其它悬空噪声，F4 不能把第一个噪声字节直接当成本次 ACK 失败。
+ * 这里限制最多跳过 16 个字节，避免线路持续乱码时任务长时间困在同步过程。
  */
-#define ROBOT_ARM_SERVICE_RX_BUFFER_SIZE      (32U)
+#define ROBOT_ARM_SERVICE_SYNC_SKIP_LIMIT           (16U)
 
 /**
- * @brief 机械臂任务启动后等待 ESP32 出厂固件完成初始化的时间。
+ * @brief 机械臂任务启动后等待 ESP32S3 初始化的时间，单位毫秒。
  *
- * ESP32 setup 中包含舵机类型识别、蜂鸣器提示和若干 delay。
- * STM32 过早发送查询帧可能被 ESP32 启动日志或初始化阶段吞掉，因此任务启动后先短暂等待。
+ * ESP32S3 上电后可能先初始化舵机、GPIO 和动作任务，F4 延迟发送 HELLO 可减少误判。
  */
-#define ROBOT_ARM_SERVICE_STARTUP_DELAY_MS    (1500U)
+#define ROBOT_ARM_SERVICE_STARTUP_DELAY_MS          (1500U)
 
 /**
- * @brief LeArm 上位机协议双字节帧头。
+ * @brief 业务动作写入 payload 的默认动作超时，单位毫秒。
  *
- * ESP32 从机程序已经验证能响应 `55 55 05 06 03 01 00`，
- * 因此 STM32 侧只识别并透传该协议族，不在这里重新解释动作组含义。
+ * ESP32S3 应使用该值作为本地动作超时阈值；F4 等 DONE 时会再额外留出串口调度余量。
+ * 当前实物机械臂从抓取、移动到放稳可能明显超过旧版 15 秒，所以正式流程按单阶段 60 秒保护。
  */
-#define ROBOT_ARM_SERVICE_FRAME_HEADER       (0x55U)
+#define ROBOT_ARM_SERVICE_ACTION_TIMEOUT_MS         (60000U)
 
 /**
- * @brief LeArm 协议最短完整帧长度。
+ * @brief F4 等待 DONE 时相对业务超时额外增加的余量，单位毫秒。
  *
- * 停止动作组示例为 `55 55 02 07`，总长度 4 字节，因此小于 4 字节的输入一定不是完整帧。
+ * 该余量覆盖 ESP32S3 动作任务到串口任务之间的调度延迟和 UART 传输时间。
+ * F4 实际等待 DONE 的最长时间为 `ACTION_TIMEOUT + DONE_EXTRA`，当前即 65 秒。
  */
-#define ROBOT_ARM_SERVICE_MIN_FRAME_LENGTH   (4U)
+#define ROBOT_ARM_SERVICE_DONE_EXTRA_TIMEOUT_MS     (5000U)
 
 /**
- * @brief LeArm 协议中的查询版本命令号。
+ * @brief HELLO 和 HEARTBEAT 这类无运动命令写入 payload 的默认超时，单位毫秒。
+ */
+#define ROBOT_ARM_SERVICE_CONTROL_TIMEOUT_MS        (1000U)
+
+/**
+ * @brief F4 发给 ESP32S3 的动作命令 payload 长度。
  *
- * 该命令不会驱动机械臂运动，只用于确认 STM32 USART3 到 ESP32 PC/BLE 协议口是否真正连通。
+ * 固定格式：
+ * cycle_id:u16、stage_id:u8、part_type:u8、model_result:u8、target_bin:u8、
+ * timeout_ms:u16、motion_profile:u8、flags:u16、reserved:u8。
  */
-#define ROBOT_ARM_SERVICE_CMD_VERSION_QUERY  (0x01U)
+#define ROBOT_ARM_SERVICE_STAGE_COMMAND_PAYLOAD_LEN (12U)
 
 /**
- * @brief LeArm 协议中的读取舵机命令号。
+ * @brief ESP32S3 回给 F4 的 ARM_ACK payload 长度。
+ */
+#define ROBOT_ARM_SERVICE_ACK_PAYLOAD_LEN           (7U)
+
+/**
+ * @brief ESP32S3 回给 F4 的 ARM_STAGE_DONE payload 长度。
+ */
+#define ROBOT_ARM_SERVICE_STAGE_DONE_PAYLOAD_LEN    (10U)
+
+/**
+ * @brief ESP32S3 回给 F4 的 ARM_NACK payload 长度。
+ */
+#define ROBOT_ARM_SERVICE_NACK_PAYLOAD_LEN          (9U)
+
+/**
+ * @brief 机械臂正式协议命令字。
  *
- * 读取类命令会产生 ESP32 回包，因此用于判断是否需要短暂读取 USART3 返回数据。
+ * 命令值必须和 `docs/f4_esp32s3_arm_protocol/f4_esp32s3_integration_guide.md` 保持一致。
  */
-#define ROBOT_ARM_SERVICE_CMD_SERVOS_READ    (0x0DU)
+typedef enum
+{
+    ROBOT_ARM_CMD_HELLO = 0x01U,           /* 双向握手命令，F4 启动后用于确认 ESP32S3 正式协议在线。 */
+    ROBOT_ARM_CMD_HEARTBEAT = 0x02U,       /* 双向心跳命令，用于确认链路仍在线。 */
+    ROBOT_ARM_CMD_MOVE_TO_WEIGHT = 0x20U,  /* F4 要求 ESP32S3 从 ROI/传送带抓取零件并放到称重模块。 */
+    ROBOT_ARM_CMD_MOVE_TO_LDC = 0x21U,     /* F4 要求 ESP32S3 从称重模块搬运到电磁感应模块。 */
+    ROBOT_ARM_CMD_SORT_RESULT = 0x22U,     /* F4 要求 ESP32S3 按最终结果放入对应分拣盘。 */
+    ROBOT_ARM_CMD_HOME = 0x23U,            /* F4 要求 ESP32S3 回安全初始位。 */
+    ROBOT_ARM_CMD_STOP = 0x24U,            /* F4 要求 ESP32S3 立即停止或进入安全状态。 */
+    ROBOT_ARM_CMD_STAGE_DONE = 0x30U,      /* ESP32S3 上报某个动作阶段真实完成或失败。 */
+    ROBOT_ARM_CMD_STAGE_REPORT = 0x31U,    /* ESP32S3 可选进度上报，F4 只打印日志，不靠它推进流程。 */
+    ROBOT_ARM_CMD_JOB_DONE = 0x32U,        /* ESP32S3 可选整套任务完成，首版 F4 不依赖。 */
+    ROBOT_ARM_CMD_ACK = 0x80U,             /* ESP32S3 接受命令后的立即确认。 */
+    ROBOT_ARM_CMD_NACK = 0x81U,            /* ESP32S3 拒绝命令或状态不允许时返回。 */
+    ROBOT_ARM_CMD_FAULT_REPORT = 0x87U     /* ESP32S3 主动上报机械臂故障。 */
+} RobotArmService_Command_t;
 
 /**
- * @brief LeArm 协议中的动作组擦除确认命令号。
+ * @brief 机械臂阶段编号。
  *
- * 出厂固件执行擦除后会回传确认帧，因此同样需要尝试读取 USART3。
+ * stage_id 进入 payload，也用于 DONE 回包匹配当前等待阶段。
  */
-#define ROBOT_ARM_SERVICE_CMD_ACTION_ERASE   (0x08U)
+typedef enum
+{
+    ROBOT_ARM_STAGE_NONE = 0U,                 /* 无动作阶段。 */
+    ROBOT_ARM_STAGE_PICK_BELT_TO_WEIGHT = 1U,  /* 从 ROI/传送带抓取并放到称重模块。 */
+    ROBOT_ARM_STAGE_WEIGHT_TO_LDC = 2U,        /* 从称重模块抓取并放到电磁感应模块。 */
+    ROBOT_ARM_STAGE_LDC_TO_SORT_BIN = 3U,      /* 从电磁感应模块抓取并放到最终盘。 */
+    ROBOT_ARM_STAGE_HOME = 4U,                 /* 回安全初始位。 */
+    ROBOT_ARM_STAGE_STOP_SAFE = 5U             /* 停止并进入安全状态。 */
+} RobotArmService_StageId_t;
 
 /**
- * @brief LeArm 协议中的动作下载确认命令号。
+ * @brief 分拣目标编号。
+ */
+typedef enum
+{
+    ROBOT_ARM_BIN_NONE = 0U,    /* 非分拣动作使用。 */
+    ROBOT_ARM_BIN_GOOD = 1U,    /* 良品盘。 */
+    ROBOT_ARM_BIN_BAD = 2U,     /* 不良品盘。 */
+    ROBOT_ARM_BIN_REVIEW = 3U   /* 待复核盘。 */
+} RobotArmService_TargetBin_t;
+
+/**
+ * @brief 单次发送上下文。
  *
- * 动作下载成功或失败时 ESP32 会返回确认帧，读取回包有助于后续下载动作组时排查。
+ * 该结构把已经组好的 UART 帧和业务校验字段放在一起。
+ * 发送任务拿到队列项后，先发送 frame_data，再用 sequence、cycle_id、stage_id 校验 ACK/DONE 是否匹配。
  */
-#define ROBOT_ARM_SERVICE_CMD_ACTION_DOWNLOAD (0x19U)
+typedef struct
+{
+    uint8_t data[ROBOT_ARM_SERVICE_FRAME_MAX_SIZE]; /* 完整 A5 二进制帧缓存。 */
+    uint16_t length;                                /* 完整帧长度。 */
+    uint8_t command;                                /* 本帧 CMD，用于 ACK/NACK 匹配。 */
+    uint16_t sequence;                              /* F4 发送序号，用于 ACK/NACK 匹配。 */
+    uint16_t cycle_id;                              /* 当前自动检测流程号，DONE 必须带回同一值。 */
+    uint16_t job_id;                                /* 当前机械臂任务号，传给 MP157-F4 主状态机。 */
+    uint8_t stage_id;                               /* 当前等待的动作阶段。 */
+    uint8_t wait_stage_done;                        /* 1 表示 ACK 后还要继续等待 DONE；0 表示只需要 ACK。 */
+    uint16_t timeout_ms;                            /* ESP32S3 动作超时和 F4 等 DONE 的基础时间。 */
+    const char *source_label;                       /* 日志来源标签。 */
+} RobotArmService_TxContext_t;
 
 /**
- * @brief LeArm 协议中的运行动作组命令号。
+ * @brief 机械臂发送队列句柄。
  *
- * 该命令只要求 ESP32 从 Flash 中取出已经保存的动作组并执行，出厂协议不会主动回包。
- * 如果指定编号下没有动作组，STM32 仍然只能看到“已发送”，机械臂不会动作。
- */
-#define ROBOT_ARM_SERVICE_CMD_ACTION_GROUP_RUN (0x06U)
-
-/**
- * @brief LeArm 协议中的复位机械臂姿态命令号。
- *
- * 该命令不依赖 ESP32 预存动作组，适合作为“串口链路已经通，但动作组不动”时的直控验证命令。
- */
-#define ROBOT_ARM_SERVICE_CMD_SERVOS_RESET     (0x0CU)
-
-/**
- * @brief ESP32S3 机械臂“ROI 抓取并放到称重模块”的动作组编号。
- *
- * 当前 F4 侧先按 LeArm 动作组方式下发，ESP32S3 负责人可把该编号映射到真实轨迹。
- * 若后续切换到 `A5 5A` 机械臂协议，只需要保留本函数入口并替换内部组帧实现。
- */
-#define ROBOT_ARM_SERVICE_ACTION_PLACE_WEIGHT  (10U)
-
-/**
- * @brief ESP32S3 机械臂“从称重模块放到电磁感应模块”的动作组编号。
- */
-#define ROBOT_ARM_SERVICE_ACTION_PLACE_LDC     (11U)
-
-/**
- * @brief ESP32S3 机械臂“从电磁感应模块放到良品区”的动作组编号。
- */
-#define ROBOT_ARM_SERVICE_ACTION_SORT_GOOD     (12U)
-
-/**
- * @brief ESP32S3 机械臂“从电磁感应模块放到不良品区”的动作组编号。
- */
-#define ROBOT_ARM_SERVICE_ACTION_SORT_BAD      (13U)
-
-/**
- * @brief ESP32S3 机械臂“从电磁感应模块放到待复核区”的动作组编号。
- */
-#define ROBOT_ARM_SERVICE_ACTION_SORT_REVIEW   (14U)
-
-/**
- * @brief 自定义 STM32 通讯模式命令号。
- *
- * ESP32 出厂固件原始协议没有“串口切换到 STM32 模式”的命令。
- * 这里约定使用未占用的 `0x18`，需要 ESP32 端同步增加同名命令处理：
- * 收到 `55 55 02 18` 后关闭蓝牙供电控制脚，并回包确认。
- */
-#define ROBOT_ARM_SERVICE_CMD_STM32_LINK_MODE (0x18U)
-
-/**
- * @brief STM32 启动后先发送给 ESP32 的自定义通讯模式帧。
- *
- * 该帧格式为 `55 55 02 18`，不驱动机械臂运动。
- * 只有同步修改过 ESP32 固件后该命令才会生效；未修改的出厂固件会忽略该命令。
- */
-static const uint8_t g_robot_arm_stm32_link_mode_frame[] = {
-    ROBOT_ARM_SERVICE_FRAME_HEADER,
-    ROBOT_ARM_SERVICE_FRAME_HEADER,
-    0x02U,
-    ROBOT_ARM_SERVICE_CMD_STM32_LINK_MODE
-};
-
-/**
- * @brief STM32 启动后主动发送给 ESP32 的无运动探测帧。
- *
- * 该帧等价于上位机发送“查询版本”：`55 55 02 01`。
- * 它用于验证“STM32 USART3 接线、波特率、ESP32 PC/BLE 协议任务”是否连通。
- */
-static const uint8_t g_robot_arm_startup_probe_frame[] = {
-    ROBOT_ARM_SERVICE_FRAME_HEADER,
-    ROBOT_ARM_SERVICE_FRAME_HEADER,
-    0x02U,
-    ROBOT_ARM_SERVICE_CMD_VERSION_QUERY
-};
-
-/**
- * @brief 机械臂转发队列句柄。
- *
- * 该队列由 USART1 命令分发层写入，由 RobotArmService_Task 独占读取。
- * 通过队列解耦接收和发送，避免 USART1 命令处理流程被 USART3 阻塞发送拖慢。
+ * 队列由 MP157-F4 二进制协议分发层写入，由 `RobotArmService_Task()` 独占读取。
  */
 static QueueHandle_t g_robot_arm_frame_queue = NULL;
 
 /**
- * @brief 判断字节是否为串口助手常见的行尾字符。
- * @param value 待判断的原始字节。
- * @return uint8_t 1 表示 `\r` 或 `\n`，0 表示普通协议字节。
+ * @brief F4 发往 ESP32S3 的机械臂协议序号。
  *
- * 串口助手勾选“回车发送”时会在 HEX 帧后追加 `0D 0A`。
- * ESP32 端状态机能够在完成一帧后重新等待帧头，但 STM32 严格按长度判帧时会先把这类输入丢掉。
+ * 每发一帧递增，ACK/NACK 必须带回对应序号。
  */
-static uint8_t RobotArmService_IsLineEnding(uint8_t value)
+static uint16_t g_robot_arm_tx_sequence = 1U;
+
+/**
+ * @brief 读取小端 u16。
+ * @param data 指向低字节的地址，不能为 NULL。
+ * @return uint16_t 解析后的 16 位整数。
+ */
+static uint16_t RobotArmService_ReadU16Le(const uint8_t *data)
 {
-    return ((value == (uint8_t)'\r') || (value == (uint8_t)'\n')) ? 1U : 0U;
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
 }
 
 /**
- * @brief 从原始 USART1 输入中提取 LeArm 协议帧的真实长度。
- * @param frame_buffer 原始串口数据缓存，不能为 NULL。
- * @param frame_length 原始串口数据长度，单位为字节。
- * @return uint16_t 大于 0 表示合法协议帧长度，0 表示不是完整 LeArm 帧。
- *
- * 主要流程：
- * 1. 检查 `55 55` 帧头；
- * 2. 按 ESP32 出厂协议计算总长度 `Length + 2`；
- * 3. 允许真实协议帧后面只追加 `\r`/`\n`；
- * 4. 返回应转发给 ESP32 的协议字节数，避免把串口助手行尾也发过去。
+ * @brief 写入小端 u16。
+ * @param data 输出地址，不能为 NULL。
+ * @param value 要写入的数值。
  */
-static uint16_t RobotArmService_GetProtocolLength(const uint8_t *frame_buffer, uint16_t frame_length)
+static void RobotArmService_WriteU16Le(uint8_t *data, uint16_t value)
 {
-    uint16_t expected_total_length;
-    uint16_t suffix_index;
-
-    if ((frame_buffer == NULL) || (frame_length < ROBOT_ARM_SERVICE_MIN_FRAME_LENGTH))
-    {
-        return 0U;
-    }
-
-    if ((frame_buffer[0] != ROBOT_ARM_SERVICE_FRAME_HEADER) ||
-        (frame_buffer[1] != ROBOT_ARM_SERVICE_FRAME_HEADER))
-    {
-        return 0U;
-    }
-
-    /*
-     * ESP32 的 PC_BLE unpack() 把 Length=2 当作“只有 CMD 无参数”的最短命令。
-     * 小于 2 的长度字段不符合当前 LeArm 协议，继续处理会造成 STM32 与 ESP32 对帧边界理解不一致。
-     */
-    if (frame_buffer[2] < 2U)
-    {
-        return 0U;
-    }
-
-    expected_total_length = (uint16_t)frame_buffer[2] + 2U;
-    if ((expected_total_length < ROBOT_ARM_SERVICE_MIN_FRAME_LENGTH) ||
-        (expected_total_length > ROBOT_ARM_SERVICE_FRAME_MAX_SIZE) ||
-        (expected_total_length > frame_length))
-    {
-        return 0U;
-    }
-
-    for (suffix_index = expected_total_length; suffix_index < frame_length; ++suffix_index)
-    {
-        if (RobotArmService_IsLineEnding(frame_buffer[suffix_index]) == 0U)
-        {
-            return 0U;
-        }
-    }
-
-    return expected_total_length;
+    data[0] = (uint8_t)(value & 0xFFU);
+    data[1] = (uint8_t)((value >> 8) & 0xFFU);
 }
 
 /**
- * @brief 判断某个 LeArm 命令是否按出厂固件逻辑会产生回包。
- * @param command LeArm 协议 CMD 字节。
- * @return uint8_t 1 表示发送后应短暂读取 USART3，0 表示该命令通常没有回包。
+ * @brief 分配一帧 F4->ESP32S3 发送序号。
+ * @return uint16_t 本次使用的序号。
  *
- * 动作组运行命令一般只让机械臂运动，不返回确认。
- * 查询/读取/下载确认类命令才需要打印 ESP32 回包，避免每个运动命令都额外等待超时。
+ * 序号从 1 开始递增，回绕到 0 时跳回 1，避免 0 和未初始化值混淆。
  */
-static uint8_t RobotArmService_CommandExpectsReply(uint8_t command)
+static uint16_t RobotArmService_AllocateSequence(void)
 {
-    if ((command == ROBOT_ARM_SERVICE_CMD_VERSION_QUERY) ||
-        (command == ROBOT_ARM_SERVICE_CMD_SERVOS_READ) ||
-        (command == ROBOT_ARM_SERVICE_CMD_ACTION_ERASE) ||
-        (command == ROBOT_ARM_SERVICE_CMD_ACTION_DOWNLOAD) ||
-        (command == ROBOT_ARM_SERVICE_CMD_STM32_LINK_MODE))
+    uint16_t sequence = g_robot_arm_tx_sequence;
+
+    ++g_robot_arm_tx_sequence;
+    if (g_robot_arm_tx_sequence == 0U)
     {
-        return 1U;
+        g_robot_arm_tx_sequence = 1U;
     }
 
-    return 0U;
+    return sequence;
 }
 
 /**
- * @brief 把 LeArm 命令字节翻译成串口日志里能直接看懂的动作说明。
- * @param command LeArm 协议中的 CMD 字节。
- * @return const char* 面向操作者的命令说明字符串。
- *
- * 这里集中维护“命令字节 -> 人话说明”的映射，避免日志里只出现 `cmd=0x18` 这类内部术语。
- * 后续如果新增机械臂命令，也要同步补充本函数和文件顶部的协议速查表。
+ * @brief 获取命令字说明。
+ * @param command 正式机械臂协议 CMD。
+ * @return const char* 可打印的命令说明。
  */
 static const char *RobotArmService_GetCommandDescription(uint8_t command)
 {
     switch (command)
     {
-        case ROBOT_ARM_SERVICE_CMD_VERSION_QUERY:
-            return "query ESP32 firmware version";
-
-        case ROBOT_ARM_SERVICE_CMD_STM32_LINK_MODE:
-            return "switch ESP32 to STM32 link mode";
-
-        case ROBOT_ARM_SERVICE_CMD_SERVOS_READ:
-            return "read all 6 servo positions";
-
-        case ROBOT_ARM_SERVICE_CMD_ACTION_ERASE:
-            return "erase action groups";
-
-        case ROBOT_ARM_SERVICE_CMD_ACTION_DOWNLOAD:
-            return "download action group";
-
-        case 0x03U:
-            return "move one or more servos to target position";
-
-        case 0x04U:
-            return "move arm tip by XYZ coordinate";
-
-        case ROBOT_ARM_SERVICE_CMD_ACTION_GROUP_RUN:
-            return "run saved action group";
-
-        case 0x07U:
-            return "stop current action group";
-
-        case ROBOT_ARM_SERVICE_CMD_SERVOS_RESET:
-            return "reset arm to default pose";
-
+        case ROBOT_ARM_CMD_HELLO:
+            return "ARM_LINK_HELLO";
+        case ROBOT_ARM_CMD_HEARTBEAT:
+            return "ARM_LINK_HEARTBEAT";
+        case ROBOT_ARM_CMD_MOVE_TO_WEIGHT:
+            return "ARM_MOVE_TO_WEIGHT";
+        case ROBOT_ARM_CMD_MOVE_TO_LDC:
+            return "ARM_MOVE_TO_LDC";
+        case ROBOT_ARM_CMD_SORT_RESULT:
+            return "ARM_SORT_RESULT";
+        case ROBOT_ARM_CMD_HOME:
+            return "ARM_HOME";
+        case ROBOT_ARM_CMD_STOP:
+            return "ARM_STOP";
+        case ROBOT_ARM_CMD_STAGE_DONE:
+            return "ARM_STAGE_DONE";
+        case ROBOT_ARM_CMD_STAGE_REPORT:
+            return "ARM_STAGE_REPORT";
+        case ROBOT_ARM_CMD_JOB_DONE:
+            return "ARM_JOB_DONE";
+        case ROBOT_ARM_CMD_ACK:
+            return "ARM_ACK";
+        case ROBOT_ARM_CMD_NACK:
+            return "ARM_NACK";
+        case ROBOT_ARM_CMD_FAULT_REPORT:
+            return "ARM_FAULT_REPORT";
         default:
-            return "unknown arm command";
+            return "ARM_UNKNOWN";
     }
 }
 
 /**
- * @brief 把内部来源标签翻译成串口日志里能看懂的来源说明。
- * @param source_label 发送入口传入的内部来源标签，例如 `startup` 或 `uart1`。
- * @return const char* 面向操作者的来源说明字符串。
- *
- * 来源说明用于区分“系统上电自动发送”和“用户从串口1手动发送”，
- * 这样看到日志时能判断当前动作是不是自己刚才触发的。
+ * @brief 获取来源说明。
+ * @param source_label 内部来源标签。
+ * @return const char* 日志中的来源说明。
  */
 static const char *RobotArmService_GetSourceDescription(const char *source_label)
 {
     if (source_label == NULL)
     {
-        return "unknown source";
+        return "unknown";
     }
 
-    if (strcmp(source_label, "startup-mode") == 0)
+    if (strcmp(source_label, "startup-hello") == 0)
     {
-        return "startup mode request";
+        return "startup hello";
     }
 
-    if (strcmp(source_label, "startup") == 0)
+    if (strcmp(source_label, "startup-heartbeat") == 0)
     {
-        return "startup link probe";
+        return "startup heartbeat";
     }
 
-    if (strcmp(source_label, "uart1") == 0)
+    if (strcmp(source_label, "auto-flow") == 0)
     {
-        return "UART1 user command";
+        return "MP157 auto flow";
+    }
+
+    if (strcmp(source_label, "uart1-formal") == 0)
+    {
+        return "UART1 formal arm frame";
     }
 
     return source_label;
 }
 
 /**
- * @brief 把 ESP32 返回的舵机类型编号翻译成可读名称。
- * @param servo_type ESP32 版本查询回包中的舵机类型字节。
- * @return const char* 舵机类型说明。
+ * @brief 清理 USART3 上残留的旧字节和错误标志。
  *
- * 出厂固件中 0 通常表示 PWM 舵机，非 0 表示总线舵机。
- * 日志同时保留原始数字，便于资料或源码中继续对照。
- */
-static const char *RobotArmService_GetServoTypeDescription(uint8_t servo_type)
-{
-    return (servo_type == 0U) ? "PWM servo" : "bus servo";
-}
-
-/**
- * @brief 清理 USART3 上可能残留的 ESP32 启动输出或错误标志。
- *
- * ESP32 的 PA5/PA4 现在作为 STM32 二进制协议口使用。
- * 如果 ESP32 在 STM32 发送探测帧之前已经输出过旧调试字节，USART3 可能留下 RXNE/ORE 状态。
- * 发送新命令前先清掉这些旧状态，避免后续 `HAL_UART_Receive()` 把旧字节误当成本次回包。
+ * 如果 ESP32S3 上电日志、线缆抖动或上一次坏帧残留在 RXNE 中，F4 等 ACK 时可能读到错误帧头。
+ * 每次发送新命令前先清理接收侧，确保后续读取尽量对应本次命令。
  */
 static void RobotArmService_FlushUsart3Rx(void)
 {
@@ -435,258 +344,656 @@ static void RobotArmService_FlushUsart3Rx(void)
 }
 
 /**
- * @brief 从 USART3 读取一段 ESP32 回包，用于调试显示。
- * @param reply_buffer 回包缓存，不能为 NULL。
- * @param buffer_size 回包缓存大小，必须大于 0。
- * @return uint16_t 实际读取到的字节数，0 表示超时未收到回包。
- *
- * 读取策略：
- * 1. 首字节等待稍长，覆盖 ESP32 主循环和处理延迟；
- * 2. 收到首字节后，用短超时连续读取后续字节；
- * 3. 缓存满或短超时到达即认为本次回包结束。
+ * @brief 从 USART3 读取一个字节。
+ * @param value 输出字节，不能为 NULL。
+ * @param timeout_ms 等待时间，单位毫秒。
+ * @return uint8_t 1 表示读取成功，0 表示超时或 UART 错误。
  */
-static uint16_t RobotArmService_ReadReply(uint8_t *reply_buffer, uint16_t buffer_size)
+static uint8_t RobotArmService_ReadByte(uint8_t *value, uint32_t timeout_ms)
 {
-    uint16_t reply_length = 0U;
-    uint32_t timeout_ms;
-
-    if ((reply_buffer == NULL) || (buffer_size == 0U))
+    if (value == NULL)
     {
         return 0U;
     }
 
-    while (reply_length < buffer_size)
+    return (HAL_UART_Receive(&huart3, value, 1U, timeout_ms) == HAL_OK) ? 1U : 0U;
+}
+
+/**
+ * @brief 从 USART3 读取一帧完整正式机械臂协议并完成 CRC 校验。
+ * @param frame_buffer 原始帧缓存，不能为 NULL。
+ * @param frame_buffer_size 原始帧缓存容量。
+ * @param parsed_frame 解析结果输出，不能为 NULL。
+ * @param first_timeout_ms 等待帧头首字节的超时时间，单位毫秒。
+ * @return uint8_t 1 表示收到合法帧，0 表示超时、坏帧或 CRC 错误。
+ *
+ * 主要流程：
+ * 1. 等待 `A5`；
+ * 2. 继续读取 `5A VER CMD LEN SEQ_L SEQ_H`；
+ * 3. 按 LEN 读取 payload、CRC 和 `6B`；
+ * 4. 复用 MP157-F4 主协议解析器校验帧头、版本、长度、CRC 和帧尾。
+ */
+static uint8_t RobotArmService_ReadFormalFrame(uint8_t *frame_buffer,
+                                               uint16_t frame_buffer_size,
+                                               BinaryProtocol_Frame_t *parsed_frame,
+                                               uint32_t first_timeout_ms)
+{
+    uint16_t expected_length;
+    uint16_t index;
+    uint8_t skipped_count = 0U;
+    BinaryProtocol_ParseStatus_t parse_status;
+
+    if ((frame_buffer == NULL) ||
+        (parsed_frame == NULL) ||
+        (frame_buffer_size < BINARY_PROTOCOL_MIN_FRAME_LENGTH))
     {
-        timeout_ms = (reply_length == 0U) ? ROBOT_ARM_SERVICE_RX_FIRST_TIMEOUT_MS
-                                          : ROBOT_ARM_SERVICE_RX_NEXT_TIMEOUT_MS;
-        if (HAL_UART_Receive(&huart3, &reply_buffer[reply_length], 1U, timeout_ms) != HAL_OK)
+        return 0U;
+    }
+
+    for (;;)
+    {
+        if (RobotArmService_ReadByte(&frame_buffer[0],
+                                     (skipped_count == 0U) ? first_timeout_ms : ROBOT_ARM_SERVICE_RX_NEXT_TIMEOUT_MS) == 0U)
+        {
+            return 0U;
+        }
+
+        if (frame_buffer[0] == BINARY_PROTOCOL_SOF0)
         {
             break;
         }
 
-        ++reply_length;
+        ++skipped_count;
+        if (skipped_count >= ROBOT_ARM_SERVICE_SYNC_SKIP_LIMIT)
+        {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+            my_printf(&huart1,
+                      "[ARM] Too many bytes before formal frame: skipped=%u, last=0x%02X.\r\n",
+                      (unsigned int)skipped_count,
+                      (unsigned int)frame_buffer[0]);
+            return 0U;
+        }
     }
 
-    return reply_length;
+    if (skipped_count > 0U)
+    {
+        my_printf(&huart1,
+                  "[ARM] Skipped %u byte(s) before ESP32 formal frame.\r\n",
+                  (unsigned int)skipped_count);
+    }
+
+    for (index = 1U; index < 7U; ++index)
+    {
+        if (RobotArmService_ReadByte(&frame_buffer[index], ROBOT_ARM_SERVICE_RX_NEXT_TIMEOUT_MS) == 0U)
+        {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+            my_printf(&huart1,
+                      "[ARM] ESP32 frame header timeout at byte %u.\r\n",
+                      (unsigned int)index);
+            return 0U;
+        }
+    }
+
+    if (frame_buffer[1] != BINARY_PROTOCOL_SOF1)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        my_printf(&huart1,
+                  "[ARM] Bad ESP32 frame header: %02X %02X.\r\n",
+                  (unsigned int)frame_buffer[0],
+                  (unsigned int)frame_buffer[1]);
+        return 0U;
+    }
+
+    if (frame_buffer[4] > BINARY_PROTOCOL_MAX_PAYLOAD_LENGTH)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        my_printf(&huart1,
+                  "[ARM] ESP32 payload too long: len=%u.\r\n",
+                  (unsigned int)frame_buffer[4]);
+        return 0U;
+    }
+
+    expected_length = (uint16_t)(BINARY_PROTOCOL_MIN_FRAME_LENGTH + frame_buffer[4]);
+    if (expected_length > frame_buffer_size)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        my_printf(&huart1,
+                  "[ARM] ESP32 frame exceeds local buffer: frame=%u, buffer=%u.\r\n",
+                  (unsigned int)expected_length,
+                  (unsigned int)frame_buffer_size);
+        return 0U;
+    }
+
+    for (index = 7U; index < expected_length; ++index)
+    {
+        if (RobotArmService_ReadByte(&frame_buffer[index], ROBOT_ARM_SERVICE_RX_NEXT_TIMEOUT_MS) == 0U)
+        {
+            BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+            my_printf(&huart1,
+                      "[ARM] ESP32 frame body timeout at byte %u/%u.\r\n",
+                      (unsigned int)index,
+                      (unsigned int)expected_length);
+            return 0U;
+        }
+    }
+
+    parse_status = BinaryProtocolService_ParseFrame(frame_buffer, expected_length, parsed_frame);
+    if (parse_status != BINARY_PROTOCOL_PARSE_OK)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        my_printf(&huart1,
+                  "[ARM] ESP32 frame parse failed: status=%u, len=%u, cmd=0x%02X.\r\n",
+                  (unsigned int)parse_status,
+                  (unsigned int)expected_length,
+                  (unsigned int)frame_buffer[3]);
+        return 0U;
+    }
+
+    return 1U;
 }
 
 /**
- * @brief 把 ESP32 回包整理成 USART1 上可读的诊断日志。
- * @param command 本次 STM32 发送的 LeArm 命令号。
- * @param reply_buffer ESP32 返回的原始字节缓存。
- * @param reply_length ESP32 返回的原始字节长度。
- *
- * 查询版本回包有稳定格式，直接打印舵机类型和软件版本。
- * 其它回包只打印长度、帧头、命令字和前两个数据字节，避免长二进制数据污染 USART1 日志。
+ * @brief 处理 ESP32S3 返回的 ACK。
+ * @param context 当前 F4 发送上下文，不能为 NULL。
+ * @param frame 已通过 CRC 校验的 ACK 帧，不能为 NULL。
+ * @return uint8_t 1 表示 ACK 与当前命令匹配，0 表示不匹配或状态拒绝。
  */
-static void RobotArmService_ReportReply(uint8_t command,
-                                        const uint8_t *reply_buffer,
-                                        uint16_t reply_length)
+static uint8_t RobotArmService_HandleAckFrame(const RobotArmService_TxContext_t *context,
+                                              const BinaryProtocol_Frame_t *frame)
 {
-    if ((reply_buffer == NULL) || (reply_length == 0U))
+    uint16_t cycle_id;
+    uint16_t acked_sequence;
+    uint8_t acked_command;
+    uint8_t status;
+    uint8_t arm_state;
+
+    if ((context == NULL) ||
+        (frame == NULL) ||
+        (frame->payload == NULL) ||
+        (frame->payload_length != ROBOT_ARM_SERVICE_ACK_PAYLOAD_LEN))
+    {
+        return 0U;
+    }
+
+    cycle_id = RobotArmService_ReadU16Le(&frame->payload[0]);
+    acked_sequence = RobotArmService_ReadU16Le(&frame->payload[2]);
+    acked_command = frame->payload[4];
+    status = frame->payload[5];
+    arm_state = frame->payload[6];
+
+    if (((context->cycle_id != 0U) && (cycle_id != context->cycle_id)) ||
+        (acked_sequence != context->sequence) ||
+        (acked_command != context->command) ||
+        (status > 1U))
     {
         BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-        BinaryProtocolService_ReportFault((uint16_t)command,
+        BinaryProtocolService_ReportFault((uint16_t)acked_command,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)status,
+                                          context->sequence);
+        my_printf(&huart1,
+                  "[ARM] ACK mismatch: rx_cycle=%u, exp_cycle=%u, ack_seq=%u, exp_seq=%u, ack_cmd=0x%02X, exp_cmd=0x%02X, status=%u.\r\n",
+                  (unsigned int)cycle_id,
+                  (unsigned int)context->cycle_id,
+                  (unsigned int)acked_sequence,
+                  (unsigned int)context->sequence,
+                  (unsigned int)acked_command,
+                  (unsigned int)context->command,
+                  (unsigned int)status);
+        return 0U;
+    }
+
+    BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+    my_printf(&huart1,
+              "[ARM] ACK OK: %s, cycle=%u, seq=%u, status=%u, arm_state=%u.\r\n",
+              RobotArmService_GetCommandDescription(context->command),
+              (unsigned int)cycle_id,
+              (unsigned int)acked_sequence,
+              (unsigned int)status,
+              (unsigned int)arm_state);
+    return 1U;
+}
+
+/**
+ * @brief 处理 ESP32S3 返回的 NACK。
+ * @param context 当前 F4 发送上下文，不能为 NULL。
+ * @param frame 已通过 CRC 校验的 NACK 帧，不能为 NULL。
+ */
+static void RobotArmService_HandleNackFrame(const RobotArmService_TxContext_t *context,
+                                            const BinaryProtocol_Frame_t *frame)
+{
+    uint16_t cycle_id = 0U;
+    uint16_t rejected_sequence = 0U;
+    uint8_t rejected_command = 0U;
+    uint8_t error_code = 0U;
+    uint8_t arm_state = 0U;
+    uint16_t detail = 0U;
+
+    if ((frame != NULL) &&
+        (frame->payload != NULL) &&
+        (frame->payload_length == ROBOT_ARM_SERVICE_NACK_PAYLOAD_LEN))
+    {
+        cycle_id = RobotArmService_ReadU16Le(&frame->payload[0]);
+        rejected_sequence = RobotArmService_ReadU16Le(&frame->payload[2]);
+        rejected_command = frame->payload[4];
+        error_code = frame->payload[5];
+        arm_state = frame->payload[6];
+        detail = RobotArmService_ReadU16Le(&frame->payload[7]);
+    }
+
+    BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+    BinaryProtocolService_ReportFault((uint16_t)error_code,
+                                      BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                      BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                      (int32_t)detail,
+                                      (context != NULL) ? context->sequence : 0U);
+    my_printf(&huart1,
+              "[ARM] NACK from ESP32: cycle=%u, rejected_seq=%u, rejected_cmd=0x%02X, error=%u, state=%u, detail=%u.\r\n",
+              (unsigned int)cycle_id,
+              (unsigned int)rejected_sequence,
+              (unsigned int)rejected_command,
+              (unsigned int)error_code,
+              (unsigned int)arm_state,
+              (unsigned int)detail);
+}
+
+/**
+ * @brief 打印 ESP32S3 可选阶段进度帧。
+ * @param frame 已解析帧，不能为 NULL。
+ *
+ * 阶段进度只是诊断信息，不能替代 DONE 推进自动流程。
+ */
+static void RobotArmService_HandleStageReportFrame(const BinaryProtocol_Frame_t *frame)
+{
+    uint16_t cycle_id = 0U;
+    uint8_t stage_id = 0U;
+    uint8_t progress = 0U;
+
+    if ((frame != NULL) && (frame->payload != NULL) && (frame->payload_length >= 4U))
+    {
+        cycle_id = RobotArmService_ReadU16Le(&frame->payload[0]);
+        stage_id = frame->payload[2];
+        progress = frame->payload[3];
+    }
+
+    my_printf(&huart1,
+              "[ARM] Stage report: cycle=%u, stage=%u, progress=%u, len=%u.\r\n",
+              (unsigned int)cycle_id,
+              (unsigned int)stage_id,
+              (unsigned int)progress,
+              (frame != NULL) ? (unsigned int)frame->payload_length : 0U);
+}
+
+/**
+ * @brief 处理 ESP32S3 返回的 DONE，并把结果交给 MP157-F4 主流程。
+ * @param context 当前 F4 发送上下文，不能为 NULL。
+ * @param frame 已通过 CRC 校验的 DONE 帧，不能为 NULL。
+ * @return uint8_t 1 表示对应阶段成功完成，0 表示失败或不匹配。
+ */
+static uint8_t RobotArmService_HandleStageDoneFrame(const RobotArmService_TxContext_t *context,
+                                                    const BinaryProtocol_Frame_t *frame)
+{
+    uint16_t cycle_id;
+    uint8_t stage_id;
+    uint8_t result;
+    uint16_t detail_code;
+    uint16_t elapsed_ms;
+    uint16_t fault_bits;
+
+    if ((context == NULL) ||
+        (frame == NULL) ||
+        (frame->payload == NULL) ||
+        (frame->payload_length != ROBOT_ARM_SERVICE_STAGE_DONE_PAYLOAD_LEN))
+    {
+        return 0U;
+    }
+
+    cycle_id = RobotArmService_ReadU16Le(&frame->payload[0]);
+    stage_id = frame->payload[2];
+    result = frame->payload[3];
+    detail_code = RobotArmService_ReadU16Le(&frame->payload[4]);
+    elapsed_ms = RobotArmService_ReadU16Le(&frame->payload[6]);
+    fault_bits = RobotArmService_ReadU16Le(&frame->payload[8]);
+
+    if ((cycle_id != context->cycle_id) || (stage_id != context->stage_id))
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_ReportFault(detail_code,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)stage_id,
+                                          context->sequence);
+        my_printf(&huart1,
+                  "[ARM] DONE mismatch: rx_cycle=%u, exp_cycle=%u, rx_stage=%u, exp_stage=%u, result=%u.\r\n",
+                  (unsigned int)cycle_id,
+                  (unsigned int)context->cycle_id,
+                  (unsigned int)stage_id,
+                  (unsigned int)context->stage_id,
+                  (unsigned int)result);
+        return 0U;
+    }
+
+    if (result == 0U)
+    {
+        BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+    }
+    else
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+    }
+
+    my_printf(&huart1,
+              "[ARM] DONE received: cycle=%u, job=%u, stage=%u, result=%u, detail=%u, elapsed=%u, faults=0x%04X.\r\n",
+              (unsigned int)cycle_id,
+              (unsigned int)context->job_id,
+              (unsigned int)stage_id,
+              (unsigned int)result,
+              (unsigned int)detail_code,
+              (unsigned int)elapsed_ms,
+              (unsigned int)fault_bits);
+
+    BinaryProtocolService_HandleArmStageDone(cycle_id,
+                                             context->job_id,
+                                             stage_id,
+                                             result,
+                                             detail_code,
+                                             elapsed_ms,
+                                             fault_bits);
+    return (result == 0U) ? 1U : 0U;
+}
+
+/**
+ * @brief 处理 ESP32S3 主动故障帧。
+ * @param frame 已解析帧，可以为 NULL。
+ */
+static void RobotArmService_HandleFaultFrame(const BinaryProtocol_Frame_t *frame)
+{
+    uint16_t fault_code = 0U;
+    uint16_t fault_bits = 0U;
+
+    if ((frame != NULL) && (frame->payload != NULL) && (frame->payload_length >= 4U))
+    {
+        fault_code = RobotArmService_ReadU16Le(&frame->payload[0]);
+        fault_bits = RobotArmService_ReadU16Le(&frame->payload[2]);
+    }
+
+    BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+    BinaryProtocolService_ReportFault(fault_code,
+                                      BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                      BINARY_PROTOCOL_FAULT_SEVERITY_STOP,
+                                      (int32_t)fault_bits,
+                                      0U);
+    my_printf(&huart1,
+              "[ARM] Fault report from ESP32: fault_code=%u, fault_bits=0x%04X, len=%u.\r\n",
+              (unsigned int)fault_code,
+              (unsigned int)fault_bits,
+              (frame != NULL) ? (unsigned int)frame->payload_length : 0U);
+}
+
+/**
+ * @brief 等待 ESP32S3 对当前命令返回 ACK 或 NACK。
+ * @param context 当前发送上下文，不能为 NULL。
+ * @return uint8_t 1 表示收到匹配 ACK，0 表示超时、NACK 或其它错误帧。
+ */
+static uint8_t RobotArmService_WaitAck(const RobotArmService_TxContext_t *context)
+{
+    uint8_t rx_frame[ROBOT_ARM_SERVICE_FRAME_MAX_SIZE];
+    BinaryProtocol_Frame_t parsed_frame;
+
+    if (context == NULL)
+    {
+        return 0U;
+    }
+
+    if (RobotArmService_ReadFormalFrame(rx_frame,
+                                        (uint16_t)sizeof(rx_frame),
+                                        &parsed_frame,
+                                        ROBOT_ARM_SERVICE_ACK_TIMEOUT_MS) == 0U)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_ReportFault((uint16_t)context->command,
                                           BINARY_PROTOCOL_FAULT_SOURCE_ARM,
                                           BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
                                           0,
-                                          0U);
+                                          context->sequence);
         my_printf(&huart1,
-                  "[ARM] No ESP32 reply: sent '%s'(0x%02X). Burn updated ESP32 firmware first; then check PD8->PA5, PD9<-PA4, common GND, 115200 baud.\r\n",
-                  RobotArmService_GetCommandDescription(command),
-                  (unsigned int)command);
-        return;
+                  "[ARM] ACK timeout: cmd=%s, cycle=%u, seq=%u. Check ESP32 formal protocol, TX/RX, GND and 115200 8N1.\r\n",
+                  RobotArmService_GetCommandDescription(context->command),
+                  (unsigned int)context->cycle_id,
+                  (unsigned int)context->sequence);
+        return 0U;
     }
 
-    if ((reply_length >= 5U) &&
-        (reply_buffer[0] == ROBOT_ARM_SERVICE_FRAME_HEADER) &&
-        (reply_buffer[1] == ROBOT_ARM_SERVICE_FRAME_HEADER) &&
-        (reply_buffer[3] == ROBOT_ARM_SERVICE_CMD_STM32_LINK_MODE) &&
-        (reply_buffer[4] == 0U))
+    if (parsed_frame.command == ROBOT_ARM_CMD_ACK)
     {
-        BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-        my_printf(&huart1,
-                  "[ARM] Link mode ready: ESP32 left PS2/offline mode. STM32 can now send arm commands on USART3.\r\n");
-        return;
+        return RobotArmService_HandleAckFrame(context, &parsed_frame);
     }
 
-    if ((reply_length >= 6U) &&
-        (reply_buffer[0] == ROBOT_ARM_SERVICE_FRAME_HEADER) &&
-        (reply_buffer[1] == ROBOT_ARM_SERVICE_FRAME_HEADER) &&
-        (reply_buffer[3] == ROBOT_ARM_SERVICE_CMD_VERSION_QUERY))
+    if (parsed_frame.command == ROBOT_ARM_CMD_NACK)
     {
-        BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-        my_printf(&huart1,
-                  "[ARM] Link OK: ESP32 version reply. len=%u, servo=%s(%u), fw=%u. You can send motion commands now.\r\n",
-                  (unsigned int)reply_length,
-                  RobotArmService_GetServoTypeDescription(reply_buffer[4]),
-                  (unsigned int)reply_buffer[4],
-                  (unsigned int)reply_buffer[5]);
-        return;
+        RobotArmService_HandleNackFrame(context, &parsed_frame);
+        return 0U;
     }
 
+    if (parsed_frame.command == ROBOT_ARM_CMD_FAULT_REPORT)
+    {
+        RobotArmService_HandleFaultFrame(&parsed_frame);
+        return 0U;
+    }
+
+    BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
     my_printf(&huart1,
-              "[ARM] ESP32 replied to '%s': len=%u, raw=%02X %02X %02X %02X %02X %02X.\r\n",
-              RobotArmService_GetCommandDescription(command),
-              (unsigned int)reply_length,
-              (reply_length > 0U) ? reply_buffer[0] : 0U,
-              (reply_length > 1U) ? reply_buffer[1] : 0U,
-              (reply_length > 2U) ? reply_buffer[2] : 0U,
-              (reply_length > 3U) ? reply_buffer[3] : 0U,
-              (reply_length > 4U) ? reply_buffer[4] : 0U,
-              (reply_length > 5U) ? reply_buffer[5] : 0U);
-    BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+              "[ARM] Unexpected frame while waiting ACK: cmd=0x%02X(%s), seq=%u.\r\n",
+              (unsigned int)parsed_frame.command,
+              RobotArmService_GetCommandDescription(parsed_frame.command),
+              (unsigned int)parsed_frame.sequence);
+    return 0U;
 }
 
 /**
- * @brief 说明那些“发送后不会回包”的机械臂命令该如何判断结果。
- * @param command 本次发送的 LeArm 命令号。
- * @param frame_data 本次发送的完整 LeArm 协议帧，不能为 NULL。
- * @param frame_length 本次发送的协议帧长度。
+ * @brief 等待 ESP32S3 对当前动作返回 STAGE_DONE。
+ * @param context 当前发送上下文，不能为 NULL。
+ * @return uint8_t 1 表示 DONE 成功，0 表示失败、超时或故障。
  *
- * LeArm 出厂协议里，动作类命令多数不会返回确认帧。
- * 如果只打印“已发送”，操作者容易误以为 ESP32 一定执行了动作；
- * 因此这里把最容易误解的动作组编号和验证方法单独打印出来。
+ * ACK 只代表动作进入 ESP32S3 队列；本函数等待真实放置完成。
+ * 期间如果收到可选进度帧，只记录日志继续等 DONE。
  */
-static void RobotArmService_ReportNoReplyCommand(uint8_t command,
-                                                 const uint8_t *frame_data,
-                                                 uint16_t frame_length)
+static uint8_t RobotArmService_WaitStageDone(const RobotArmService_TxContext_t *context)
 {
-    if ((frame_data == NULL) || (frame_length < ROBOT_ARM_SERVICE_MIN_FRAME_LENGTH))
+    uint8_t rx_frame[ROBOT_ARM_SERVICE_FRAME_MAX_SIZE];
+    BinaryProtocol_Frame_t parsed_frame;
+    TickType_t deadline_tick;
+    TickType_t now_tick;
+    TickType_t remain_tick;
+    uint32_t remain_ms;
+
+    if (context == NULL)
     {
-        return;
+        return 0U;
     }
 
-    if ((command == ROBOT_ARM_SERVICE_CMD_ACTION_GROUP_RUN) && (frame_length >= 7U))
+    deadline_tick = xTaskGetTickCount() +
+                    pdMS_TO_TICKS((uint32_t)context->timeout_ms + ROBOT_ARM_SERVICE_DONE_EXTRA_TIMEOUT_MS);
+
+    for (;;)
     {
-        uint16_t repeat_times = (uint16_t)frame_data[5] | ((uint16_t)frame_data[6] << 8);
+        now_tick = xTaskGetTickCount();
+        if ((int32_t)(deadline_tick - now_tick) <= 0)
+        {
+            break;
+        }
+
+        remain_tick = deadline_tick - now_tick;
+        remain_ms = (uint32_t)remain_tick * (uint32_t)portTICK_PERIOD_MS;
+        if (remain_ms == 0U)
+        {
+            remain_ms = 1U;
+        }
+
+        if (RobotArmService_ReadFormalFrame(rx_frame,
+                                            (uint16_t)sizeof(rx_frame),
+                                            &parsed_frame,
+                                            remain_ms) == 0U)
+        {
+            break;
+        }
+
+        if (parsed_frame.command == ROBOT_ARM_CMD_STAGE_DONE)
+        {
+            return RobotArmService_HandleStageDoneFrame(context, &parsed_frame);
+        }
+
+        if (parsed_frame.command == ROBOT_ARM_CMD_STAGE_REPORT)
+        {
+            RobotArmService_HandleStageReportFrame(&parsed_frame);
+            continue;
+        }
+
+        if (parsed_frame.command == ROBOT_ARM_CMD_NACK)
+        {
+            RobotArmService_HandleNackFrame(context, &parsed_frame);
+            return 0U;
+        }
+
+        if (parsed_frame.command == ROBOT_ARM_CMD_FAULT_REPORT)
+        {
+            RobotArmService_HandleFaultFrame(&parsed_frame);
+            return 0U;
+        }
 
         my_printf(&huart1,
-                  "[ARM] Motion command has no reply: requested saved action group %u, repeat %u time(s). If the arm does not move, ESP32 may not have this group saved. Test direct reset with 55 55 02 0C.\r\n",
-                  (unsigned int)frame_data[4],
-                  (unsigned int)repeat_times);
-        return;
+                  "[ARM] Ignore frame while waiting DONE: cmd=0x%02X(%s), seq=%u.\r\n",
+                  (unsigned int)parsed_frame.command,
+                  RobotArmService_GetCommandDescription(parsed_frame.command),
+                  (unsigned int)parsed_frame.sequence);
     }
 
-    if (command == ROBOT_ARM_SERVICE_CMD_SERVOS_RESET)
-    {
-        my_printf(&huart1,
-                  "[ARM] Reset command has no reply. The arm should move to default pose if servo power and bus wiring are OK.\r\n");
-        return;
-    }
-
+    BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+    BinaryProtocolService_ReportFault((uint16_t)context->stage_id,
+                                      BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                      BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                      (int32_t)context->timeout_ms,
+                                      context->sequence);
     my_printf(&huart1,
-              "[ARM] '%s' has no reply frame. Judge it by arm movement or by the next query command.\r\n",
-              RobotArmService_GetCommandDescription(command));
+              "[ARM] DONE timeout: cmd=%s, cycle=%u, job=%u, stage=%u, wait_ms=%u.\r\n",
+              RobotArmService_GetCommandDescription(context->command),
+              (unsigned int)context->cycle_id,
+              (unsigned int)context->job_id,
+              (unsigned int)context->stage_id,
+              (unsigned int)((uint32_t)context->timeout_ms + ROBOT_ARM_SERVICE_DONE_EXTRA_TIMEOUT_MS));
+    return 0U;
 }
 
 /**
- * @brief 通过 USART3 发送一帧 LeArm 协议，并按需读取 ESP32 回包。
- * @param frame_data 待发送协议帧，不能为 NULL。
- * @param frame_length 待发送协议帧长度，单位为字节。
- * @param source_label 日志中标记帧来源，例如 `startup` 或 `uart1`。
- *
- * 该函数是机械臂任务内唯一的 USART3 发送入口。
- * 统一放在这里可以保证发送日志、回包读取和错误处理保持一致。
+ * @brief 发送正式协议帧，并按协议等待 ACK/DONE。
+ * @param context 发送上下文，不能为 NULL。
  */
-static void RobotArmService_TransmitFrame(const uint8_t *frame_data,
-                                          uint16_t frame_length,
-                                          const char *source_label)
+static void RobotArmService_TransmitContext(const RobotArmService_TxContext_t *context)
 {
     HAL_StatusTypeDef tx_status;
-    uint8_t reply_buffer[ROBOT_ARM_SERVICE_RX_BUFFER_SIZE];
-    uint16_t reply_length;
-    uint8_t command;
 
-    if ((frame_data == NULL) || (frame_length < ROBOT_ARM_SERVICE_MIN_FRAME_LENGTH))
+    if ((context == NULL) ||
+        (context->length < BINARY_PROTOCOL_MIN_FRAME_LENGTH) ||
+        (context->length > ROBOT_ARM_SERVICE_FRAME_MAX_SIZE))
     {
         return;
     }
 
-    command = frame_data[3];
     RobotArmService_FlushUsart3Rx();
-
     tx_status = HAL_UART_Transmit(&huart3,
-                                  (uint8_t *)frame_data,
-                                  frame_length,
+                                  (uint8_t *)context->data,
+                                  context->length,
                                   ROBOT_ARM_SERVICE_TX_TIMEOUT_MS);
-
-    if (tx_status == HAL_OK)
-    {
-        my_printf(&huart1,
-                  "[ARM] Sent to ESP32: %s. source=%s, len=%u, cmd=0x%02X.\r\n",
-                  RobotArmService_GetCommandDescription(command),
-                  RobotArmService_GetSourceDescription(source_label),
-                  (unsigned int)frame_length,
-                  (unsigned int)command);
-    }
-    else
+    if (tx_status != HAL_OK)
     {
         BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
         BinaryProtocolService_ReportFault((uint16_t)tx_status,
                                           BINARY_PROTOCOL_FAULT_SOURCE_ARM,
                                           BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
                                           (int32_t)tx_status,
-                                          0U);
+                                          context->sequence);
         my_printf(&huart1,
-                  "[ARM] Send failed: '%s' did not leave USART3. HAL=%d, len=%u, cmd=0x%02X. Check USART3 wiring or pin conflict.\r\n",
-                  RobotArmService_GetCommandDescription(command),
+                  "[ARM] Send failed: cmd=%s, HAL=%d, len=%u, seq=%u.\r\n",
+                  RobotArmService_GetCommandDescription(context->command),
                   (int)tx_status,
-                  (unsigned int)frame_length,
-                  (unsigned int)command);
+                  (unsigned int)context->length,
+                  (unsigned int)context->sequence);
         return;
     }
 
-    if (RobotArmService_CommandExpectsReply(command) != 0U)
+    my_printf(&huart1,
+              "[ARM] Sent formal frame: cmd=%s, source=%s, cycle=%u, job=%u, stage=%u, seq=%u, len=%u.\r\n",
+              RobotArmService_GetCommandDescription(context->command),
+              RobotArmService_GetSourceDescription(context->source_label),
+              (unsigned int)context->cycle_id,
+              (unsigned int)context->job_id,
+              (unsigned int)context->stage_id,
+              (unsigned int)context->sequence,
+              (unsigned int)context->length);
+
+    if (RobotArmService_WaitAck(context) == 0U)
     {
-        reply_length = RobotArmService_ReadReply(reply_buffer, sizeof(reply_buffer));
-        RobotArmService_ReportReply(command, reply_buffer, reply_length);
+        return;
     }
-    else
+
+    if (context->wait_stage_done != 0U)
     {
-        RobotArmService_ReportNoReplyCommand(command, frame_data, frame_length);
+        (void)RobotArmService_WaitStageDone(context);
     }
 }
 
 /**
- * @brief 初始化机械臂服务内部队列。
- * @return uint8_t 1 表示队列可用，0 表示创建失败。
- *
- * 若队列已经存在，直接返回成功，避免重复创建导致内存泄漏。
+ * @brief 填充机械臂阶段命令 payload。
+ * @param payload 输出 payload，长度必须至少为 12 字节。
+ * @param cycle_id 当前单件流程号。
+ * @param stage_id 当前机械臂阶段。
+ * @param part_type 零件类型，未知填 0。
+ * @param model_result 模型结果，0=未知，1=良品，2=不良品，3=待复核。
+ * @param target_bin 分拣盘，非分拣阶段填 0。
+ * @param timeout_ms 本动作超时时间。
  */
-uint8_t RobotArmService_Init(void)
+static void RobotArmService_FillStagePayload(uint8_t *payload,
+                                             uint16_t cycle_id,
+                                             uint8_t stage_id,
+                                             uint8_t part_type,
+                                             uint8_t model_result,
+                                             uint8_t target_bin,
+                                             uint16_t timeout_ms)
 {
-    if (g_robot_arm_frame_queue != NULL)
-    {
-        return 1U;
-    }
-
-    g_robot_arm_frame_queue = xQueueCreate(ROBOT_ARM_SERVICE_QUEUE_LENGTH,
-                                           sizeof(RobotArmService_Frame_t));
-    return (g_robot_arm_frame_queue != NULL) ? 1U : 0U;
+    (void)memset(payload, 0, ROBOT_ARM_SERVICE_STAGE_COMMAND_PAYLOAD_LEN);
+    RobotArmService_WriteU16Le(&payload[0], cycle_id);
+    payload[2] = stage_id;
+    payload[3] = part_type;
+    payload[4] = model_result;
+    payload[5] = target_bin;
+    RobotArmService_WriteU16Le(&payload[6], timeout_ms);
+    payload[8] = 0U;
+    RobotArmService_WriteU16Le(&payload[9], 0U);
+    payload[11] = 0U;
 }
 
 /**
- * @brief 把一个自动检测业务动作组投递到 ESP32S3 发送队列。
- * @param action_group_id ESP32S3 需要运行的动作组编号。
- * @param cycle_id 当前自动检测流程号，仅用于 F4 日志和排障。
- * @param job_id 当前机械臂任务号，仅用于 F4 日志和排障。
- * @param part_type 零件类型，当前 LeArm 帧暂不携带，保留给后续 A5 机械臂协议。
- * @param model_result 模型结果，当前 LeArm 帧暂不携带，保留给后续 A5 机械臂协议。
- * @param final_bin 最终分拣目标，非分拣阶段填 0。
- * @return uint8_t 1 表示投递成功，0 表示队列未就绪或已满。
- *
- * 当前 ESP32S3 固件不用本仓库实现，因此 F4 侧先定义稳定的业务入口和动作组编号。
- * 后续 ESP32S3 只要保证动作组 10/11/12/13/14 分别完成称重、电感和分拣动作即可联调。
+ * @brief 构建并入队一个正式机械臂动作命令。
+ * @param command 机械臂命令字。
+ * @param cycle_id 当前自动检测流程号。
+ * @param job_id 当前机械臂任务号。
+ * @param stage_id 当前阶段编号。
+ * @param part_type 零件类型。
+ * @param model_result 模型结果。
+ * @param target_bin 分拣目标。
+ * @return uint8_t 1 表示已进入发送队列，0 表示组帧或入队失败。
  */
-static uint8_t RobotArmService_EnqueueBusinessAction(uint8_t action_group_id,
-                                                     uint16_t cycle_id,
-                                                     uint16_t job_id,
-                                                     uint8_t part_type,
-                                                     uint8_t model_result,
-                                                     uint8_t final_bin)
+static uint8_t RobotArmService_EnqueueStageCommand(uint8_t command,
+                                                   uint16_t cycle_id,
+                                                   uint16_t job_id,
+                                                   uint8_t stage_id,
+                                                   uint8_t part_type,
+                                                   uint8_t model_result,
+                                                   uint8_t target_bin)
 {
-    RobotArmService_Frame_t queued_frame;
+    RobotArmService_TxContext_t queued_frame;
+    uint8_t payload[ROBOT_ARM_SERVICE_STAGE_COMMAND_PAYLOAD_LEN];
     BaseType_t queue_status;
 
     if (RobotArmService_Init() == 0U)
@@ -696,20 +1003,153 @@ static uint8_t RobotArmService_EnqueueBusinessAction(uint8_t action_group_id,
     }
 
     (void)memset(&queued_frame, 0, sizeof(queued_frame));
-    queued_frame.data[0] = ROBOT_ARM_SERVICE_FRAME_HEADER;
-    queued_frame.data[1] = ROBOT_ARM_SERVICE_FRAME_HEADER;
-    queued_frame.data[2] = 0x05U;
-    queued_frame.data[3] = ROBOT_ARM_SERVICE_CMD_ACTION_GROUP_RUN;
-    queued_frame.data[4] = action_group_id;
-    queued_frame.data[5] = 0x01U;
-    queued_frame.data[6] = 0x00U;
-    queued_frame.length = 7U;
+    RobotArmService_FillStagePayload(payload,
+                                     cycle_id,
+                                     stage_id,
+                                     part_type,
+                                     model_result,
+                                     target_bin,
+                                     ROBOT_ARM_SERVICE_ACTION_TIMEOUT_MS);
+
+    queued_frame.sequence = RobotArmService_AllocateSequence();
+    queued_frame.length = BinaryProtocolService_BuildFrame(command,
+                                                           queued_frame.sequence,
+                                                           payload,
+                                                           (uint8_t)sizeof(payload),
+                                                           queued_frame.data,
+                                                           (uint16_t)sizeof(queued_frame.data));
+    if (queued_frame.length == 0U)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        return 0U;
+    }
+
+    queued_frame.command = command;
+    queued_frame.cycle_id = cycle_id;
+    queued_frame.job_id = job_id;
+    queued_frame.stage_id = stage_id;
+    queued_frame.wait_stage_done = 1U;
+    queued_frame.timeout_ms = ROBOT_ARM_SERVICE_ACTION_TIMEOUT_MS;
+    queued_frame.source_label = "auto-flow";
 
     queue_status = xQueueSend(g_robot_arm_frame_queue, &queued_frame, 0U);
     if (queue_status != pdTRUE)
     {
         BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-        BinaryProtocolService_ReportFault((uint16_t)action_group_id,
+        BinaryProtocolService_ReportFault((uint16_t)command,
+                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                          (int32_t)job_id,
+                                          queued_frame.sequence);
+        my_printf(&huart1,
+                  "[ARM] Queue busy: cmd=%s, cycle=%u, job=%u, stage=%u.\r\n",
+                  RobotArmService_GetCommandDescription(command),
+                  (unsigned int)cycle_id,
+                  (unsigned int)job_id,
+                  (unsigned int)stage_id);
+        return 0U;
+    }
+
+    BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+    my_printf(&huart1,
+              "[ARM] Queued formal action: cmd=%s, cycle=%u, job=%u, part=%u, model=%u, bin=%u, seq=%u.\r\n",
+              RobotArmService_GetCommandDescription(command),
+              (unsigned int)cycle_id,
+              (unsigned int)job_id,
+              (unsigned int)part_type,
+              (unsigned int)model_result,
+              (unsigned int)target_bin,
+              (unsigned int)queued_frame.sequence);
+    return 1U;
+}
+
+/**
+ * @brief 构建并立即发送一个启动诊断命令。
+ * @param command HELLO 或 HEARTBEAT 命令。
+ * @param source_label 日志来源标签。
+ *
+ * 启动诊断不进入动作队列，也不等待 DONE，只验证 ESP32S3 正式协议 ACK。
+ */
+static void RobotArmService_SendStartupControl(uint8_t command, const char *source_label)
+{
+    RobotArmService_TxContext_t context;
+
+    (void)memset(&context, 0, sizeof(context));
+    context.sequence = RobotArmService_AllocateSequence();
+    context.length = BinaryProtocolService_BuildFrame(command,
+                                                      context.sequence,
+                                                      (const uint8_t *)0,
+                                                      0U,
+                                                      context.data,
+                                                      (uint16_t)sizeof(context.data));
+    if (context.length == 0U)
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        return;
+    }
+
+    context.command = command;
+    context.cycle_id = 0U;
+    context.job_id = 0U;
+    context.stage_id = ROBOT_ARM_STAGE_NONE;
+    context.wait_stage_done = 0U;
+    context.timeout_ms = ROBOT_ARM_SERVICE_CONTROL_TIMEOUT_MS;
+    context.source_label = source_label;
+    RobotArmService_TransmitContext(&context);
+}
+
+uint8_t RobotArmService_Init(void)
+{
+    if (g_robot_arm_frame_queue != NULL)
+    {
+        return 1U;
+    }
+
+    g_robot_arm_frame_queue = xQueueCreate(ROBOT_ARM_SERVICE_QUEUE_LENGTH,
+                                           sizeof(RobotArmService_TxContext_t));
+    return (g_robot_arm_frame_queue != NULL) ? 1U : 0U;
+}
+
+uint8_t RobotArmService_RequestPlaceWeight(uint16_t cycle_id,
+                                           uint16_t job_id,
+                                           uint8_t part_type,
+                                           uint8_t model_result)
+{
+    return RobotArmService_EnqueueStageCommand(ROBOT_ARM_CMD_MOVE_TO_WEIGHT,
+                                               cycle_id,
+                                               job_id,
+                                               ROBOT_ARM_STAGE_PICK_BELT_TO_WEIGHT,
+                                               part_type,
+                                               model_result,
+                                               ROBOT_ARM_BIN_NONE);
+}
+
+uint8_t RobotArmService_RequestPlaceLdc(uint16_t cycle_id,
+                                        uint16_t job_id,
+                                        uint8_t part_type,
+                                        uint8_t model_result)
+{
+    return RobotArmService_EnqueueStageCommand(ROBOT_ARM_CMD_MOVE_TO_LDC,
+                                               cycle_id,
+                                               job_id,
+                                               ROBOT_ARM_STAGE_WEIGHT_TO_LDC,
+                                               part_type,
+                                               model_result,
+                                               ROBOT_ARM_BIN_NONE);
+}
+
+uint8_t RobotArmService_RequestFinalSort(uint16_t cycle_id,
+                                         uint16_t job_id,
+                                         uint8_t part_type,
+                                         uint8_t model_result,
+                                         uint8_t final_bin)
+{
+    if ((final_bin != ROBOT_ARM_BIN_GOOD) &&
+        (final_bin != ROBOT_ARM_BIN_BAD) &&
+        (final_bin != ROBOT_ARM_BIN_REVIEW))
+    {
+        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+        BinaryProtocolService_ReportFault((uint16_t)final_bin,
                                           BINARY_PROTOCOL_FAULT_SOURCE_ARM,
                                           BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
                                           (int32_t)job_id,
@@ -717,177 +1157,18 @@ static uint8_t RobotArmService_EnqueueBusinessAction(uint8_t action_group_id,
         return 0U;
     }
 
-    BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-    my_printf(&huart1,
-              "[ARM] Auto action queued: group=%u, cycle=%u, job=%u, part=%u, model=%u, bin=%u.\r\n",
-              (unsigned int)action_group_id,
-              (unsigned int)cycle_id,
-              (unsigned int)job_id,
-              (unsigned int)part_type,
-              (unsigned int)model_result,
-              (unsigned int)final_bin);
-    return 1U;
+    return RobotArmService_EnqueueStageCommand(ROBOT_ARM_CMD_SORT_RESULT,
+                                               cycle_id,
+                                               job_id,
+                                               ROBOT_ARM_STAGE_LDC_TO_SORT_BIN,
+                                               part_type,
+                                               model_result,
+                                               final_bin);
 }
 
-/**
- * @brief 请求 ESP32S3 机械臂把 ROI 中的零件放到称重模块。
- */
-uint8_t RobotArmService_RequestPlaceWeight(uint16_t cycle_id,
-                                           uint16_t job_id,
-                                           uint8_t part_type,
-                                           uint8_t model_result)
-{
-    return RobotArmService_EnqueueBusinessAction(ROBOT_ARM_SERVICE_ACTION_PLACE_WEIGHT,
-                                                 cycle_id,
-                                                 job_id,
-                                                 part_type,
-                                                 model_result,
-                                                 0U);
-}
-
-/**
- * @brief 请求 ESP32S3 机械臂把零件从称重模块放到电磁感应模块。
- */
-uint8_t RobotArmService_RequestPlaceLdc(uint16_t cycle_id,
-                                        uint16_t job_id,
-                                        uint8_t part_type,
-                                        uint8_t model_result)
-{
-    return RobotArmService_EnqueueBusinessAction(ROBOT_ARM_SERVICE_ACTION_PLACE_LDC,
-                                                 cycle_id,
-                                                 job_id,
-                                                 part_type,
-                                                 model_result,
-                                                 0U);
-}
-
-/**
- * @brief 请求 ESP32S3 机械臂把零件放到最终分拣区。
- */
-uint8_t RobotArmService_RequestFinalSort(uint16_t cycle_id,
-                                         uint16_t job_id,
-                                         uint8_t part_type,
-                                         uint8_t model_result,
-                                         uint8_t final_bin)
-{
-    uint8_t action_group_id = ROBOT_ARM_SERVICE_ACTION_SORT_REVIEW;
-
-    if (final_bin == 1U)
-    {
-        action_group_id = ROBOT_ARM_SERVICE_ACTION_SORT_GOOD;
-    }
-    else if (final_bin == 2U)
-    {
-        action_group_id = ROBOT_ARM_SERVICE_ACTION_SORT_BAD;
-    }
-
-    return RobotArmService_EnqueueBusinessAction(action_group_id,
-                                                 cycle_id,
-                                                 job_id,
-                                                 part_type,
-                                                 model_result,
-                                                 final_bin);
-}
-
-/**
- * @brief 判断一段原始串口数据是否符合 LeArm 上位机协议帧格式。
- * @param frame_buffer 原始串口数据缓存，不能为 NULL。
- * @param frame_length 原始串口数据长度，单位为字节。
- * @return uint8_t 1 表示帧格式合法，0 表示不是完整 LeArm 帧。
- *
- * 校验点：
- * 1. 至少包含 `55 55 Length CMD` 四个字节；
- * 2. 前两个字节必须是 LeArm 固定帧头；
- * 3. Length 字段必须能和本次 DMA 空闲中断给出的总长度对齐；
- * 4. 总长度不能超过本模块的队列缓存上限。
- */
-uint8_t RobotArmService_IsProtocolFrame(const uint8_t *frame_buffer, uint16_t frame_length)
-{
-    return (RobotArmService_GetProtocolLength(frame_buffer, frame_length) != 0U) ? 1U : 0U;
-}
-
-/**
- * @brief 处理一帧来自 USART1 的原始数据，若识别为机械臂协议则投递到 USART3 转发任务。
- * @param frame_buffer 原始串口数据缓存，不能为 NULL。
- * @param frame_length 原始串口数据长度，单位为字节。
- * @return uint8_t 1 表示该帧已经被机械臂服务接管，0 表示该帧不是机械臂协议帧。
- *
- * 这里不直接调用 HAL_UART_Transmit，是为了让 USART1 命令分发路径保持轻量。
- * 如果队列已满，函数仍然返回 1，表示该帧属于机械臂协议但已被丢弃，防止二进制帧继续落入文本命令解析分支。
- */
-uint8_t RobotArmService_HandleFrame(const uint8_t *frame_buffer, uint16_t frame_length)
-{
-    RobotArmService_Frame_t queued_frame;
-    uint16_t protocol_length;
-    BaseType_t queue_status;
-
-    protocol_length = RobotArmService_GetProtocolLength(frame_buffer, frame_length);
-    if (protocol_length == 0U)
-    {
-        return 0U;
-    }
-
-    if ((g_robot_arm_frame_queue == NULL) && (RobotArmService_Init() == 0U))
-    {
-        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-        BinaryProtocolService_ReportFault((uint16_t)frame_buffer[3],
-                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
-                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
-                                          0,
-                                          0U);
-        my_printf(&huart1,
-                  "[ARM] Queue create failed: '%s'(0x%02X) was not sent. Check FreeRTOS heap.\r\n",
-                  RobotArmService_GetCommandDescription(frame_buffer[3]),
-                  (unsigned int)frame_buffer[3]);
-        return 1U;
-    }
-
-    (void)memset(&queued_frame, 0, sizeof(queued_frame));
-    (void)memcpy(queued_frame.data, frame_buffer, protocol_length);
-    queued_frame.length = protocol_length;
-
-    /*
-     * 队列发送使用 0 tick 等待，避免称重主任务或命令分发路径因为机械臂队列拥塞而阻塞。
-     * 队列满时直接丢弃当前帧，操作者可以重新下发动作命令。
-     */
-    queue_status = xQueueSend(g_robot_arm_frame_queue, &queued_frame, 0U);
-    if (queue_status == pdTRUE)
-    {
-        my_printf(&huart1,
-                  "[ARM] UART1 accepted: %s. rx_len=%u, tx_len=%u, cmd=0x%02X.\r\n",
-                  RobotArmService_GetCommandDescription(queued_frame.data[3]),
-                  (unsigned int)frame_length,
-                  (unsigned int)protocol_length,
-                  (unsigned int)queued_frame.data[3]);
-    }
-    else
-    {
-        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-        BinaryProtocolService_ReportFault((uint16_t)queued_frame.data[3],
-                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
-                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
-                                          (int32_t)protocol_length,
-                                          0U);
-        my_printf(&huart1,
-                  "[ARM] Command queue is busy: '%s' was dropped. Retry after the previous arm log ends. len=%u, cmd=0x%02X.\r\n",
-                  RobotArmService_GetCommandDescription(queued_frame.data[3]),
-                  (unsigned int)protocol_length,
-                  (unsigned int)queued_frame.data[3]);
-    }
-
-    return 1U;
-}
-
-/**
- * @brief 机械臂服务任务入口，负责把队列中的机械臂协议帧通过 USART3 发送给 ESP32。
- * @param argument FreeRTOS 任务参数，当前未使用。
- *
- * 任务内部不解析动作组编号、不修改帧内容，只做 USART1 到 USART3 的可靠转发。
- * 这样 ESP32 仍然保持机械臂协议和总线舵机控制的唯一执行者，STM32 只承担调度与上游指令桥接。
- */
 void RobotArmService_Task(void *argument)
 {
-    RobotArmService_Frame_t frame;
+    RobotArmService_TxContext_t frame;
 
     (void)argument;
 
@@ -905,29 +1186,21 @@ void RobotArmService_Task(void *argument)
         }
     }
 
-    /*
-     * 启动阶段先发送自定义 STM32 通讯模式帧，再发送查询版本帧。
-     * 两条帧都不驱动机械臂运动：前者要求 ESP32 端关闭蓝牙并确认，后者用于确认协议回包。
-     */
     vTaskDelay(pdMS_TO_TICKS(ROBOT_ARM_SERVICE_STARTUP_DELAY_MS));
-    RobotArmService_TransmitFrame(g_robot_arm_stm32_link_mode_frame,
-                                  (uint16_t)sizeof(g_robot_arm_stm32_link_mode_frame),
-                                  "startup-mode");
+    RobotArmService_SendStartupControl(ROBOT_ARM_CMD_HELLO, "startup-hello");
     vTaskDelay(pdMS_TO_TICKS(20U));
-    RobotArmService_TransmitFrame(g_robot_arm_startup_probe_frame,
-                                  (uint16_t)sizeof(g_robot_arm_startup_probe_frame),
-                                  "startup");
+    RobotArmService_SendStartupControl(ROBOT_ARM_CMD_HEARTBEAT, "startup-heartbeat");
 
     for (;;)
     {
         if (xQueueReceive(g_robot_arm_frame_queue, &frame, portMAX_DELAY) == pdTRUE)
         {
             /*
-             * USART3 已在 CubeMX 中配置为 115200 8N1，需要和 ESP32 当前 PA5/PA4 串口波特率保持一致。
-             * 当前链路对接 ESP32 的 PA5/PA4 扩展串口；如果 ESP32 后续再次改动波特率，这里和 CubeMX 配置也要同步调整。
-             * 这里按原始字节发送，确保 `55 55 ...` 二进制协议不被字符串处理破坏。
+             * USART3 已在 CubeMX 中配置为 115200 8N1。
+             * 队列中的每一项都已经是完整正式二进制帧，发送后必须先等 ACK，
+             * 对动作命令还必须继续等 STAGE_DONE，避免 ACK 被误当作动作完成。
              */
-            RobotArmService_TransmitFrame(frame.data, frame.length, "uart1");
+            RobotArmService_TransmitContext(&frame);
         }
     }
 }

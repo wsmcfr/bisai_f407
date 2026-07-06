@@ -6,7 +6,6 @@
 #include "conveyor_motor_service.h"
 #include "hx711.h"
 #include "ldc1614_service.h"
-#include "robot_arm_service.h"
 #include "uart_command.h"
 #include "usart.h"
 
@@ -20,7 +19,7 @@
  * - USART1：115200 8N1，PA9(TX)/PA10(RX)，由串口助手、MP157 或其它上位机发送命令；
  * - 本文件的 `WeightService_ProcessCommand()` 是当前 USART1 命令的唯一任务级消费者；
  * - 自动检测二进制帧会先走 `BinaryProtocolService_HandleFrame()`，识别成功后不会继续按文本命令解析；
- * - 机械臂二进制帧会先走 `RobotArmService_HandleFrame()`，识别成功后直接转发到 USART3，不再按文本命令解析；
+ * - 机械臂动作不再从 USART1 透传，必须由 MP157-F4 主协议触发后再由 F4 通过 USART3 下发给 ESP32S3；
  * - 文本命令会去掉首尾空白并转成大写，因此 `get`、`GET\r\n`、`Get` 都等价于 `GET`。
  *
  * MP157 主链路当前只允许发送自动检测二进制帧：
@@ -32,9 +31,10 @@
  * 旧的 `GET/STATUS/TARE/CAL/LDCCAL/BELTSCAN/CAM...` 文本命令只作为断开 MP157 后的串口助手维护入口。
  * USART1 文本输出默认静默，因此 MP157 不再依赖 `[OK]`、`[ERROR]` 或 `[INFO]` 文本判断成功失败。
  *
- * 用户可从 USART1 直接发送的机械臂二进制帧：
- * - 例如 `55 55 02 01` 查询 ESP32 版本，`55 55 05 06 03 01 00` 运行 3 号动作组 1 次；
- * - 详细帧表和接线要求在 `User/App/robot_arm_service.c` 顶部维护。
+ * 机械臂链路：
+ * - MP157 先发送 `ARM_JOB_START/FINAL_SORT_RESULT` 给 F4；
+ * - F4 再通过 USART3 向 ESP32S3 发送正式 `A5 5A` 机械臂帧；
+ * - ESP32S3 必须按正式 ACK/DONE 协议回包，F4 不再接受旧协议透传。
  *
  * 用户可从 USART1 直接发送的自动检测二进制帧：
  * - 帧头固定 `A5 5A`，帧尾固定 `6B`，CRC16 覆盖 `VER~PAYLOAD`；
@@ -683,15 +683,6 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
          * 自动检测二进制协议使用 `A5 5A` 帧头和 CRC 校验。
          * 不管业务命令最终 ACK 还是 NACK，只要识别为本协议帧，就不能再落入机械臂或文本命令解析分支，
          * 否则 CRC 错帧可能被误当作乱码文本处理，现场排查会更混乱。
-         */
-        return;
-    }
-
-    if (RobotArmService_HandleFrame(raw_frame, raw_frame_length) != 0U)
-    {
-        /*
-         * 机械臂帧是二进制协议，不能继续走文本命令规范化流程。
-         * 这里直接返回，后续由 RobotArmService_Task 通过 USART3 转发给 ESP32。
          */
         return;
     }

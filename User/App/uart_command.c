@@ -21,7 +21,7 @@
  * | LDC 标定入口 | `LDCCAL CH1 20` / `LDCSTOP` | `ldc1614_service.c` | 仅作为串口助手维护入口；自动流程故障走 `FAULT_REPORT` | USART1 文本默认静默 |
  * | 传送带调试入口 | 二进制 `BELT_MANUAL_CONTROL` / `QUERY_STATUS` | `binary_protocol_service.c` | 切换巡航、停止或查询结构化状态 | 正确返回 `ACK/STATUS_REPORT`，错误返回 `NACK/FAULT_REPORT` |
  * | 摄像头电机维护入口 | `CAMINFO` / `CAMSTOP` / `CAMLAT LEFT 30` / `CAMLAT RIGHT 30` / `CAMZ UP 30` | `camera_motor_service.c` | 调试摄像头左右轴和上下轴，两个电机共用 USART6 但地址不同 | USART1 文本默认静默，自动流程走二进制执行器命令 |
- * | 机械臂 HEX 帧 | `55 55 02 01` / `55 55 05 06 03 01 00` | `robot_arm_service.c` | 透传到 USART3/ESP32，查询或执行 LeArm 动作 | 查询类有 `[ARM] RX...` 日志，运动类通常看机械臂动作 |
+ * | 机械臂正式帧 | `A5 5A 01 20 ... 6B` | `robot_arm_service.c` | 通过 USART3 发给 ESP32S3，并等待 ACK/DONE | `[ARM] ACK OK` 后继续等 `[ARM] DONE received` |
  *
  * 串口链路：
  * - USART1：115200 8N1，PA9(TX)/PA10(RX)，面向串口助手、MP157 或其它上位机；
@@ -63,7 +63,7 @@
  */
 /*
  * 机械臂调试日志改为更长的可读英文句子，避免 ARMCC5 解析 UTF-8 中文字符串时报错。
- * 384 字节可以容纳动作组排查建议和接线检查提示，避免日志被截断。
+ * 384 字节可以容纳正式协议 ACK/DONE 排查建议和接线检查提示，避免日志被截断。
  */
 #define UART_COMMAND_TX_BUFFER_SIZE       (384U)
 
@@ -171,7 +171,7 @@ void UartCommand_StartReceive(void)
  *
  * 该函数和 UartCommand_Fetch 使用同一个 USART1 单消费者缓存。
  * 与文本接口不同的是，这里不会补字符串结束符，也不会因为帧内存在 0x00 而提前截断，
- * 因此可用于机械臂 `55 55 ...` 二进制协议透传。
+ * 因此可用于 `A5 5A ... 6B` 正式二进制帧传输。
  */
 uint8_t UartCommand_FetchRaw(uint8_t *frame_buffer,
                              uint16_t buffer_size,
