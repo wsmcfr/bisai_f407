@@ -71,17 +71,17 @@
  * @brief 业务动作写入 payload 的默认动作超时，单位毫秒。
  *
  * ESP32S3 应使用该值作为本地动作超时阈值；F4 等 DONE 时会再额外留出串口调度余量。
- * 当前实物机械臂从抓取、移动到放稳可能明显超过旧版 15 秒，所以正式流程按单阶段 60 秒保护。
+ * 当前实物机械臂从抓取、移动到放稳可能明显超过旧版 15 秒，所以正式流程按单阶段 100 秒保护。
  */
-#define ROBOT_ARM_SERVICE_ACTION_TIMEOUT_MS         (60000U)
+#define ROBOT_ARM_SERVICE_ACTION_TIMEOUT_MS         (100000U)
 
 /**
  * @brief F4 等待 DONE 时相对业务超时额外增加的余量，单位毫秒。
  *
  * 该余量覆盖 ESP32S3 动作任务到串口任务之间的调度延迟和 UART 传输时间。
- * F4 实际等待 DONE 的最长时间为 `ACTION_TIMEOUT + DONE_EXTRA`，当前即 65 秒。
+ * F4 实际等待 DONE 的最长时间为 `ACTION_TIMEOUT + DONE_EXTRA`，当前即 110 秒。
  */
-#define ROBOT_ARM_SERVICE_DONE_EXTRA_TIMEOUT_MS     (5000U)
+#define ROBOT_ARM_SERVICE_DONE_EXTRA_TIMEOUT_MS     (10000U)
 
 /**
  * @brief HELLO 和 HEARTBEAT 这类无运动命令写入 payload 的默认超时，单位毫秒。
@@ -93,9 +93,9 @@
  *
  * 固定格式：
  * cycle_id:u16、stage_id:u8、part_type:u8、model_result:u8、target_bin:u8、
- * timeout_ms:u16、motion_profile:u8、flags:u16、reserved:u8。
+ * timeout_ms:u32、motion_profile:u8、flags:u16、reserved:u8。
  */
-#define ROBOT_ARM_SERVICE_STAGE_COMMAND_PAYLOAD_LEN (12U)
+#define ROBOT_ARM_SERVICE_STAGE_COMMAND_PAYLOAD_LEN (14U)
 
 /**
  * @brief ESP32S3 回给 F4 的 ARM_ACK payload 长度。
@@ -176,7 +176,7 @@ typedef struct
     uint16_t job_id;                                /* 当前机械臂任务号，传给 MP157-F4 主状态机。 */
     uint8_t stage_id;                               /* 当前等待的动作阶段。 */
     uint8_t wait_stage_done;                        /* 1 表示 ACK 后还要继续等待 DONE；0 表示只需要 ACK。 */
-    uint16_t timeout_ms;                            /* ESP32S3 动作超时和 F4 等 DONE 的基础时间。 */
+    uint32_t timeout_ms;                            /* ESP32S3 动作超时和 F4 等 DONE 的基础时间。 */
     const char *source_label;                       /* 日志来源标签。 */
 } RobotArmService_TxContext_t;
 
@@ -213,6 +213,22 @@ static void RobotArmService_WriteU16Le(uint8_t *data, uint16_t value)
 {
     data[0] = (uint8_t)(value & 0xFFU);
     data[1] = (uint8_t)((value >> 8) & 0xFFU);
+}
+
+/**
+ * @brief 写入小端 u32。
+ * @param data 输出地址，不能为 NULL。
+ * @param value 要写入的 32 位数。
+ *
+ * 机械臂动作超时可能超过 65535ms，因此 F4 发给 ESP32S3 的 timeout_ms
+ * 必须按 32 位小端写入 payload，避免 100000ms 被截断成 34464ms。
+ */
+static void RobotArmService_WriteU32Le(uint8_t *data, uint32_t value)
+{
+    data[0] = (uint8_t)(value & 0xFFUL);
+    data[1] = (uint8_t)((value >> 8) & 0xFFUL);
+    data[2] = (uint8_t)((value >> 16) & 0xFFUL);
+    data[3] = (uint8_t)((value >> 24) & 0xFFUL);
 }
 
 /**
@@ -945,7 +961,7 @@ static void RobotArmService_TransmitContext(const RobotArmService_TxContext_t *c
 
 /**
  * @brief 填充机械臂阶段命令 payload。
- * @param payload 输出 payload，长度必须至少为 12 字节。
+ * @param payload 输出 payload，长度必须至少为 14 字节。
  * @param cycle_id 当前单件流程号。
  * @param stage_id 当前机械臂阶段。
  * @param part_type 零件类型，未知填 0。
@@ -959,7 +975,7 @@ static void RobotArmService_FillStagePayload(uint8_t *payload,
                                              uint8_t part_type,
                                              uint8_t model_result,
                                              uint8_t target_bin,
-                                             uint16_t timeout_ms)
+                                             uint32_t timeout_ms)
 {
     (void)memset(payload, 0, ROBOT_ARM_SERVICE_STAGE_COMMAND_PAYLOAD_LEN);
     RobotArmService_WriteU16Le(&payload[0], cycle_id);
@@ -967,10 +983,10 @@ static void RobotArmService_FillStagePayload(uint8_t *payload,
     payload[3] = part_type;
     payload[4] = model_result;
     payload[5] = target_bin;
-    RobotArmService_WriteU16Le(&payload[6], timeout_ms);
-    payload[8] = 0U;
-    RobotArmService_WriteU16Le(&payload[9], 0U);
-    payload[11] = 0U;
+    RobotArmService_WriteU32Le(&payload[6], timeout_ms);
+    payload[10] = 0U;
+    RobotArmService_WriteU16Le(&payload[11], 0U);
+    payload[13] = 0U;
 }
 
 /**

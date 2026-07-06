@@ -7,7 +7,7 @@
 | 当前协议 | 只使用 `A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD CRC_L CRC_H 6B` 正式二进制协议 |
 | 上游入口 | `binary_protocol_service.c` 调用 `RobotArmService_RequestPlaceWeight()`、`RobotArmService_RequestPlaceLdc()`、`RobotArmService_RequestFinalSort()` |
 | 下游回包 | ESP32S3 必须回 `ARM_ACK`，动作真实完成后再回 `ARM_STAGE_DONE` |
-| 当前超时 | F4 发给 ESP32S3 的动作 `timeout_ms=60000ms`；F4 等 DONE 总窗口为 `60000+5000=65000ms` |
+| 当前超时 | F4 发给 ESP32S3 的动作 `timeout_ms=100000ms`，按 `u32` 小端发送；F4 等 DONE 总窗口为 `100000+10000=110000ms` |
 
 ## 修改文件清单
 
@@ -51,7 +51,7 @@
 | F4 TX 字节 | 串口分析仪或串口助手 | 自动流程触发机械臂抓取，抓 USART3 TX。 | 首字节应为 `A5 5A`，CMD 应为 `0x20`，帧尾 `6B`。 | 若仍是旧动作组帧，确认 F4 是否重新编译、下载和复位。 |
 | ESP32S3 ACK | ESP32S3 串口日志或 F4 USART1 日志 | 观察 `ARM_ACK`。 | F4 日志出现 `ACK OK: ARM_MOVE_TO_WEIGHT`。 | 检查 ESP32S3 是否实现 ACK、CRC 是否一致、TX/RX 是否交叉。 |
 | ESP32S3 DONE | 实物机械臂 | 让机械臂真实放到称重模块后回 `ARM_STAGE_DONE stage=1 result=0`。 | F4 调用称重并向 MP157 发 `WEIGHT_RESULT`。 | 检查 ESP32S3 是否把 ACK 误当 DONE、stage_id 是否填错。 |
-| 动作超时窗口 | F4 USART3 抓包 + MP157 日志 | 触发自动流程，观察 `ARM_MOVE_TO_WEIGHT/MOVE_TO_LDC/SORT_RESULT` payload 的 `timeout_ms` 字段。 | payload 偏移 6~7 应为 `60 EA`，表示 `60000ms`；F4 DONE 日志最大等待约 `65000ms`。 | 若仍是 `98 3A`，说明 F4 仍运行旧固件或未重新下载；若 MP157 先超时，确认 Qt 二进制是否包含 `F4_ARM_ACTIVE_FRAME_TIMEOUT_MS`。 |
+| 动作超时窗口 | F4 USART3 抓包 + MP157 日志 | 触发自动流程，观察 `ARM_MOVE_TO_WEIGHT/MOVE_TO_LDC/SORT_RESULT` payload 的 `timeout_ms` 字段。 | payload 偏移 6~9 应为 `A0 86 01 00`，表示 `100000ms`；F4 DONE 日志最大等待约 `110000ms`。 | 若仍是 2 字节旧字段或 `60 EA`，说明 F4 仍运行旧固件或未重新下载；若 MP157 先超时，确认 Qt 参数页 `机械臂等待` 是否大于 F4 最长等待。 |
 | 故障上报 | ESP32S3 | 人为制造忙状态或抓取失败。 | ESP32S3 回 `ARM_NACK` 或 `ARM_STAGE_DONE result!=0`，F4 上报 ARM 故障。 | 检查 error_code、result、fault_bits 是否按文档填写。 |
 
 ## 修改记录
@@ -60,6 +60,7 @@
 |---|---|---|
 | 2026-07-06 | 切换到正式机械臂二进制协议 | F4 不再发送旧动作组兼容帧，改为 `A5 5A` 正式协议，并等待 ACK/DONE。 |
 | 2026-07-06 | 放大机械臂单阶段等待时间 | `ROBOT_ARM_SERVICE_ACTION_TIMEOUT_MS` 从 `15000ms` 调整为 `60000ms`，DONE 额外余量从 `2000ms` 调整为 `5000ms`，避免真实机械臂动作慢时 F4 过早超时。 |
+| 2026-07-07 | 扩展动作超时字段 | `timeout_ms` 从旧 `u16` 发送字段扩展为 `u32`，当前可完整发送 `100000ms`，避免被截断成 `34464ms`。 |
 
 ## 硬件资源
 
