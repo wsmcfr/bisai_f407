@@ -2,6 +2,7 @@
 
 #include "binary_protocol_service.h"
 #include "FreeRTOS.h"
+#include "semphr.h"
 #include "queue.h"
 #include "task.h"
 #include "uart_command.h"
@@ -111,6 +112,27 @@
  * @brief ESP32S3 回给 F4 的 ARM_NACK payload 长度。
  */
 #define ROBOT_ARM_SERVICE_NACK_PAYLOAD_LEN          (9U)
+
+/* ========== USART3 DMA+空闲中断接收 ========== */
+
+/* DMA接收缓冲区大小，单帧最大58字节，64足够。 */
+#define ROBOT_ARM_DMA_RX_BUF_SIZE                  (64U)
+
+/* 环形缓冲区大小，需容纳至少两帧（ACK+DONE连续到达）。 */
+#define ROBOT_ARM_RING_BUF_SIZE                    (128U)
+
+/* DMA硬件写入的接收缓冲区（不可被任务直接读取，由ISR搬运到环形缓冲区）。 */
+static uint8_t g_robot_arm_dma_buf[ROBOT_ARM_DMA_RX_BUF_SIZE];
+
+/* ISR与任务之间共享的环形缓冲区，ISR写、任务读。 */
+static uint8_t g_robot_arm_ring_buf[ROBOT_ARM_RING_BUF_SIZE];
+static volatile uint16_t g_robot_arm_ring_write = 0U;
+static volatile uint16_t g_robot_arm_ring_read = 0U;
+
+/* 任务等待新数据的信号量，ISR中Give、任务中Take。 */
+static SemaphoreHandle_t g_robot_arm_rx_semaphore = NULL;
+
+/* ========== 结束 DMA 接收定义 ========== */
 
 /**
  * @brief 机械臂正式协议命令字。
@@ -360,19 +382,99 @@ static void RobotArmService_FlushUsart3Rx(void)
 }
 
 /**
- * @brief 从 USART3 读取一个字节。
+ * @brief 启动 USART3 DMA+空闲中断接收。
+ *
+ * 使用 HAL_UARTEx_ReceiveToIdle_DMA：当ESP32发完一帧后总线空闲，
+ * 硬件自动触发中断，DMA缓冲区里就是完整的一帧数据。
+ * 关闭半传输中断以避免短帧场景下的多余回调。
+ */
+static void RobotArmService_StartDmaReceive(void)
+{
+    if (HAL_UARTEx_ReceiveToIdle_DMA(&huart3,
+                                      g_robot_arm_dma_buf,
+                                      ROBOT_ARM_DMA_RX_BUF_SIZE) == HAL_OK)
+    {
+        if (huart3.hdmarx != NULL)
+        {
+            __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);
+        }
+    }
+}
+
+/**
+ * @brief USART3 DMA接收事件回调（从ISR中调用）。
+ * @param size 本次接收到的字节数。
+ *
+ * 把DMA缓冲区的数据搬到环形缓冲区，然后重启DMA，最后唤醒等待任务。
+ */
+void RobotArmService_RxEventFromISR(uint16_t size)
+{
+    BaseType_t higher_priority_woken = pdFALSE;
+    uint16_t i;
+    uint16_t next_write;
+
+    for (i = 0U; i < size; ++i)
+    {
+        next_write = (uint16_t)((g_robot_arm_ring_write + 1U) % ROBOT_ARM_RING_BUF_SIZE);
+        if (next_write == g_robot_arm_ring_read)
+        {
+            break; /* 环形缓冲区满，丢弃剩余字节。 */
+        }
+        g_robot_arm_ring_buf[g_robot_arm_ring_write] = g_robot_arm_dma_buf[i];
+        g_robot_arm_ring_write = next_write;
+    }
+
+    /* 重启下一轮DMA接收。 */
+    RobotArmService_StartDmaReceive();
+
+    if (g_robot_arm_rx_semaphore != NULL)
+    {
+        (void)xSemaphoreGiveFromISR(g_robot_arm_rx_semaphore, &higher_priority_woken);
+        portYIELD_FROM_ISR(higher_priority_woken);
+    }
+}
+
+/**
+ * @brief 从 USART3 读取一个字节（从环形缓冲区取出）。
  * @param value 输出字节，不能为 NULL。
  * @param timeout_ms 等待时间，单位毫秒。
- * @return uint8_t 1 表示读取成功，0 表示超时或 UART 错误。
+ * @return uint8_t 1 表示读取成功，0 表示超时。
+ *
+ * DMA+空闲中断负责把硬件收到的字节搬入环形缓冲区，
+ * 本函数只负责从缓冲区取数据，不会阻塞在硬件寄存器上。
  */
 static uint8_t RobotArmService_ReadByte(uint8_t *value, uint32_t timeout_ms)
 {
+    TickType_t deadline;
+    TickType_t now;
+    TickType_t remain;
+
     if (value == NULL)
     {
         return 0U;
     }
 
-    return (HAL_UART_Receive(&huart3, value, 1U, timeout_ms) == HAL_OK) ? 1U : 0U;
+    deadline = xTaskGetTickCount() + pdMS_TO_TICKS((timeout_ms == 0U) ? 1U : timeout_ms);
+
+    for (;;)
+    {
+        /* 环形缓冲区有数据则直接取出。 */
+        if (g_robot_arm_ring_read != g_robot_arm_ring_write)
+        {
+            *value = g_robot_arm_ring_buf[g_robot_arm_ring_read];
+            g_robot_arm_ring_read = (uint16_t)((g_robot_arm_ring_read + 1U) % ROBOT_ARM_RING_BUF_SIZE);
+            return 1U;
+        }
+
+        /* 无数据，等信号量直到超时。 */
+        now = xTaskGetTickCount();
+        if ((int32_t)(deadline - now) <= 0)
+        {
+            return 0U;
+        }
+        remain = deadline - now;
+        (void)xSemaphoreTake(g_robot_arm_rx_semaphore, remain);
+    }
 }
 
 /**
@@ -1123,7 +1225,21 @@ uint8_t RobotArmService_Init(void)
 
     g_robot_arm_frame_queue = xQueueCreate(ROBOT_ARM_SERVICE_QUEUE_LENGTH,
                                            sizeof(RobotArmService_TxContext_t));
-    return (g_robot_arm_frame_queue != NULL) ? 1U : 0U;
+    if (g_robot_arm_frame_queue == NULL)
+    {
+        return 0U;
+    }
+
+    /* 创建 USART3 接收信号量并启动 DMA+空闲中断接收。 */
+    if (g_robot_arm_rx_semaphore == NULL)
+    {
+        g_robot_arm_rx_semaphore = xSemaphoreCreateBinary();
+    }
+    g_robot_arm_ring_write = 0U;
+    g_robot_arm_ring_read = 0U;
+    RobotArmService_StartDmaReceive();
+
+    return 1U;
 }
 
 uint8_t RobotArmService_RequestPlaceWeight(uint16_t cycle_id,

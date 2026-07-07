@@ -34,6 +34,8 @@ uint8_t RobotArmService_Init(void);
  * @return uint8_t 1 表示正式协议命令已进入发送队列，0 表示队列或参数异常。
  *
  * 发送任务会先等待 ESP32S3 `ARM_ACK`，再等待 `ARM_STAGE_DONE stage=1`。
+ * 如果 `robot_arm_service.c` 里把正式流程宏关闭用于 USART3 回环自检，
+ * 则本接口不会真正入队，只会打印“当前处于 loopback 模式”并返回 0。
  */
 uint8_t RobotArmService_RequestPlaceWeight(uint16_t cycle_id,
                                            uint16_t job_id,
@@ -49,6 +51,8 @@ uint8_t RobotArmService_RequestPlaceWeight(uint16_t cycle_id,
  * @return uint8_t 1 表示正式协议命令已进入发送队列，0 表示队列或参数异常。
  *
  * 发送任务会先等待 ESP32S3 `ARM_ACK`，再等待 `ARM_STAGE_DONE stage=2`。
+ * 如果 `robot_arm_service.c` 里把正式流程宏关闭用于 USART3 回环自检，
+ * 则本接口不会真正入队，只会打印“当前处于 loopback 模式”并返回 0。
  */
 uint8_t RobotArmService_RequestPlaceLdc(uint16_t cycle_id,
                                         uint16_t job_id,
@@ -65,6 +69,8 @@ uint8_t RobotArmService_RequestPlaceLdc(uint16_t cycle_id,
  * @return uint8_t 1 表示正式协议命令已进入发送队列，0 表示队列或参数异常。
  *
  * 发送任务会先等待 ESP32S3 `ARM_ACK`，再等待 `ARM_STAGE_DONE stage=3`。
+ * 如果 `robot_arm_service.c` 里把正式流程宏关闭用于 USART3 回环自检，
+ * 则本接口不会真正入队，只会打印“当前处于 loopback 模式”并返回 0。
  */
 uint8_t RobotArmService_RequestFinalSort(uint16_t cycle_id,
                                          uint16_t job_id,
@@ -82,8 +88,21 @@ uint8_t RobotArmService_RequestFinalSort(uint16_t cycle_id,
  * 3. 阻塞等待业务命令入队；
  * 4. 通过 USART3 发送正式二进制帧；
  * 5. 动作命令先等 ACK，再等 DONE，并把 DONE 交给 MP157-F4 主状态机。
+ *
+ * 如果 `robot_arm_service.c` 里关闭了正式流程宏，
+ * 则该任务不会进入自动流程，而是周期性执行 USART3 TX->RX 回环自检，
+ * 并把结果打印到 UART1，供现场先确认 PD9 是否真的能收到数据。
  */
 void RobotArmService_Task(void *argument);
+
+/**
+ * @brief USART3 DMA+空闲中断接收事件回调（从ISR中调用）。
+ * @param size 本次DMA传输的实际字节数。
+ *
+ * 由 HAL_UARTEx_RxEventCallback 在 huart==&huart3 时调用，
+ * 负责把DMA缓冲区中收到的字节压入内部环形缓冲区并唤醒等待任务。
+ */
+void RobotArmService_RxEventFromISR(uint16_t size);
 
 #ifdef __cplusplus
 }

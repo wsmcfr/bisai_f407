@@ -480,6 +480,11 @@
               <FilePath>../User/App/robot_arm_service.c</FilePath>
             </File>
             <File>
+              <FileName>robot_arm_rx_parser.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/App/robot_arm_rx_parser.c</FilePath>
+            </File>
+            <File>
               <FileName>system_heartbeat_service.c</FileName>
               <FileType>1</FileType>
               <FilePath>../User/App/system_heartbeat_service.c</FilePath>

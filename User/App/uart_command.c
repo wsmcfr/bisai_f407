@@ -1,6 +1,7 @@
 #include "uart_command.h"
 
 #include "FreeRTOS.h"
+#include "robot_arm_service.h"
 #include "semphr.h"
 #include "usart.h"
 
@@ -53,6 +54,9 @@
  *
  * 若后续需要用 Windows 串口助手临时看文本日志，可以在现场调试固件中改为 1U；
  * 正式接 MP157 时必须保持 0U。
+ *
+ * 本轮 `USART3` 短接回环定位已经结束，机械臂链路调试日志已迁移到独立的 `USART2(PA2/PA3)`；
+ * 因此这里恢复为 `0U`，继续保证 MP157-F4 正式链路只走二进制帧，不混入文本调试输出。
  */
 #define UART_COMMAND_USART1_TEXT_ENABLE    (0U)
 
@@ -405,6 +409,13 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     BaseType_t higher_priority_task_woken = pdFALSE;
     uint16_t copy_length;
+
+    /* USART3: 机械臂ESP32链路，DMA+空闲中断接收，交由robot_arm_service处理。 */
+    if (huart == &huart3)
+    {
+        RobotArmService_RxEventFromISR(Size);
+        return;
+    }
 
     if ((huart != &huart1) || (Size == 0U))
     {

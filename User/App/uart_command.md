@@ -35,19 +35,20 @@
 
 | 场景 | 处理 |
 |---|---|
-| `my_printf(&huart1, ...)` | `UART_COMMAND_USART1_TEXT_ENABLE` 为 `0U` 时直接丢弃文本，返回 0。 |
+| `my_printf(&huart1, ...)` | `UART_COMMAND_USART1_TEXT_ENABLE` 为 `0U` 时直接丢弃文本，返回 0；当前已恢复为 `0U`，继续保证 MP157 主链路只走二进制。 |
 | `UartCommand_SendRaw(&huart1, ...)` | 不受文本静默影响，原样发送二进制帧。 |
-| Windows 串口助手临时维护 | 可以在专用调试固件中把 `UART_COMMAND_USART1_TEXT_ENABLE` 改为 `1U`，但正式接 MP157 前必须改回 `0U`。 |
+| Windows 串口助手临时维护 | 可以在专用调试固件中把 `UART_COMMAND_USART1_TEXT_ENABLE` 改为 `1U`，但正式接 MP157 前必须改回 `0U`；本轮机械臂链路调试已迁移到独立 `USART2`。 |
 | MP157 成功/失败判断 | 只能解析二进制帧，不能搜索 `OK/ERROR/READY/BELTINFO` 文本。 |
 
 ## 验证方式
 
 | 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
 |---|---|---|---|---|
-| 确认文本静默开关 | Windows PowerShell | `Select-String -Path E:\hal\bisai_f407_project\User\App\uart_command.c -Pattern "UART_COMMAND_USART1_TEXT_ENABLE"` | 能看到 `#define UART_COMMAND_USART1_TEXT_ENABLE    (0U)`。 | 如果不是 `0U`，正式联调前改回 `0U` 并重新编译烧录。 |
+| 确认文本静默开关 | Windows PowerShell | `Select-String -Path E:\hal\bisai_f407_project\User\App\uart_command.c -Pattern "UART_COMMAND_USART1_TEXT_ENABLE"` | 正式联调阶段应看到 `#define UART_COMMAND_USART1_TEXT_ENABLE    (0U)`。 | 如果误改成 `1U`，MP157 可能被文本日志干扰。 |
 | 确认二进制发送路径存在 | Windows PowerShell | `Select-String -Path E:\hal\bisai_f407_project\User\App\uart_command.c -Pattern "UartCommand_SendRaw"` | 能定位到原始字节发送函数和 `HAL_UART_Transmit`。 | 如果函数不存在，说明工程不是最新版本。 |
 | 确认 MP157 不再走文本心跳 | Windows PowerShell | `Select-String -Path C:\Users\caofengrui\Desktop\linux\20_uvc_camera\qt_camera_display\main.cpp -Pattern "BINARY_PROTOCOL_CMD_HEARTBEAT"` | Qt 侧存在二进制心跳命令。 | 如果仍搜索到 `STATUS\r\n` 发送路径，必须先清掉文本心跳。 |
 | 确认 F4 正确/错误回包 | MP157 串口工具 | 发送合法 `HEARTBEAT` 二进制帧，再发送 CRC 错帧。 | 合法帧回 `ACK 0x80`；CRC 错帧回 `NACK 0x81` 或被记录为解析错误，不执行硬件动作。 | 检查帧头、帧尾、CRC 覆盖范围、USART1 TX/RX 交叉和共地。 |
+| 确认 USART1 不再混入文本 | MP157 自动流程联调 | 保持 MP157 正常连接 `USART1` 后运行自动流程。 | MP157 只会收到二进制 `ACK/NACK/STATUS_REPORT/FAULT_REPORT`，不会再夹杂 `[ARM-LOOP]` 或 `[ARM]` 文本。 | 若 MP157 解析异常，先确认 `UART_COMMAND_USART1_TEXT_ENABLE` 是否仍为 `0U`。 |
 
 ## 读写验证
 
@@ -62,3 +63,4 @@
 | 日期 | 修改 |
 |---|---|
 | 2026-07-02 | 明确 USART1 正式链路只允许二进制回包；文本日志默认静默，正确返回 `ACK/STATUS_REPORT`，错误返回 `NACK/FAULT_REPORT`。 |
+| 2026-07-07 | `USART3` 本机回环调试结束后，把 `UART_COMMAND_USART1_TEXT_ENABLE` 恢复为 `0U`；机械臂链路调试日志改由独立 `USART2` 输出，不再占用 MP157 主链路。 |

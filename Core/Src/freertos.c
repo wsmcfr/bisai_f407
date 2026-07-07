@@ -57,7 +57,7 @@ static osThreadId_t conveyorMotorTaskHandle = NULL;
 /* 传送带电机任务需要周期性闭环调速，优先级保持在普通业务级。 */
 static const osThreadAttr_t conveyorMotorTask_attributes = {
   .name = "conveyorMotorTask",             /* 任务名称用于 RTOS 调试视图识别传送带电机服务线程。 */
-  .stack_size = 256 * 4,                   /* 任务栈大小按字节配置，用于容纳电机状态机、串口发送和局部变量开销。 */
+  .stack_size = 320 * 4,                   /* 电机任务会经过 Emm42 状态机、串口发送和日志路径，扩到 320 word 减少边界场景栈压缩。 */
   .priority = (osPriority_t) osPriorityNormal, /* 普通优先级保证电机控制能及时运行，同时不压制更高实时性采样任务。 */
 };
 
@@ -67,7 +67,7 @@ static osThreadId_t cameraMotorTaskHandle = NULL;
 /* 摄像头运动电机任务只响应点动/停止命令，优先级保持在普通业务级，避免阻塞称重和 LDC 采样。 */
 static const osThreadAttr_t cameraMotorTask_attributes = {
   .name = "cameraMotorTask",               /* 任务名称用于 RTOS 调试视图识别摄像头运动电机服务线程。 */
-  .stack_size = 256 * 4,                   /* 任务内含两个 Emm42 句柄、队列命令和串口日志，预留 256 word 栈空间。 */
+  .stack_size = 320 * 4,                   /* 摄像头电机任务同样会经过双电机控制和日志路径，扩到 320 word 给后续调试留余量。 */
   .priority = (osPriority_t) osPriorityNormal, /* 普通优先级保证点动命令能及时执行，同时不压制更高实时性采样任务。 */
 };
 
@@ -88,7 +88,7 @@ static osThreadId_t robotArmTaskHandle = NULL;
 /* 栈和优先级保持在普通业务任务级别，避免机械臂短帧转发影响称重、电感检测等更高实时性路径。 */
 static const osThreadAttr_t robotArmTask_attributes = {
   .name = "robotArmTask",                  /* 任务名称用于 RTOS 调试视图中识别机械臂 USART1->USART3 转发线程。 */
-  .stack_size = 256 * 4,                   /* 任务内含队列帧缓存和 HAL_UART_Transmit 调用链，预留 256 word 栈空间。 */
+  .stack_size = 512 * 4,                   /* 机械臂任务会叠加 ACK/DONE 帧缓存、称重结果打包和日志调用链，扩到 512 word 规避栈踩踏。 */
   .priority = (osPriority_t) osPriorityNormal, /* 普通优先级保证机械臂命令及时转发，同时不压制更高实时性采样或中断回调。 */
 };
 
@@ -97,14 +97,14 @@ static const osThreadAttr_t robotArmTask_attributes = {
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for ldc1614Task */
 osThreadId_t ldc1614TaskHandle;
 const osThreadAttr_t ldc1614Task_attributes = {
   .name = "ldc1614Task",
-  .stack_size = 256 * 4,
+  .stack_size = 320 * 4,
   .priority = (osPriority_t) osPriorityBelowNormal,
 };
 
