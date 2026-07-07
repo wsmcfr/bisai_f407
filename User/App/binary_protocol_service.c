@@ -1885,7 +1885,12 @@ static void BinaryProtocolService_HandleStopCycle(const BinaryProtocol_Frame_t *
         return;
     }
 
-    if (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U)
+    /*
+     * cycle_id=0 表示强制停止：MP157 重启后可能不知道 F4 当前 active_cycle_id，
+     * 此时用 0 发送 STOP_CYCLE 可以无条件清理 F4 的旧流程状态。
+     * cycle_id 非零时仍然校验匹配，防止误停其他有效流程。
+     */
+    if ((payload.cycle_id != 0U) && (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U))
     {
         BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
                                        frame->sequence,
