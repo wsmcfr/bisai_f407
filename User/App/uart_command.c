@@ -3,6 +3,7 @@
 #include "FreeRTOS.h"
 #include "robot_arm_service.h"
 #include "semphr.h"
+#include "task.h"
 #include "usart.h"
 
 #include <stdarg.h>
@@ -10,10 +11,10 @@
 #include <string.h>
 
 /**
- * @brief USART1 命令接收底座与业务命令分发约定。
+ * @brief MP157 主链路命令接收底座与业务命令分发约定。
  *
- * 本文件只负责“收完整一帧”和“串口安全打印”，不直接解释业务含义。
- * 用户真正能从 USART1 发送的命令由上层服务解释，维护时必须按下面索引同步更新：
+ * 本文件只负责“接收 MP157 主链路原始字节块”和“串口安全发送”，不直接解释业务含义。
+ * 用户真正能从 MP157 主链路发送的命令由上层服务解释，维护时必须按下面索引同步更新：
  * | 命令类型 | 示例 | 处理文件 | 主要效果 | 是否回包 |
  * | --- | --- | --- | --- | --- |
  * | MP157 心跳命令 | 二进制 `HEARTBEAT` | `binary_protocol_service.c` | 查询 STM32F407 主任务和 USART1 二进制协议入口是否在线 | 返回二进制 `ACK` 或 `NACK` |
@@ -25,8 +26,9 @@
  * | 机械臂正式帧 | `A5 5A 01 20 ... 6B` | `robot_arm_service.c` | 通过 USART3 发给 ESP32S3，并等待 ACK/DONE | `[ARM] ACK OK` 后继续等 `[ARM] DONE received` |
  *
  * 串口链路：
- * - USART1：115200 8N1，PA9(TX)/PA10(RX)，面向串口助手、MP157 或其它上位机；
- * - 本文件使用 `HAL_UARTEx_ReceiveToIdle_DMA()` 接收，空闲中断认为“一帧命令结束”；
+ * - USART1：115200 8N1，PA9(TX)/PA10(RX)，面向 MP157 或串口助手维护输入；
+ * - USART2：115200 8N1，PA2(TX)/PA3(RX)，当前不再作为 MP157 正式主链路；
+ * - 本文件使用 `HAL_UARTEx_ReceiveToIdle_DMA()` 接收，空闲中断只表示当前线路暂时空闲；
  * - 文本命令通过 `UartCommand_Fetch()` 取出并补 `\0`，自动检测二进制帧和机械臂二进制帧通过
  *   `UartCommand_FetchRaw()` 取出，避免帧内 `0x00` 被字符串逻辑截断。
  *
@@ -45,7 +47,15 @@
 #define UART_COMMAND_RX_DMA_BUFFER_SIZE   (64U)
 
 /**
- * @brief USART1 文本输出总开关。
+ * @brief MP157 主链路 ISR 到任务之间的原始字节环形缓存容量。
+ *
+ * MP157 可能连续写入三帧安全 STOP，DMA-IDLE 也可能把多帧合并成一个回调块。
+ * 256 字节能够缓存四个 DMA 满块，避免称重任务短时忙于 HX711 时后来的 STOP 覆盖前一块数据。
+ */
+#define UART_COMMAND_RX_RING_BUFFER_SIZE  (256U)
+
+/**
+ * @brief MP157 主链路文本输出总开关。
  *
  * 当前 USART1 是 STM32MP157 与 F407 的主控制链路。
  * 自动检测阶段只允许 ACK/NACK/STATUS_REPORT/FAULT_REPORT 等二进制帧返回，
@@ -55,10 +65,30 @@
  * 若后续需要用 Windows 串口助手临时看文本日志，可以在现场调试固件中改为 1U；
  * 正式接 MP157 时必须保持 0U。
  *
- * 本轮 `USART3` 短接回环定位已经结束，机械臂链路调试日志已迁移到独立的 `USART2(PA2/PA3)`；
- * 因此这里恢复为 `0U`，继续保证 MP157-F4 正式链路只走二进制帧，不混入文本调试输出。
+ * 由于 USART1 已恢复为 MP157 正式主链路，这里保持 `0U`，保证 MP157-F4 的
+ * USART1 正式链路不混入文本调试输出；如需现场日志，应另行迁移到非主链路串口。
  */
-#define UART_COMMAND_USART1_TEXT_ENABLE    (0U)
+#define UART_COMMAND_MP157_TEXT_ENABLE     (0U)
+
+/**
+ * @brief MP157-F4 正式主链路串口句柄。
+ *
+ * 用户已决定把 F4 的 `USART1 PA9/PA10` 接回 MP157 `/dev/ttySTM2` 的 TTL 侧，
+ * 所以接收、二进制 ACK/NACK 回包以及文本静默判断都必须以该句柄为准。
+ */
+#define UART_COMMAND_MP157_HUART           (&huart1)
+
+/**
+ * @brief 获取当前 MP157-F407 正式主链路串口句柄。
+ * @return UART_HandleTypeDef* 返回接收 MP157 命令、发送 ACK/NACK/STATUS/FAULT 的串口句柄。
+ *
+ * 该函数让协议发送端复用同一个主链路定义，避免接收路径已经切回 USART1，
+ * 但二进制回包仍误发到 USART2 的分裂问题。
+ */
+UART_HandleTypeDef *UartCommand_GetMp157Huart(void)
+{
+    return UART_COMMAND_MP157_HUART;
+}
 
 /**
  * @brief 串口发送格式化缓存区大小。
@@ -79,13 +109,14 @@
 static uint8_t g_uart_dma_rx_buffer[UART_COMMAND_RX_DMA_BUFFER_SIZE];
 
 /**
- * @brief ISR与任务之间共享的单帧命令缓存。
+ * @brief ISR 与任务之间共享的原始字节环形缓存。
  *
- * 本项目当前命令非常短，而且业务模型是“上位机发一条命令，设备回一条结果”，
- * 因此保留最近一帧即可，无需额外引入环形缓冲区。
+ * DMA 回调只追加字节，不在中断中解释协议；任务批量取出后再由流式解析器拆分粘包和半包。
  */
-static uint8_t g_uart_pending_command[UART_COMMAND_RX_DMA_BUFFER_SIZE];
-static volatile uint16_t g_uart_pending_length = 0U;
+static uint8_t g_uart_rx_ring_buffer[UART_COMMAND_RX_RING_BUFFER_SIZE];
+static volatile uint16_t g_uart_rx_ring_read_index = 0U;
+static volatile uint16_t g_uart_rx_ring_write_index = 0U;
+static volatile uint16_t g_uart_rx_ring_length = 0U;
 
 /**
  * @brief 串口同步对象。
@@ -97,25 +128,31 @@ static SemaphoreHandle_t g_uart_rx_semaphore = NULL;
 static SemaphoreHandle_t g_uart_tx_mutex = NULL;
 
 /**
- * @brief 重新启动一次USART1 DMA+空闲中断接收。
+ * @brief 重新启动一次 MP157 主链路 DMA+空闲中断接收。
  *
  * HAL在某次接收事件结束后，需要用户重新挂起下一次接收。
  * 这里统一封装，避免同一逻辑散落在多个位置。
  */
 static void UartCommand_RestartReceive(void)
 {
-    if (HAL_UARTEx_ReceiveToIdle_DMA(&huart1,
-                                     g_uart_dma_rx_buffer,
-                                     UART_COMMAND_RX_DMA_BUFFER_SIZE) == HAL_OK)
+    HAL_StatusTypeDef receive_status;
+
+    receive_status = HAL_UARTEx_ReceiveToIdle_DMA(UART_COMMAND_MP157_HUART,
+                                                  g_uart_dma_rx_buffer,
+                                                  UART_COMMAND_RX_DMA_BUFFER_SIZE);
+    if (receive_status != HAL_OK)
     {
-        /*
-         * 半传输中断会导致命令还没收完整就进入回调。
-         * 对短命令场景而言，这只会增加噪声，因此直接关闭。
-         */
-        if (huart1.hdmarx != NULL)
-        {
-            __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
-        }
+        /* 接收重启失败时直接返回，避免在串口底座层打印调试文本影响正式协议链路。 */
+        return;
+    }
+
+    /*
+     * 半传输中断会导致命令还没收完整就进入回调。
+     * 对短命令场景而言，这只会增加噪声，因此直接关闭。
+     */
+    if (UART_COMMAND_MP157_HUART->hdmarx != NULL)
+    {
+        __HAL_DMA_DISABLE_IT(UART_COMMAND_MP157_HUART->hdmarx, DMA_IT_HT);
     }
 }
 
@@ -147,35 +184,26 @@ void UartCommand_StartReceive(void)
 {
     UartCommand_InitSyncObjects();
 
-    /* 启动前先清空共享缓存，避免误读到上电前残留内容。 */
-    g_uart_pending_length = 0U;
+    /* 启动前清空环形缓存读写位置，避免误读到上电前或复位前残留数据。 */
+    g_uart_rx_ring_read_index = 0U;
+    g_uart_rx_ring_write_index = 0U;
+    g_uart_rx_ring_length = 0U;
     (void)memset(g_uart_dma_rx_buffer, 0, sizeof(g_uart_dma_rx_buffer));
-    (void)memset(g_uart_pending_command, 0, sizeof(g_uart_pending_command));
+    (void)memset(g_uart_rx_ring_buffer, 0, sizeof(g_uart_rx_ring_buffer));
 
     UartCommand_RestartReceive();
 }
 
 /**
- * @brief 从接收模块中安全取出一条完整命令。
- * @param command_buffer 调用者提供的输出缓存区。
- * @param buffer_size 输出缓存区大小，必须大于0。
- * @param timeout_ms 等待命令的超时时间，单位毫秒。传0表示立即返回。
- * @return uint8_t 1表示成功取到命令，0表示未取到命令。
- *
- * 该函数先等待接收信号量，再在临界区内复制单帧缓存。
- * 因为当前只保留“最近一帧”，所以这里的逻辑比环形缓冲区更轻量。
- */
-/**
- * @brief 从接收模块中安全取出一帧原始串口数据。
+ * @brief 从接收模块中安全取出当前已到达的一批原始串口字节。
  * @param frame_buffer 调用者提供的原始字节输出缓存，不能为 NULL。
  * @param buffer_size 输出缓存大小，必须大于0。
  * @param frame_length 实际拷贝出的字节数输出参数，不能为 NULL。
  * @param timeout_ms 等待命令的超时时间，单位毫秒。传0表示立即返回。
- * @return uint8_t 1表示成功取到一帧数据，0表示没有新数据或参数非法。
+ * @return uint8_t 1表示成功取到至少一个字节，0表示没有新数据或参数非法。
  *
- * 该函数和 UartCommand_Fetch 使用同一个 USART1 单消费者缓存。
- * 与文本接口不同的是，这里不会补字符串结束符，也不会因为帧内存在 0x00 而提前截断，
- * 因此可用于 `A5 5A ... 6B` 正式二进制帧传输。
+ * 重要边界：一次返回可能包含多帧，也可能只是半帧，DMA-IDLE 不是协议帧边界。
+ * 唯一消费者必须把这些字节交给上层流式解析器，不能直接把整块当成一帧。
  */
 uint8_t UartCommand_FetchRaw(uint8_t *frame_buffer,
                              uint16_t buffer_size,
@@ -183,6 +211,7 @@ uint8_t UartCommand_FetchRaw(uint8_t *frame_buffer,
                              uint32_t timeout_ms)
 {
     uint16_t copy_length;
+    uint16_t copy_index;
     TickType_t wait_ticks;
 
     if ((frame_buffer == NULL) ||
@@ -203,23 +232,35 @@ uint8_t UartCommand_FetchRaw(uint8_t *frame_buffer,
 
     taskENTER_CRITICAL();
 
-    copy_length = g_uart_pending_length;
+    copy_length = g_uart_rx_ring_length;
     if (copy_length > buffer_size)
     {
         /*
-         * 调用者缓存比 DMA 缓存小时，只复制调用者能容纳的部分。
-         * 当前机械臂帧和文本命令都很短，正常不会触发该分支；保留该边界处理防止越界。
+         * 调用者缓存小于当前积压字节数时，只取出能容纳的前缀，
+         * 剩余字节保留在环形缓存内，下一轮继续取出，避免截断后永久丢失。
          */
         copy_length = buffer_size;
     }
 
-    (void)memcpy(frame_buffer, g_uart_pending_command, copy_length);
+    for (copy_index = 0U; copy_index < copy_length; copy_index++)
+    {
+        frame_buffer[copy_index] = g_uart_rx_ring_buffer[g_uart_rx_ring_read_index];
+        g_uart_rx_ring_read_index = (uint16_t)((g_uart_rx_ring_read_index + 1U) %
+                                               UART_COMMAND_RX_RING_BUFFER_SIZE);
+    }
     *frame_length = copy_length;
-
-    /* 当前帧已交给唯一消费者，清零长度等待下一次 DMA 空闲中断写入新帧。 */
-    g_uart_pending_length = 0U;
+    g_uart_rx_ring_length = (uint16_t)(g_uart_rx_ring_length - copy_length);
 
     taskEXIT_CRITICAL();
+
+    if ((g_uart_rx_ring_length > 0U) && (g_uart_rx_semaphore != NULL))
+    {
+        /*
+         * 本次调用者缓存没有取完全部积压字节时，重新释放二值信号量，
+         * 确保唯一消费者下一轮无需等待新的 DMA 回调也能继续清空剩余数据。
+         */
+        (void)xSemaphoreGive(g_uart_rx_semaphore);
+    }
 
     return 1U;
 }
@@ -237,35 +278,21 @@ uint8_t UartCommand_FetchRaw(uint8_t *frame_buffer,
 uint8_t UartCommand_Fetch(char *command_buffer, uint16_t buffer_size, uint32_t timeout_ms)
 {
     uint16_t copy_length;
-    TickType_t wait_ticks;
 
-    if ((command_buffer == NULL) || (buffer_size == 0U) || (g_uart_rx_semaphore == NULL))
+    if ((command_buffer == NULL) || (buffer_size <= 1U))
     {
         return 0U;
     }
 
-    wait_ticks = (timeout_ms == 0U) ? 0U : pdMS_TO_TICKS(timeout_ms);
-    if (xSemaphoreTake(g_uart_rx_semaphore, wait_ticks) != pdTRUE)
+    if (UartCommand_FetchRaw((uint8_t *)command_buffer,
+                             (uint16_t)(buffer_size - 1U),
+                             &copy_length,
+                             timeout_ms) == 0U)
     {
         return 0U;
     }
 
-    taskENTER_CRITICAL();
-
-    copy_length = g_uart_pending_length;
-    if (copy_length >= buffer_size)
-    {
-        copy_length = (uint16_t)(buffer_size - 1U);
-    }
-
-    (void)memcpy(command_buffer, g_uart_pending_command, copy_length);
     command_buffer[copy_length] = '\0';
-
-    /* 当前帧被取走后立刻清空长度，等待下一帧覆盖写入。 */
-    g_uart_pending_length = 0U;
-
-    taskEXIT_CRITICAL();
-
     return 1U;
 }
 
@@ -289,11 +316,11 @@ int my_printf(UART_HandleTypeDef *huart, const char *format, ...)
     }
 
     /*
-     * USART1 面向 MP157 时只允许二进制协议帧返回。
-     * 这里直接丢弃 USART1 文本日志，但保留返回 0，表示调用者无需因为“调试文本未发送”
+     * MP157 主链路只允许二进制协议帧返回。
+     * 这里直接丢弃主链路文本日志，但保留返回 0，表示调用者无需因为“调试文本未发送”
      * 改变业务状态；其它串口如果复用 my_printf，仍按原逻辑输出。
      */
-    if ((huart == &huart1) && (UART_COMMAND_USART1_TEXT_ENABLE == 0U))
+    if ((huart == UART_COMMAND_MP157_HUART) && (UART_COMMAND_MP157_TEXT_ENABLE == 0U))
     {
         return 0;
     }
@@ -352,7 +379,7 @@ int my_printf(UART_HandleTypeDef *huart, const char *format, ...)
  *
  * 设计原因：
  * 1. 二进制 ACK/NACK 帧中可能包含 `0x00`，不能使用 `printf` 风格字符串发送；
- * 2. USART1 同时会输出文本调试日志，必须和 `my_printf()` 使用同一把互斥锁；
+ * 2. MP157 主链路会发送二进制回包，必须和 `my_printf()` 使用同一把互斥锁；
  * 3. 该函数只负责“原样发送字节”，不解释协议，也不追加 `\r\n`。
  */
 HAL_StatusTypeDef UartCommand_SendRaw(UART_HandleTypeDef *huart,
@@ -397,18 +424,20 @@ HAL_StatusTypeDef UartCommand_SendRaw(UART_HandleTypeDef *huart,
  * @param Size 本次已经收到的数据长度。
  *
  * 该回调运行在中断上下文中，因此只做四件事：
- * 1. 过滤非USART1事件；
+ * 1. 过滤非 MP157 主链路事件；
  * 2. 停止当前DMA会话，避免复制过程中仍被DMA改写；
- * 3. 把本次收到的一整帧复制到共享缓存；
+ * 3. 把本次收到的原始字节追加到环形缓存；
  * 4. 立即重启下一轮DMA接收，并释放信号量通知任务。
  *
- * 这里的“释放信号量”只发生在 HAL 已经判定一帧接收结束之后，
- * 因此任务侧拿到的始终是“完整一帧”，而不是半包数据。
+ * HAL 的空闲事件只表示当前线路短暂停顿，不保证恰好位于协议帧边界。
+ * 因此任务侧拿到的可能是粘包或半包，必须继续交给 MP157 流式解析器处理。
  */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     BaseType_t higher_priority_task_woken = pdFALSE;
     uint16_t copy_length;
+    uint16_t copy_index;
+    UBaseType_t critical_state;
 
     /* USART3: 机械臂ESP32链路，DMA+空闲中断接收，交由robot_arm_service处理。 */
     if (huart == &huart3)
@@ -417,9 +446,9 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         return;
     }
 
-    if ((huart != &huart1) || (Size == 0U))
+    if ((huart != UART_COMMAND_MP157_HUART) || (Size == 0U))
     {
-        if (huart == &huart1)
+        if (huart == UART_COMMAND_MP157_HUART)
         {
             /* 即便本次没有拿到有效数据，也要恢复下一轮接收，避免链路中断。 */
             UartCommand_RestartReceive();
@@ -427,18 +456,35 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         return;
     }
 
-    /* 先停DMA，再复制完整帧，避免任务侧读到DMA尚未写完的脏数据。 */
+    /* 先停DMA，再复制本次原始接收块，避免任务侧读到DMA尚未写完的脏数据。 */
     (void)HAL_UART_DMAStop(huart);
 
     copy_length = Size;
-    if (copy_length >= UART_COMMAND_RX_DMA_BUFFER_SIZE)
+    if (copy_length > UART_COMMAND_RX_DMA_BUFFER_SIZE)
     {
-        copy_length = (uint16_t)(UART_COMMAND_RX_DMA_BUFFER_SIZE - 1U);
+        copy_length = UART_COMMAND_RX_DMA_BUFFER_SIZE;
     }
 
-    (void)memcpy(g_uart_pending_command, g_uart_dma_rx_buffer, copy_length);
-    g_uart_pending_command[copy_length] = '\0';
-    g_uart_pending_length = copy_length;
+    critical_state = taskENTER_CRITICAL_FROM_ISR();
+    for (copy_index = 0U; copy_index < copy_length; copy_index++)
+    {
+        if (g_uart_rx_ring_length >= UART_COMMAND_RX_RING_BUFFER_SIZE)
+        {
+            /*
+             * 环形缓存已满时丢弃最旧字节，优先保留最新 STOP 等安全控制意图。
+             * 这里不在中断中打印或上报，避免调试文本影响 USART1 正式协议链路。
+             */
+            g_uart_rx_ring_read_index = (uint16_t)((g_uart_rx_ring_read_index + 1U) %
+                                                   UART_COMMAND_RX_RING_BUFFER_SIZE);
+            g_uart_rx_ring_length--;
+        }
+
+        g_uart_rx_ring_buffer[g_uart_rx_ring_write_index] = g_uart_dma_rx_buffer[copy_index];
+        g_uart_rx_ring_write_index = (uint16_t)((g_uart_rx_ring_write_index + 1U) %
+                                                UART_COMMAND_RX_RING_BUFFER_SIZE);
+        g_uart_rx_ring_length++;
+    }
+    taskEXIT_CRITICAL_FROM_ISR(critical_state);
 
     /* 清空DMA缓存后立即重启下一轮接收，保证后续命令仍能继续进入。 */
     (void)memset(g_uart_dma_rx_buffer, 0, sizeof(g_uart_dma_rx_buffer));
@@ -447,10 +493,44 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     if (g_uart_rx_semaphore != NULL)
     {
         /*
-         * 当前采用“最近一帧覆盖旧帧”的策略。
-         * 这对短文本交互足够简单有效，也符合本任务“用户发指令才查询”的使用方式。
+         * 二值信号量只负责唤醒唯一消费者；即使多次回调合并为一次唤醒，
+         * 所有字节仍保存在环形缓存中，不再发生“后一块覆盖前一块”。
          */
         (void)xSemaphoreGiveFromISR(g_uart_rx_semaphore, &higher_priority_task_woken);
         portYIELD_FROM_ISR(higher_priority_task_woken);
     }
+}
+
+/**
+ * @brief HAL 串口错误回调。
+ * @param huart 发生错误的串口句柄。
+ * @return 无返回值。
+ *
+ * 设计目的：
+ * - USART1 当前是 MP157 主链路，如果 PA10 悬空、接反、波特率不一致或线路有噪声，
+ *   HAL 可能在 ORE/FE/NE/PE 后中止 DMA 接收；
+ * - USART3 是 F4 与 ESP32S3 机械臂的 DMA+空闲接收链路，同样需要在错误后重新挂起接收；
+ * - 默认 weak 回调不会恢复接收，现场表现就是外部设备一直发但 F4 不再进回调；
+ * - 这里只按串口归属分发错误恢复，不在 ISR 中打印，也不在串口底座里解析业务协议。
+ */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart == &huart3)
+    {
+        RobotArmService_RecoverRxFromISR();
+        return;
+    }
+
+    if (huart != UART_COMMAND_MP157_HUART)
+    {
+        return;
+    }
+
+    __HAL_UART_CLEAR_PEFLAG(huart);
+    __HAL_UART_CLEAR_FEFLAG(huart);
+    __HAL_UART_CLEAR_NEFLAG(huart);
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    huart->ErrorCode = HAL_UART_ERROR_NONE;
+
+    UartCommand_RestartReceive();
 }

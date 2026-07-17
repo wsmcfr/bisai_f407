@@ -460,6 +460,11 @@
               <FilePath>../User/App/binary_protocol_service.c</FilePath>
             </File>
             <File>
+              <FileName>mp157_rx_parser.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/App/mp157_rx_parser.c</FilePath>
+            </File>
+            <File>
               <FileName>ldc1614_service.c</FileName>
               <FileType>1</FileType>
               <FilePath>../User/App/ldc1614_service.c</FilePath>

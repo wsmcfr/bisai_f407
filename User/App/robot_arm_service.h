@@ -12,7 +12,7 @@ extern "C" {
  *
  * F4-ESP32S3 正式协议复用 `A5 5A VER CMD LEN SEQ PAYLOAD CRC 6B` 帧格式，
  * 当前最大 payload 为 48 字节，因此完整帧最大为 58 字节。
- * 这里保留 64 字节，与 USART1 原始命令缓存对齐，方便后续扩展。
+ * 这里保留 64 字节，与 USART2 原始命令缓存对齐，方便后续扩展。
  */
 #define ROBOT_ARM_SERVICE_FRAME_MAX_SIZE (64U)
 
@@ -103,6 +103,16 @@ void RobotArmService_Task(void *argument);
  * 负责把DMA缓冲区中收到的字节压入内部环形缓冲区并唤醒等待任务。
  */
 void RobotArmService_RxEventFromISR(uint16_t size);
+
+/**
+ * @brief USART3 接收错误后的恢复入口（从 HAL 错误回调中调用）。
+ *
+ * 当 USART3 在 DMA+空闲接收过程中出现 ORE/FE/NE/PE 等错误时，
+ * HAL 会中止当前接收流程；该函数负责清除 USART3 错误标志、
+ * 丢弃可能已经不完整的接收缓存，并重新挂起下一轮 DMA+空闲中断接收。
+ * 该函数运行在中断上下文，内部只做状态复位和接收重启，不做日志输出。
+ */
+void RobotArmService_RecoverRxFromISR(void);
 
 #ifdef __cplusplus
 }

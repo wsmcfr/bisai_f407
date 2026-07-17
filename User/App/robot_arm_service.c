@@ -348,19 +348,22 @@ static const char *RobotArmService_GetSourceDescription(const char *source_label
 }
 
 /**
- * @brief 清理 USART3 上残留的旧字节和错误标志。
+ * @brief 清除 USART3 接收错误标志。
  *
- * 如果 ESP32S3 上电日志、线缆抖动或上一次坏帧残留在 RXNE 中，F4 等 ACK 时可能读到错误帧头。
- * 每次发送新命令前先清理接收侧，确保后续读取尽量对应本次命令。
+ * 主要流程：
+ * 1. 逐项检查奇偶校验、溢出、帧错误和噪声错误标志；
+ * 2. 只在对应标志置位时调用 HAL 清除宏，避免无意义读取数据寄存器；
+ * 3. 最后清空 HAL 句柄里的 ErrorCode，允许后续重新挂起 DMA 接收。
+ *
+ * 副作用：清除错误标志会读取 USART 状态/数据寄存器，错误期间残留的坏字节会被丢弃。
  */
-static void RobotArmService_FlushUsart3Rx(void)
-{
-    volatile uint32_t discarded_register;
+static void RobotArmService_StartDmaReceive(void);
 
-    while (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_RXNE) != RESET)
+static void RobotArmService_ClearUsart3ErrorFlags(void)
+{
+    if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_PE) != RESET)
     {
-        discarded_register = huart3.Instance->DR;
-        (void)discarded_register;
+        __HAL_UART_CLEAR_PEFLAG(&huart3);
     }
 
     if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_ORE) != RESET)
@@ -379,6 +382,35 @@ static void RobotArmService_FlushUsart3Rx(void)
     }
 
     huart3.ErrorCode = HAL_UART_ERROR_NONE;
+}
+
+/**
+ * @brief 清理 USART3 上残留的旧字节和错误标志。
+ *
+ * DMA 接收期间不能直接读 DR 寄存器（会和 DMA 竞争同一个数据源导致丢字节或状态异常）。
+ * 正确做法：先中止 DMA 接收 → 清空软件环形缓冲区 → 清除硬件错误标志 → 重启 DMA 接收。
+ * 这样保证发送命令后读到的 ACK/DONE 帧一定是本次命令的响应。
+ */
+static void RobotArmService_FlushUsart3Rx(void)
+{
+    /* 先停止当前 DMA 接收流程，避免后续操作和 DMA 竞争 DR 寄存器。 */
+    (void)HAL_UART_DMAStop(&huart3);
+
+    /* 清空软件环形缓冲区中可能残留的旧帧/噪声字节。 */
+    g_robot_arm_ring_write = 0U;
+    g_robot_arm_ring_read = 0U;
+
+    /* 清除 USART3 硬件侧的接收错误标志和可能残留在 DR 中的字节。 */
+    RobotArmService_ClearUsart3ErrorFlags();
+    while (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_RXNE) != RESET)
+    {
+        volatile uint32_t discard = huart3.Instance->DR;
+        (void)discard;
+    }
+
+    /* 清空 DMA 缓冲区并重新挂起 DMA+空闲中断接收。 */
+    (void)memset(g_robot_arm_dma_buf, 0, sizeof(g_robot_arm_dma_buf));
+    RobotArmService_StartDmaReceive();
 }
 
 /**
@@ -402,32 +434,82 @@ static void RobotArmService_StartDmaReceive(void)
 }
 
 /**
+ * @brief 从 HAL 错误回调中恢复 USART3 DMA+空闲中断接收。
+ *
+ * 主要流程：
+ * 1. 清除 USART3 的 PE/ORE/FE/NE 等错误标志；
+ * 2. 清空软件环形缓冲区读写位置，丢弃错误前后可能拼接出的半帧；
+ * 3. 清空 DMA 临时缓冲并重新挂起 `HAL_UARTEx_ReceiveToIdle_DMA()`。
+ *
+ * @return 无返回值。
+ * 副作用：该函数运行在中断上下文，会丢弃 USART3 当前缓存中的未解析字节；
+ * 这是为了避免错误恢复后把坏帧残留误解析成 ESP32S3 的 ACK/DONE。
+ */
+void RobotArmService_RecoverRxFromISR(void)
+{
+    UBaseType_t critical_state;
+
+    /*
+     * USART3 接收错误后，HAL 可能已经终止 DMA 接收流程。
+     * 先清错误标志，再丢弃软件环形缓冲中的半帧/坏帧，避免任务侧把错误前后的字节拼成假帧。
+     */
+    RobotArmService_ClearUsart3ErrorFlags();
+
+    critical_state = taskENTER_CRITICAL_FROM_ISR();
+    g_robot_arm_ring_write = 0U;
+    g_robot_arm_ring_read = 0U;
+    taskEXIT_CRITICAL_FROM_ISR(critical_state);
+
+    (void)memset(g_robot_arm_dma_buf, 0, sizeof(g_robot_arm_dma_buf));
+    RobotArmService_StartDmaReceive();
+}
+
+/**
  * @brief USART3 DMA接收事件回调（从ISR中调用）。
  * @param size 本次接收到的字节数。
  *
- * 把DMA缓冲区的数据搬到环形缓冲区，然后重启DMA，最后唤醒等待任务。
+ * 主要流程：
+ * 1. 先把 HAL 给出的长度限制在 DMA 缓冲区容量内，避免异常长度造成越界；
+ * 2. 在中断临界区内把 DMA 缓冲区搬到软件环形缓冲区；
+ * 3. 立即重启下一轮 DMA+空闲中断接收；
+ * 4. 只有本次确实收到字节时才唤醒等待任务，避免空事件造成误唤醒。
  */
 void RobotArmService_RxEventFromISR(uint16_t size)
 {
     BaseType_t higher_priority_woken = pdFALSE;
+    UBaseType_t critical_state;
+    uint16_t copy_length;
     uint16_t i;
     uint16_t next_write;
 
-    for (i = 0U; i < size; ++i)
+    copy_length = size;
+    if (copy_length > ROBOT_ARM_DMA_RX_BUF_SIZE)
     {
-        next_write = (uint16_t)((g_robot_arm_ring_write + 1U) % ROBOT_ARM_RING_BUF_SIZE);
-        if (next_write == g_robot_arm_ring_read)
+        copy_length = ROBOT_ARM_DMA_RX_BUF_SIZE;
+    }
+
+    if (copy_length > 0U)
+    {
+        critical_state = taskENTER_CRITICAL_FROM_ISR();
+        for (i = 0U; i < copy_length; ++i)
         {
-            break; /* 环形缓冲区满，丢弃剩余字节。 */
+            next_write = (uint16_t)((g_robot_arm_ring_write + 1U) % ROBOT_ARM_RING_BUF_SIZE);
+            if (next_write == g_robot_arm_ring_read)
+            {
+                break; /* 环形缓冲区满时丢弃本次剩余字节，避免覆盖任务尚未读取的旧帧。 */
+            }
+            g_robot_arm_ring_buf[g_robot_arm_ring_write] = g_robot_arm_dma_buf[i];
+            g_robot_arm_ring_write = next_write;
         }
-        g_robot_arm_ring_buf[g_robot_arm_ring_write] = g_robot_arm_dma_buf[i];
-        g_robot_arm_ring_write = next_write;
+        taskEXIT_CRITICAL_FROM_ISR(critical_state);
+
+        (void)memset(g_robot_arm_dma_buf, 0, sizeof(g_robot_arm_dma_buf));
     }
 
     /* 重启下一轮DMA接收。 */
     RobotArmService_StartDmaReceive();
 
-    if (g_robot_arm_rx_semaphore != NULL)
+    if ((copy_length > 0U) && (g_robot_arm_rx_semaphore != NULL))
     {
         (void)xSemaphoreGiveFromISR(g_robot_arm_rx_semaphore, &higher_priority_woken);
         portYIELD_FROM_ISR(higher_priority_woken);
@@ -525,7 +607,7 @@ static uint8_t RobotArmService_ReadFormalFrame(uint8_t *frame_buffer,
         if (skipped_count >= ROBOT_ARM_SERVICE_SYNC_SKIP_LIMIT)
         {
             BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-            my_printf(&huart1,
+            my_printf(&huart2,
                       "[ARM] Too many bytes before formal frame: skipped=%u, last=0x%02X.\r\n",
                       (unsigned int)skipped_count,
                       (unsigned int)frame_buffer[0]);
@@ -535,7 +617,7 @@ static uint8_t RobotArmService_ReadFormalFrame(uint8_t *frame_buffer,
 
     if (skipped_count > 0U)
     {
-        my_printf(&huart1,
+        my_printf(&huart2,
                   "[ARM] Skipped %u byte(s) before ESP32 formal frame.\r\n",
                   (unsigned int)skipped_count);
     }
@@ -545,7 +627,7 @@ static uint8_t RobotArmService_ReadFormalFrame(uint8_t *frame_buffer,
         if (RobotArmService_ReadByte(&frame_buffer[index], ROBOT_ARM_SERVICE_RX_NEXT_TIMEOUT_MS) == 0U)
         {
             BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-            my_printf(&huart1,
+            my_printf(&huart2,
                       "[ARM] ESP32 frame header timeout at byte %u.\r\n",
                       (unsigned int)index);
             return 0U;
@@ -555,7 +637,7 @@ static uint8_t RobotArmService_ReadFormalFrame(uint8_t *frame_buffer,
     if (frame_buffer[1] != BINARY_PROTOCOL_SOF1)
     {
         BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-        my_printf(&huart1,
+        my_printf(&huart2,
                   "[ARM] Bad ESP32 frame header: %02X %02X.\r\n",
                   (unsigned int)frame_buffer[0],
                   (unsigned int)frame_buffer[1]);
@@ -565,7 +647,7 @@ static uint8_t RobotArmService_ReadFormalFrame(uint8_t *frame_buffer,
     if (frame_buffer[4] > BINARY_PROTOCOL_MAX_PAYLOAD_LENGTH)
     {
         BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-        my_printf(&huart1,
+        my_printf(&huart2,
                   "[ARM] ESP32 payload too long: len=%u.\r\n",
                   (unsigned int)frame_buffer[4]);
         return 0U;
@@ -575,7 +657,7 @@ static uint8_t RobotArmService_ReadFormalFrame(uint8_t *frame_buffer,
     if (expected_length > frame_buffer_size)
     {
         BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-        my_printf(&huart1,
+        my_printf(&huart2,
                   "[ARM] ESP32 frame exceeds local buffer: frame=%u, buffer=%u.\r\n",
                   (unsigned int)expected_length,
                   (unsigned int)frame_buffer_size);
@@ -587,7 +669,7 @@ static uint8_t RobotArmService_ReadFormalFrame(uint8_t *frame_buffer,
         if (RobotArmService_ReadByte(&frame_buffer[index], ROBOT_ARM_SERVICE_RX_NEXT_TIMEOUT_MS) == 0U)
         {
             BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-            my_printf(&huart1,
+            my_printf(&huart2,
                       "[ARM] ESP32 frame body timeout at byte %u/%u.\r\n",
                       (unsigned int)index,
                       (unsigned int)expected_length);
@@ -599,7 +681,7 @@ static uint8_t RobotArmService_ReadFormalFrame(uint8_t *frame_buffer,
     if (parse_status != BINARY_PROTOCOL_PARSE_OK)
     {
         BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-        my_printf(&huart1,
+        my_printf(&huart2,
                   "[ARM] ESP32 frame parse failed: status=%u, len=%u, cmd=0x%02X.\r\n",
                   (unsigned int)parse_status,
                   (unsigned int)expected_length,
@@ -650,7 +732,7 @@ static uint8_t RobotArmService_HandleAckFrame(const RobotArmService_TxContext_t 
                                           BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
                                           (int32_t)status,
                                           context->sequence);
-        my_printf(&huart1,
+        my_printf(&huart2,
                   "[ARM] ACK mismatch: rx_cycle=%u, exp_cycle=%u, ack_seq=%u, exp_seq=%u, ack_cmd=0x%02X, exp_cmd=0x%02X, status=%u.\r\n",
                   (unsigned int)cycle_id,
                   (unsigned int)context->cycle_id,
@@ -663,7 +745,7 @@ static uint8_t RobotArmService_HandleAckFrame(const RobotArmService_TxContext_t 
     }
 
     BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-    my_printf(&huart1,
+    my_printf(&huart2,
               "[ARM] ACK OK: %s, cycle=%u, seq=%u, status=%u, arm_state=%u.\r\n",
               RobotArmService_GetCommandDescription(context->command),
               (unsigned int)cycle_id,
@@ -706,7 +788,7 @@ static void RobotArmService_HandleNackFrame(const RobotArmService_TxContext_t *c
                                       BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
                                       (int32_t)detail,
                                       (context != NULL) ? context->sequence : 0U);
-    my_printf(&huart1,
+    my_printf(&huart2,
               "[ARM] NACK from ESP32: cycle=%u, rejected_seq=%u, rejected_cmd=0x%02X, error=%u, state=%u, detail=%u.\r\n",
               (unsigned int)cycle_id,
               (unsigned int)rejected_sequence,
@@ -735,7 +817,7 @@ static void RobotArmService_HandleStageReportFrame(const BinaryProtocol_Frame_t 
         progress = frame->payload[3];
     }
 
-    my_printf(&huart1,
+    my_printf(&huart2,
               "[ARM] Stage report: cycle=%u, stage=%u, progress=%u, len=%u.\r\n",
               (unsigned int)cycle_id,
               (unsigned int)stage_id,
@@ -782,7 +864,7 @@ static uint8_t RobotArmService_HandleStageDoneFrame(const RobotArmService_TxCont
                                           BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
                                           (int32_t)stage_id,
                                           context->sequence);
-        my_printf(&huart1,
+        my_printf(&huart2,
                   "[ARM] DONE mismatch: rx_cycle=%u, exp_cycle=%u, rx_stage=%u, exp_stage=%u, result=%u.\r\n",
                   (unsigned int)cycle_id,
                   (unsigned int)context->cycle_id,
@@ -801,7 +883,7 @@ static uint8_t RobotArmService_HandleStageDoneFrame(const RobotArmService_TxCont
         BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
     }
 
-    my_printf(&huart1,
+    my_printf(&huart2,
               "[ARM] DONE received: cycle=%u, job=%u, stage=%u, result=%u, detail=%u, elapsed=%u, faults=0x%04X.\r\n",
               (unsigned int)cycle_id,
               (unsigned int)context->job_id,
@@ -842,7 +924,7 @@ static void RobotArmService_HandleFaultFrame(const BinaryProtocol_Frame_t *frame
                                       BINARY_PROTOCOL_FAULT_SEVERITY_STOP,
                                       (int32_t)fault_bits,
                                       0U);
-    my_printf(&huart1,
+    my_printf(&huart2,
               "[ARM] Fault report from ESP32: fault_code=%u, fault_bits=0x%04X, len=%u.\r\n",
               (unsigned int)fault_code,
               (unsigned int)fault_bits,
@@ -875,7 +957,7 @@ static uint8_t RobotArmService_WaitAck(const RobotArmService_TxContext_t *contex
                                           BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
                                           0,
                                           context->sequence);
-        my_printf(&huart1,
+        my_printf(&huart2,
                   "[ARM] ACK timeout: cmd=%s, cycle=%u, seq=%u. Check ESP32 formal protocol, TX/RX, GND and 115200 8N1.\r\n",
                   RobotArmService_GetCommandDescription(context->command),
                   (unsigned int)context->cycle_id,
@@ -901,7 +983,7 @@ static uint8_t RobotArmService_WaitAck(const RobotArmService_TxContext_t *contex
     }
 
     BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-    my_printf(&huart1,
+    my_printf(&huart2,
               "[ARM] Unexpected frame while waiting ACK: cmd=0x%02X(%s), seq=%u.\r\n",
               (unsigned int)parsed_frame.command,
               RobotArmService_GetCommandDescription(parsed_frame.command),
@@ -980,7 +1062,7 @@ static uint8_t RobotArmService_WaitStageDone(const RobotArmService_TxContext_t *
             return 0U;
         }
 
-        my_printf(&huart1,
+        my_printf(&huart2,
                   "[ARM] Ignore frame while waiting DONE: cmd=0x%02X(%s), seq=%u.\r\n",
                   (unsigned int)parsed_frame.command,
                   RobotArmService_GetCommandDescription(parsed_frame.command),
@@ -993,7 +1075,7 @@ static uint8_t RobotArmService_WaitStageDone(const RobotArmService_TxContext_t *
                                       BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
                                       (int32_t)context->timeout_ms,
                                       context->sequence);
-    my_printf(&huart1,
+    my_printf(&huart2,
               "[ARM] DONE timeout: cmd=%s, cycle=%u, job=%u, stage=%u, wait_ms=%u.\r\n",
               RobotArmService_GetCommandDescription(context->command),
               (unsigned int)context->cycle_id,
@@ -1031,7 +1113,7 @@ static void RobotArmService_TransmitContext(const RobotArmService_TxContext_t *c
                                           BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
                                           (int32_t)tx_status,
                                           context->sequence);
-        my_printf(&huart1,
+        my_printf(&huart2,
                   "[ARM] Send failed: cmd=%s, HAL=%d, len=%u, seq=%u.\r\n",
                   RobotArmService_GetCommandDescription(context->command),
                   (int)tx_status,
@@ -1040,7 +1122,7 @@ static void RobotArmService_TransmitContext(const RobotArmService_TxContext_t *c
         return;
     }
 
-    my_printf(&huart1,
+    my_printf(&huart2,
               "[ARM] Sent formal frame: cmd=%s, source=%s, cycle=%u, job=%u, stage=%u, seq=%u, len=%u.\r\n",
               RobotArmService_GetCommandDescription(context->command),
               RobotArmService_GetSourceDescription(context->source_label),
@@ -1159,7 +1241,7 @@ static uint8_t RobotArmService_EnqueueStageCommand(uint8_t command,
                                           BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
                                           (int32_t)job_id,
                                           queued_frame.sequence);
-        my_printf(&huart1,
+        my_printf(&huart2,
                   "[ARM] Queue busy: cmd=%s, cycle=%u, job=%u, stage=%u.\r\n",
                   RobotArmService_GetCommandDescription(command),
                   (unsigned int)cycle_id,
@@ -1169,7 +1251,7 @@ static uint8_t RobotArmService_EnqueueStageCommand(uint8_t command,
     }
 
     BinaryProtocolService_ClearFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-    my_printf(&huart1,
+    my_printf(&huart2,
               "[ARM] Queued formal action: cmd=%s, cycle=%u, job=%u, part=%u, model=%u, bin=%u, seq=%u.\r\n",
               RobotArmService_GetCommandDescription(command),
               (unsigned int)cycle_id,
@@ -1298,10 +1380,16 @@ uint8_t RobotArmService_RequestFinalSort(uint16_t cycle_id,
                                                final_bin);
 }
 
+/**
+ * @brief 启用 USART3 回环调试模式。
+ *
+ * 置1后任务只做"收到什么就原样发回去"，用串口助手验证 PD8/PD9 收发是否正常。
+ * 正式运行时必须改回 0。
+ */
+#define ROBOT_ARM_SERVICE_LOOPBACK_DEBUG  (0U)
+
 void RobotArmService_Task(void *argument)
 {
-    RobotArmService_TxContext_t frame;
-
     (void)argument;
 
     if (RobotArmService_Init() == 0U)
@@ -1318,21 +1406,33 @@ void RobotArmService_Task(void *argument)
         }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(ROBOT_ARM_SERVICE_STARTUP_DELAY_MS));
-    RobotArmService_SendStartupControl(ROBOT_ARM_CMD_HELLO, "startup-hello");
-    vTaskDelay(pdMS_TO_TICKS(20U));
-    RobotArmService_SendStartupControl(ROBOT_ARM_CMD_HEARTBEAT, "startup-heartbeat");
-
+#if ROBOT_ARM_SERVICE_LOOPBACK_DEBUG
+    /* 回环调试模式：USART3 收到的每个字节原样通过 USART3 发回，用于验证硬件链路。 */
     for (;;)
     {
-        if (xQueueReceive(g_robot_arm_frame_queue, &frame, portMAX_DELAY) == pdTRUE)
+        uint8_t byte_val;
+
+        if (RobotArmService_ReadByte(&byte_val, 100U) == 1U)
         {
-            /*
-             * USART3 已在 CubeMX 中配置为 115200 8N1。
-             * 队列中的每一项都已经是完整正式二进制帧，发送后必须先等 ACK，
-             * 对动作命令还必须继续等 STAGE_DONE，避免 ACK 被误当作动作完成。
-             */
-            RobotArmService_TransmitContext(&frame);
+            HAL_UART_Transmit(&huart3, &byte_val, 1U, 50U);
         }
     }
+#else
+    {
+        RobotArmService_TxContext_t frame;
+
+        vTaskDelay(pdMS_TO_TICKS(ROBOT_ARM_SERVICE_STARTUP_DELAY_MS));
+        RobotArmService_SendStartupControl(ROBOT_ARM_CMD_HELLO, "startup-hello");
+        vTaskDelay(pdMS_TO_TICKS(20U));
+        RobotArmService_SendStartupControl(ROBOT_ARM_CMD_HEARTBEAT, "startup-heartbeat");
+
+        for (;;)
+        {
+            if (xQueueReceive(g_robot_arm_frame_queue, &frame, portMAX_DELAY) == pdTRUE)
+            {
+                RobotArmService_TransmitContext(&frame);
+            }
+        }
+    }
+#endif
 }

@@ -33,10 +33,10 @@
 | `User/App/conveyor_motor_service.c` | 将传送带电机绑定到 `huart4`，默认地址 `0x01`；新增运行时配置队列命令。 | 传送带不再占用 `USART6`，并能接收 MP157 下发的地址、最小步长、常规速度和方向映射。 |
 | `User/App/conveyor_motor_service.h` | 更新传送带任务说明和 `ConveyorMotorService_RequestRuntimeConfig()` 声明。 | 二进制协议层可以安全投递参数，不直接抢 UART4。 |
 | `User/App/camera_motor_service.c` | 摄像头运动电机服务绑定 `huart6`，默认维护现场左右轴地址 `0x03` 和上下轴地址 `0x02`；新增运行时配置 FIFO 队列命令，STOP 队首优先。 | 可以通过 `CAMLAT/CAMZ` 文本命令调试摄像头左右轴和上下轴，也可以由 MP157 下发运行时参数。 |
-| `User/App/camera_motor_service.h` | 新增摄像头运行时参数接口声明。 | 供 FreeRTOS 创建任务、USART1 命令入口和二进制协议层调用。 |
+| `User/App/camera_motor_service.h` | 新增摄像头运行时参数接口声明。 | 供 FreeRTOS 创建任务、USART2 命令入口和二进制协议层调用；文本日志从 USART1 输出。 |
 | `User/App/binary_protocol_service.c/.h` | 新增 `STEPPER_PARAM_SET 0x42`；新增 `BINARY_PROTOCOL_ACTUATOR_MOVE_STATUS_ESTIMATED_DONE=5`。 | MP157 参数页可把三台电机配置下发给 F4；位置运动完成事件可在 `detail_i32` 低 16 位标记 `estimated-done`。 |
-| `User/App/weight_service.c` | 在 USART1 统一命令分发入口中加入 `CameraMotorService_HandleCommand()`。 | `CAMINFO/CAMSTOP/CAMLAT/CAMZ（CAMFWD 兼容）` 能从 USART1 串口助手或 MP157 下发。 |
-| `User/App/uart_command.c` | 更新 USART1 命令总表，补充摄像头电机命令。 | 打开串口底座文件即可查到 `CAM...` 命令用途。 |
+| `User/App/weight_service.c` | 在 USART2 统一命令分发入口中加入 `CameraMotorService_HandleCommand()`。 | `CAMINFO/CAMSTOP/CAMLAT/CAMZ（CAMFWD 兼容）` 能从 USART2 串口助手或 MP157 下发，响应从 USART1 调试口观察。 |
+| `User/App/uart_command.c` | 更新 USART2 命令总表，补充摄像头电机命令。 | 打开串口底座文件即可查到 `CAM...` 命令用途。 |
 | `Core/Src/freertos.c` | 创建 `cameraMotorTask`，启动摄像头电机服务任务。 | 新服务真正进入 FreeRTOS 调度。 |
 | `MDK-ARM/bisai_f407_project.uvprojx` | 把 `camera_motor_service.c` 加入 Keil 工程。 | Keil 编译时会编译新增服务文件。 |
 | `User/App/emm42_motor_uart_binding.md` | 新增本说明文档。 | 后续调试时可以直接查串口、ID、命令和验证步骤。 |
@@ -45,7 +45,7 @@
 
 ## 4. 串口命令
 
-所有命令都从 `USART1 PA9/PA10 115200 8N1` 进入 F4，最终由 `weight_service.c` 统一分发。
+所有维护文本命令都从 `USART2 PA2/PA3 115200 8N1` 进入 F4，最终由 `weight_service.c` 统一分发；文本响应和运行日志从 `USART1 PA9` 调试口输出。
 
 ### 4.1 传送带命令
 
@@ -103,7 +103,7 @@
 |---:|---|---|---|
 | 1 | Windows | 打开 `E:\hal\bisai_f407_project\MDK-ARM\bisai_f407_project.uvprojx`。 | Keil 能看到 `User/App/camera_motor_service.c`。 |
 | 2 | Keil | 编译工程。 | 无 `camera_motor_service` 未定义、未加入工程或头文件找不到错误。 |
-| 3 | Keil/ST-Link | 下载到 F407。 | F4 上电后 USART1 日志能看到传送带和摄像头电机服务启动信息。 |
+| 3 | Keil/ST-Link | 下载到 F407。 | F4 上电后 USART1 调试口能看到传送带和摄像头电机服务启动信息。 |
 
 说明：本次未在 Codex 里主动运行 Keil 编译，等待用户在 Keil 中编译并贴出结果。
 
@@ -111,22 +111,22 @@
 
 | 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
 |---|---|---|---|---|
-| 确认传送带串口 | USART1 串口助手 | `BELTINFO` | 输出 `[INFO][BELT] ...`，启动日志应显示 `UART4=PC10/PC11, addr=1`。 | 检查 `conveyor_motor_service.c` 是否仍绑定 `huart6`，检查 PC10/PC11 接线和共地。 |
-| 启动传送带扫描 | USART1 串口助手 | `BELTSCAN` | 传送带电机动作，摄像头两个电机不动。 | 如果摄像头电机动，说明接线或地址混乱；如果都不动，查 UART4 接线和 Emm42 地址。 |
-| 停止传送带 | USART1 串口助手 | `BELTSTOP` | 传送带停止。 | 查 Emm42 停止命令是否发到 UART4。 |
-| 查询摄像头电机 | USART1 串口助手 | `CAMINFO` | 输出 `lateral_addr=3`、`z_addr=2`、`min_step`、`speed`、`dir` 和 `USART6=PC6/PC7`。 | 如果提示未知命令，检查 `weight_service.c` 是否已接入 `CameraMotorService_HandleCommand()`；如果仍是 `lateral_addr=2,z_addr=3`，说明 F4 还没有重新编译下载新固件或 MP157 参数没有重新下发。 |
+| 确认传送带串口 | USART2 命令输入 + USART1 日志 | 向 USART2 发送 `BELTINFO` | USART1 输出 `[INFO][BELT] ...`，启动日志应显示 `UART4=PC10/PC11, addr=1`。 | 检查 `conveyor_motor_service.c` 是否仍绑定 `huart6`，检查 USART2 输入、USART1 日志线、PC10/PC11 接线和共地。 |
+| 启动传送带扫描 | USART2 命令输入 | `BELTSCAN` | 传送带电机动作，摄像头两个电机不动；日志从 USART1 输出。 | 如果摄像头电机动，说明接线或地址混乱；如果都不动，查 UART4 接线和 Emm42 地址。 |
+| 停止传送带 | USART2 命令输入 | `BELTSTOP` | 传送带停止，日志从 USART1 输出。 | 查 Emm42 停止命令是否发到 UART4。 |
+| 查询摄像头电机 | USART2 命令输入 + USART1 日志 | 向 USART2 发送 `CAMINFO` | USART1 输出 `lateral_addr=3`、`z_addr=2`、`min_step`、`speed`、`dir` 和 `USART6=PC6/PC7`。 | 如果提示未知命令，检查 `weight_service.c` 是否已接入 `CameraMotorService_HandleCommand()`；如果仍是 `lateral_addr=2,z_addr=3`，说明 F4 还没有重新编译下载新固件或 MP157 参数没有重新下发。 |
 | 下发步进参数 | MP157 Qt 参数页 | `参数设置 -> 步进参数 -> 保存并下发` | F4 回 `ACK acked_cmd=0x42 status=0`；再发 `CAMINFO` 能看到摄像头两个轴的速度/方向/地址变为下发值。 | 如果只保存 JSON 没有 ACK，说明没有真正下发；如果 F4 端没变化，确认 F4 已重新编译下载。 |
-| 测试摄像头右移 | USART1 串口助手 | `CAMLAT RIGHT 30` | 只有摄像头左右轴动作。 | 如果上下轴动作，两个电机 ID 可能接反；如果两个都动，两个电机可能都是同一 ID。 |
-| 测试摄像头左移 | USART1 串口助手 | `CAMLAT LEFT 30` | 只有摄像头左右轴反向动作。 | 如果方向反了，记录现场方向并调整方向映射。 |
-| 测试摄像头上升轴 | USART1 串口助手 | `CAMZ UP 30` | 只有摄像头上下轴动作。 | 如果左右轴动作，检查现场地址是否设置为左右 `0x03`、上下 `0x02`。 |
-| 测试摄像头下降轴 | USART1 串口助手 | `CAMZ DOWN 30` | 只有摄像头上下轴反向动作。 | 检查机械限位、方向映射和 USART6 接线。 |
-| 停止摄像头两个轴 | USART1 串口助手 | `CAMSTOP` | 两个摄像头运动轴停止。 | 查 USART6 是否被其它任务占用，查两个 Emm42 地址是否正确。 |
+| 测试摄像头右移 | USART2 命令输入 | `CAMLAT RIGHT 30` | 只有摄像头左右轴动作，日志从 USART1 输出。 | 如果上下轴动作，两个电机 ID 可能接反；如果两个都动，两个电机可能都是同一 ID。 |
+| 测试摄像头左移 | USART2 命令输入 | `CAMLAT LEFT 30` | 只有摄像头左右轴反向动作，日志从 USART1 输出。 | 如果方向反了，记录现场方向并调整方向映射。 |
+| 测试摄像头上升轴 | USART2 命令输入 | `CAMZ UP 30` | 只有摄像头上下轴动作，日志从 USART1 输出。 | 如果左右轴动作，检查现场地址是否设置为左右 `0x03`、上下 `0x02`。 |
+| 测试摄像头下降轴 | USART2 命令输入 | `CAMZ DOWN 30` | 只有摄像头上下轴反向动作，日志从 USART1 输出。 | 检查机械限位、方向映射和 USART6 接线。 |
+| 停止摄像头两个轴 | USART2 命令输入 | `CAMSTOP` | 两个摄像头运动轴停止，日志从 USART1 输出。 | 查 USART6 是否被其它任务占用，查两个 Emm42 地址是否正确。 |
 
 ## 8. 读写验证
 
 | 数据通路 | 写操作 | 读/确认操作 | 判定 |
 |---|---|---|---|
-| USART1 命令入口 | 串口助手发送 `CAMINFO`。 | 查看 USART1 返回文本。 | 有返回表示命令入口和分发链路工作。 |
+| USART2 命令入口 | 串口助手向 USART2 发送 `CAMINFO`。 | 查看 USART1 返回文本。 | 有返回表示命令入口、分发链路和调试输出链路工作。 |
 | UART4 到传送带 | 串口助手发送 `BELTSCAN`。 | 观察传送带动作，再发 `BELTSTOP`。 | 只有传送带动作表示 UART4 绑定正确。 |
 | USART6 到摄像头左右轴 | 串口助手发送 `CAMLAT RIGHT 30`。 | 观察摄像头左右轴动作，再发 `CAMSTOP`。 | 只有地址 `0x03` 电机动作表示 ID 正确。 |
 | USART6 到摄像头上下轴 | 串口助手发送 `CAMZ UP 30`。 | 观察摄像头上下轴动作，再发 `CAMSTOP`。 | 只有地址 `0x02` 电机动作表示 ID 正确。 |
@@ -144,3 +144,4 @@
 | 2026-07-03 | 新增 MP157 `STEPPER_PARAM_SET` 运行时参数下发说明；三台电机速度范围按 Emm42 协议统一为 `0~5000 rpm`。 |
 | 2026-07-04 | 现场电机地址改为摄像头左右轴 `0x03`、摄像头上下轴 `0x02`；参数保存 ACK 后还要通过 `CAMINFO` 或 `Runtime config applied` 确认 F4 运行内存已应用。 |
 | 2026-07-05 | 复核张大头官方位置模式代码后，把位置完成机制调整为主动回包优先、估算完成兜底：`status=0` 表示收到 `[addr FD 9F 6B]`，`status=5 estimated-done` 表示按步数/速度估算完成，避免 MP157 在 Z 轴下降后等待不到主动回包而停住。 |
+| 2026-07-16 | MP157-F4 主链路迁移到 USART2(PA2/PA3)，Emm42 维护文本命令从 USART2 输入，响应和运行日志从 USART1(PA9) 输出。 |

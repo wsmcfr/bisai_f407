@@ -6,6 +6,7 @@
 #include "conveyor_motor_service.h"
 #include "hx711.h"
 #include "ldc1614_service.h"
+#include "mp157_rx_parser.h"
 #include "uart_command.h"
 #include "usart.h"
 
@@ -13,13 +14,23 @@
 #include <string.h>
 
 /**
- * @brief USART1 用户命令总入口速查。
+ * @brief MP157 主链路流式解析上下文。
+ *
+ * 该上下文需要跨多次任务循环保存半帧，并包含 192 字节累积缓存。
+ * 使用静态存储而不是 WeightService_Task 局部变量，避免占用默认任务约 1KB 的运行栈，
+ * 同时 MP157 主链路只有本任务一个消费者，因此不需要额外互斥保护。
+ */
+static Mp157RxParser_Context_t g_weight_mp157_rx_parser;
+
+/**
+ * @brief MP157 主链路用户命令总入口速查。
  *
  * 通信入口：
- * - USART1：115200 8N1，PA9(TX)/PA10(RX)，由串口助手、MP157 或其它上位机发送命令；
- * - 本文件的 `WeightService_ProcessCommand()` 是当前 USART1 命令的唯一任务级消费者；
+ * - USART1：115200 8N1，PA9(TX)/PA10(RX)，由 MP157 或串口助手维护输入命令；
+ * - USART2：115200 8N1，PA2(TX)/PA3(RX)，当前不再作为 MP157 正式主链路；
+ * - 本文件的 `WeightService_ProcessCommand()` 是当前 MP157 主链路命令的唯一任务级消费者；
  * - 自动检测二进制帧会先走 `BinaryProtocolService_HandleFrame()`，识别成功后不会继续按文本命令解析；
- * - 机械臂动作不再从 USART1 透传，必须由 MP157-F4 主协议触发后再由 F4 通过 USART3 下发给 ESP32S3；
+ * - 机械臂动作不再从 MP157 主链路透传，必须由 MP157-F4 主协议触发后再由 F4 通过 USART3 下发给 ESP32S3；
  * - 文本命令会去掉首尾空白并转成大写，因此 `get`、`GET\r\n`、`Get` 都等价于 `GET`。
  *
  * MP157 主链路当前只允许发送自动检测二进制帧：
@@ -29,7 +40,8 @@
  * | `START/PAUSE/RESUME/STOP/VISION/BELT` | 控制传送带和自动检测状态机 | `ACK` 或 `STATUS_REPORT` | `NACK` 或 `FAULT_REPORT` |
  *
  * 旧的 `GET/STATUS/TARE/CAL/LDCCAL/BELTSCAN/CAM...` 文本命令只作为断开 MP157 后的串口助手维护入口。
- * USART1 文本输出默认静默，因此 MP157 不再依赖 `[OK]`、`[ERROR]` 或 `[INFO]` 文本判断成功失败。
+ * USART1 文本输出默认静默；文本维护响应和运行日志不能混入 MP157 正式主链路，
+ * 因此 MP157 不再依赖 `[OK]`、`[ERROR]` 或 `[INFO]` 文本判断成功失败。
  *
  * 机械臂链路：
  * - MP157 先发送 `ARM_JOB_START/FINAL_SORT_RESULT` 给 F4；
@@ -104,7 +116,7 @@ typedef struct
 /**
  * @brief 二进制标定入口使用的称重运行上下文。
  *
- * USART1 二进制协议由 WeightService_Task 消费，所以协议处理函数和 HX711 状态天然处于同一个任务调用链。
+ * MP157 主链路二进制协议由 WeightService_Task 消费，所以协议处理函数和 HX711 状态天然处于同一个任务调用链。
  * 这里保存指针和最近一次采样快照，让 binary_protocol_service.c 能通过公开函数请求标定，
  * 但仍不直接访问 weight_service.c 内部的静态局部变量。
  */
@@ -360,7 +372,7 @@ static HX711_Status_t WeightService_ExecuteTare(HX711_Handle_t *hx711,
  * @param latest_raw_value 最近一次滤波后的原始计数。
  * @param tare_ready 去皮状态指针，不能为空。
  *
- * 每次从 USART1 取到命令后、进入二进制协议分发前调用本函数，
+ * 每次从 MP157 主链路取到命令后、进入二进制协议分发前调用本函数，
  * 让协议层回调 WeightService_RequestCalibration() 时能拿到同一轮任务中的最新状态。
  */
 static void WeightService_UpdateBinaryContext(HX711_Handle_t *hx711,
@@ -653,16 +665,26 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
                                          HX711_Status_t latest_status,
                                          int32_t latest_raw_value,
                                          uint8_t *tare_ready,
-                                         WeightService_Filter_t *filter)
+                                         WeightService_Filter_t *filter,
+                                         Mp157RxParser_Context_t *mp157_rx_parser)
 {
     uint8_t raw_frame[64];
     uint16_t raw_frame_length;
+    uint8_t parsed_raw_frame[BINARY_PROTOCOL_MAX_FRAME_LENGTH];
+    uint16_t parsed_raw_frame_length;
+    BinaryProtocol_Frame_t parsed_frame;
+    Mp157RxParser_Result_t parser_result;
     char command_buffer[64];
     uint16_t text_length;
+    uint16_t binary_candidate_index;
+    uint8_t binary_candidate_found = 0U;
     uint32_t known_weight_g;
     HX711_Status_t status;
 
-    if ((hx711 == NULL) || (tare_ready == NULL) || (filter == NULL))
+    if ((hx711 == NULL) ||
+        (tare_ready == NULL) ||
+        (filter == NULL) ||
+        (mp157_rx_parser == NULL))
     {
         return;
     }
@@ -677,13 +699,56 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
         return;
     }
 
-    if (BinaryProtocolService_HandleFrame(raw_frame, raw_frame_length) != 0U)
+    /*
+     * 正常帧从第 0 字节开始，但串口受干扰时前面可能出现少量噪声。
+     * 只要当前块中出现候选 SOF0，就交给流式解析器自行寻找完整 `A5 5A`，
+     * 避免“噪声 + STOP”整块被误当成 ASCII 后直接丢失。
+     */
+    for (binary_candidate_index = 0U;
+         binary_candidate_index < raw_frame_length;
+         binary_candidate_index++)
+    {
+        if (raw_frame[binary_candidate_index] == BINARY_PROTOCOL_SOF0)
+        {
+            binary_candidate_found = 1U;
+            break;
+        }
+    }
+
+    if ((mp157_rx_parser->length > 0U) ||
+        (binary_candidate_found != 0U))
     {
         /*
-         * 自动检测二进制协议使用 `A5 5A` 帧头和 CRC 校验。
-         * 不管业务命令最终 ACK 还是 NACK，只要识别为本协议帧，就不能再落入机械臂或文本命令解析分支，
-         * 否则 CRC 错帧可能被误当作乱码文本处理，现场排查会更混乱。
+         * 二进制主链路按“字节流”而不是 DMA-IDLE 回调边界处理。
+         * 一次 raw_frame 可能同时包含三帧 STOP，也可能只包含半帧；解析器会缓存半帧，
+         * 并循环提取当前已经完整到达的每一帧，避免整块长度校验失败后 STOP 被静默丢弃。
          */
+        Mp157RxParser_PushBytes(mp157_rx_parser, raw_frame, raw_frame_length);
+
+        for (;;)
+        {
+            parsed_raw_frame_length = 0U;
+            parser_result = Mp157RxParser_TryExtractFrame(mp157_rx_parser,
+                                                          parsed_raw_frame,
+                                                          (uint16_t)sizeof(parsed_raw_frame),
+                                                          &parsed_raw_frame_length,
+                                                          &parsed_frame);
+            if (parser_result == MP157_RX_PARSER_RESULT_FRAME_READY)
+            {
+                (void)BinaryProtocolService_HandleFrame(parsed_raw_frame,
+                                                        parsed_raw_frame_length);
+                continue;
+            }
+
+            if (parser_result == MP157_RX_PARSER_RESULT_DROPPED_BYTES)
+            {
+                /* 丢弃噪声或坏帧一个同步步长后，立即继续寻找后面可能紧跟的安全 STOP。 */
+                continue;
+            }
+
+            break;
+        }
+
         return;
     }
 
@@ -711,7 +776,7 @@ static void WeightService_ProcessCommand(HX711_Handle_t *hx711,
         /*
          * STATUS 是 STM32MP157 周期发送的健康探测命令。
          * 回复中同时包含 OK、F4、READY 三个关键字，匹配 MP157 侧现有
-         * DeviceHealthController 的判断条件；该命令只证明 USART1 命令任务仍可调度，
+         * DeviceHealthController 的判断条件；该命令只证明 MP157 主链路命令任务仍可调度，
          * 不会触发称重去皮、LDC 标定、电机运动或机械臂动作。
          */
         my_printf(&huart1, "[OK][F4] READY\r\n");
@@ -844,6 +909,7 @@ void WeightService_Task(void *argument)
     (void)argument;
 
     WeightService_FilterReset(&filter);
+    Mp157RxParser_Init(&g_weight_mp157_rx_parser);
     UartCommand_StartReceive();
 
     HX711_LoadDefaultConfig(&hx711);
@@ -852,7 +918,7 @@ void WeightService_Task(void *argument)
     {
         /*
          * HX711 没接或 GPIO 初始化异常时，不能让任务停在死循环。
-         * WeightService_Task 同时是 USART1 命令消费者；如果这里阻塞，
+         * WeightService_Task 同时是 MP157 主链路命令消费者；如果这里阻塞，
          * MP157 的 START_CYCLE/HEARTBEAT 二进制帧也会没人处理，传送带调试会被称重模块牵连。
          * 因此只置位称重故障并继续跑主循环，让 MP157 通过 STATUS_REPORT/FAULT_REPORT 得到结构化错误。
          */
@@ -940,7 +1006,8 @@ void WeightService_Task(void *argument)
                                      latest_status,
                                      latest_raw_value,
                                      &tare_ready,
-                                     &filter);
+                                     &filter,
+                                     &g_weight_mp157_rx_parser);
         osDelay(WEIGHT_SERVICE_SAMPLE_PERIOD_MS);
     }
 }

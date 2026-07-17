@@ -964,7 +964,7 @@ uint8_t BinaryProtocolService_DecodeWeightResult(const uint8_t *payload,
 static uint8_t BinaryProtocolService_IsActiveCycle(uint16_t cycle_id);
 
 /**
- * @brief 通过 USART1 发送一帧二进制协议。
+ * @brief 通过 MP157 主链路发送一帧二进制协议。
  * @param command 命令字。
  * @param payload 负载地址，没有负载时可以为 NULL。
  * @param payload_length 负载长度。
@@ -989,7 +989,7 @@ static void BinaryProtocolService_SendFrame(uint8_t command, const uint8_t *payl
     }
 
     ++g_binary_protocol_runtime.tx_sequence;
-    (void)UartCommand_SendRaw(&huart1, tx_buffer, frame_length, 0xFFU);
+    (void)UartCommand_SendRaw(UartCommand_GetMp157Huart(), tx_buffer, frame_length, 0xFFU);
 }
 
 /**
@@ -2410,6 +2410,7 @@ static void BinaryProtocolService_HandleActuatorStop(const BinaryProtocol_Frame_
     BinaryProtocol_ActuatorStopPayload_t payload;
     uint8_t conveyor_accepted = 1U;
     uint8_t camera_accepted = 1U;
+    uint8_t cycle_mismatch = 0U;
 
     if (BinaryProtocolService_DecodeActuatorStop(frame->payload, frame->payload_length, &payload) == 0U)
     {
@@ -2421,16 +2422,6 @@ static void BinaryProtocolService_HandleActuatorStop(const BinaryProtocol_Frame_
         return;
     }
 
-    if ((payload.cycle_id != 0U) && (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U))
-    {
-        BinaryProtocolService_SendNack(payload.cycle_id,
-                                       frame->sequence,
-                                       frame->command,
-                                       BINARY_PROTOCOL_ERROR_CYCLE_MISMATCH,
-                                       g_binary_protocol_runtime.active_cycle_id);
-        return;
-    }
-
     if (payload.flags != 0U)
     {
         BinaryProtocolService_SendNack(payload.cycle_id,
@@ -2439,19 +2430,6 @@ static void BinaryProtocolService_HandleActuatorStop(const BinaryProtocol_Frame_
                                        BINARY_PROTOCOL_ERROR_FIELD_RANGE,
                                        payload.flags);
         return;
-    }
-
-    if ((payload.actuator == BINARY_PROTOCOL_ACTUATOR_CONVEYOR) ||
-        (payload.actuator == BINARY_PROTOCOL_ACTUATOR_ALL))
-    {
-        conveyor_accepted = ConveyorMotorService_RequestStop();
-    }
-
-    if ((payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL) ||
-        (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_Z) ||
-        (payload.actuator == BINARY_PROTOCOL_ACTUATOR_ALL))
-    {
-        camera_accepted = CameraMotorService_RequestStopAll();
     }
 
     if ((payload.actuator != BINARY_PROTOCOL_ACTUATOR_CONVEYOR) &&
@@ -2467,6 +2445,34 @@ static void BinaryProtocolService_HandleActuatorStop(const BinaryProtocol_Frame_
         return;
     }
 
+    if ((payload.cycle_id != 0U) && (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U))
+    {
+        /*
+         * ACTUATOR_STOP 是运动层安全停机命令，不能因为 MP157 与 F4 的 cycle_id 已经漂移
+         * 就拒绝停机；否则上位机超时兜底时可能已经本地进入下一阶段，而物理电机仍继续转。
+         * 这里保留告警信息用于联调排查，但仍继续向传送带和摄像头电机服务投递 STOP。
+         */
+        cycle_mismatch = 1U;
+        my_printf(&huart1,
+                  "[WARN][PROTO] ACTUATOR_STOP ignores cycle mismatch for safety. payload_cycle=%u active_cycle=%u actuator=%u\r\n",
+                  (unsigned int)payload.cycle_id,
+                  (unsigned int)g_binary_protocol_runtime.active_cycle_id,
+                  (unsigned int)payload.actuator);
+    }
+
+    if ((payload.actuator == BINARY_PROTOCOL_ACTUATOR_CONVEYOR) ||
+        (payload.actuator == BINARY_PROTOCOL_ACTUATOR_ALL))
+    {
+        conveyor_accepted = ConveyorMotorService_RequestStop();
+    }
+
+    if ((payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_LATERAL) ||
+        (payload.actuator == BINARY_PROTOCOL_ACTUATOR_CAMERA_Z) ||
+        (payload.actuator == BINARY_PROTOCOL_ACTUATOR_ALL))
+    {
+        camera_accepted = CameraMotorService_RequestStopAll();
+    }
+
     if ((conveyor_accepted == 0U) || (camera_accepted == 0U))
     {
         BinaryProtocolService_SendNack(payload.cycle_id,
@@ -2475,6 +2481,14 @@ static void BinaryProtocolService_HandleActuatorStop(const BinaryProtocol_Frame_
                                        BINARY_PROTOCOL_ERROR_HARDWARE_FAULT,
                                        payload.actuator);
         return;
+    }
+
+    if (cycle_mismatch != 0U)
+    {
+        my_printf(&huart1,
+                  "[OK][PROTO] ACTUATOR_STOP applied despite cycle mismatch. seq=%u actuator=%u\r\n",
+                  (unsigned int)frame->sequence,
+                  (unsigned int)payload.actuator);
     }
 
     BinaryProtocolService_SendAck(payload.cycle_id, frame->sequence, frame->command, 0U);
@@ -2931,7 +2945,7 @@ static void BinaryProtocolService_HandleFinalSortResult(const BinaryProtocol_Fra
  * 2. cycle_id 必须为 0，表示人工维护命令，不绑定自动检测流程；
  * 3. flags 必须为 0，避免 MP157 误以为当前支持自动去皮、保存 Flash 或其它扩展动作；
  * 4. 克重字段交给称重服务按 HX711 额定量程和最近采样状态校验；
- * 5. 成功只回 ACK，失败只回 NACK，USART1 不再输出文本作为 MP157 判断依据。
+ * 5. 成功只回 ACK，失败只回 NACK，MP157 主链路不再输出文本作为 MP157 判断依据。
  */
 static void BinaryProtocolService_HandleWeightCalibration(const BinaryProtocol_Frame_t *frame)
 {
@@ -2986,7 +3000,7 @@ static void BinaryProtocolService_HandleWeightCalibration(const BinaryProtocol_F
 }
 
 /**
- * @brief 处理一帧来自 USART1 的二进制协议。
+ * @brief 处理一帧来自 MP157 主链路的二进制协议。
  * @param frame_buffer 原始帧缓存。
  * @param frame_length 原始帧长度。
  * @return uint8_t 1 表示该帧属于本协议且已经处理，0 表示不是本协议帧。

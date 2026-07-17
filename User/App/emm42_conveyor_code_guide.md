@@ -26,8 +26,8 @@
 |---|---|---|
 | `Core/Src/usart.c` | 串口底层初始化 | `huart4` 对应 `UART4 PC10/PC11`，`huart6` 对应 `USART6 PC6/PC7`。 |
 | `Core/Src/freertos.c` | FreeRTOS 任务启动胶水 | 创建传送带任务 `ConveyorMotorService_Task()` 和摄像头电机任务 `CameraMotorService_Task()`。 |
-| `User/App/uart_command.c` | `USART1` 命令接收与线程安全打印 | 只负责收完整命令和安全打印，不直接控制电机。 |
-| `User/App/weight_service.c` | `USART1` 统一命令分发入口 | 分发 `BELT...` 到传送带服务，分发 `CAM...` 到摄像头电机服务。 |
+| `User/App/uart_command.c` | `USART2` 命令接收、二进制回包与 USART1 线程安全打印 | 只负责收完整命令和安全发送，不直接控制电机。 |
+| `User/App/weight_service.c` | `USART2` 统一命令分发入口 | 分发 `BELT...` 到传送带服务，分发 `CAM...` 到摄像头电机服务；文本响应从 USART1 调试口输出。 |
 | `User/App/conveyor_motor_service.c` | 传送带状态机 | 绑定 `huart4`，默认地址 `0x01`；通过运行时配置支持地址、最小步长、对中/短步速度、上料扫描速度和方向映射；支持 `ACTUATOR_VEL_MOVE/ACTUATOR_POS_MOVE/ACTUATOR_HOME`；位置运动成功发送后优先轮询 `[addr FD 9F 6B]`，未收到主动回包时按估算运动时间上报 `EVENT_REPORT event=0x14 status=5 estimated-done`。 |
 | `User/App/conveyor_motor_service.h` | 传送带服务公共接口 | 暴露任务入口、`RequestScan/RequestStop/RequestTrack`、`RequestRuntimeConfig`、`RequestJog`、`RequestPosition`、`RequestPositionWithReport` 和 `RequestSetCurrentPositionZero`。 |
 | `User/App/camera_motor_service.c` | 摄像头运动电机服务 | 绑定 `huart6`，现场默认左右轴地址 `0x03`、上下轴地址 `0x02`；通过运行时配置支持两轴地址、最小步长、常规速度和方向映射；支持左右轴持续速度运动、两轴固定步数位置运动和当前位置设零。 |
@@ -43,7 +43,7 @@
 
 | 步骤 | 文件 | 关键函数 | 作用 |
 |---:|---|---|---|
-| 1 | `User/App/uart_command.c` | `HAL_UARTEx_RxEventCallback()` | `USART1` 通过 DMA + IDLE 收到一帧命令。 |
+| 1 | `User/App/uart_command.c` | `HAL_UARTEx_RxEventCallback()` | `USART2` 通过 DMA + IDLE 收到一块原始字节，可能是一帧、半帧或多帧粘包。 |
 | 2 | `User/App/uart_command.c` | `UartCommand_Fetch()` / `UartCommand_FetchRaw()` | 把完整命令交给任务上下文。 |
 | 3 | `User/App/weight_service.c` | `WeightService_ProcessCommand()` | 统一分发二进制协议、机械臂帧和 ASCII 文本命令。 |
 | 4 | `User/App/conveyor_motor_service.c` | `ConveyorMotorService_HandleCommand()` | 解析 `BELTSCAN/BELTSTOP/BELTTRACK/BELTCAM/BELTENABLE/BELTINFO`。 |
@@ -114,6 +114,8 @@
 |---|---|
 | 传送带接线 | F4 `PC10(TX)` 接传送带 Emm42 `RX`，F4 `PC11(RX)` 接传送带 Emm42 `TX`。 |
 | 摄像头接线 | F4 `PC6(TX)` 接两个摄像头 Emm42 `RX`，F4 `PC7(RX)` 接两个摄像头 Emm42 `TX`。 |
+| MP157-F4 主链路 | MP157 `/dev/ttySTM2` TX 接 F4 `PA3(USART2_RX)`，MP157 `/dev/ttySTM2` RX 接 F4 `PA2(USART2_TX)`。 |
+| F4 调试口 | USB-TTL RX 接 F4 `PA9(USART1_TX)`，用于观察 `[BELT]`、`[CAM]`、`[STOP]` 等日志。 |
 | 共地 | F4、Emm42 驱动器、电机电源必须共地。 |
 | 地址 | 同一条 `USART6` 上两个摄像头电机现场默认分别设置为左右轴 `0x03`、上下轴 `0x02`；运行时下发时也必须互不相同。 |
 | 禁止混接 | 传送带不能再接到 `USART6 PC6/PC7`，否则会和摄像头两个电机抢总线。 |
@@ -123,20 +125,20 @@
 
 | 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
 |---|---|---|---|---|
-| 确认传送带串口 | USART1 串口助手 | `BELTINFO` | 输出 `[INFO][BELT] ... track=<对中速度> rpm, scan=<上料速度> rpm`，启动日志应含 `UART4=PC10/PC11, addr=1`。 | 检查 `conveyor_motor_service.c` 是否绑定 `huart4`，检查 PC10/PC11 接线和共地。 |
-| 启动传送带扫描 | USART1 串口助手 | `BELTSCAN` | 只有传送带电机动作。 | 如果摄像头电机动作，检查接线是否把传送带接到了 USART6。 |
-| 验证上方来料跟踪方向 | USART1 串口助手或 MP157 自动流程 | 先 `BELTSCAN` 观察扫描送入方向，再发 `BELTTRACK -80` | 传送带应沿扫描送入方向继续运动，把上方刚入画的零件送向 ROI 中心。 | 如果 `BELTTRACK -80` 把零件推回上方，确认 `CONVEYOR_MOTOR_POSITIVE_ERROR_IS_CW` 已为 `0U` 且 F407 已重新编译下载；再检查 MP157 参数页是否把传送带 direction 下发为 `-1`。 |
-| 验证视觉跟踪速度 | USART1 串口助手或 MP157 自动流程 | 先在 MP157 参数页把传送带 `对中速度` 设为 `137rpm` 并下发，再依次发送 `BELTTRACK -120`、`BELTTRACK -60`、`BELTTRACK -25`、`BELTTRACK 0` | `BELTINFO` 中 `track=137 rpm`，实际跟踪速度最高不超过该参数；误差进入 `24 px` 死区后传送带停止，零件应减少 ROI 前后往返。 | 如果仍过冲，先降低 MP157 参数页传送带 `对中速度` 并确认 `BELTINFO track=<新值>`；如果停得太早，把 `CONVEYOR_MOTOR_CENTER_DEADBAND_PX` 从 `24` 缩到 `20` 或 `18` 后重新编译下载。 |
-| 验证小误差不再卡滞 | USART1 串口助手或 MP157 自动流程 | 依次发送 `BELTTRACK 23`、`BELTTRACK 25`、`BELTTRACK -25` | `BELTTRACK 23` 应直接进入死区停机；`BELTTRACK 25/-25` 应以 `20 rpm` 附近低速实际动作，不能只显示发命令但传送带不动。 | 如果 `25px` 仍不动，把 `CONVEYOR_MOTOR_TRACK_MIN_SPEED_RPM` 改到 `25U`；如果 `25px` 动作后又过冲，先把死区缩到 `20`，不要再降低最小速度到无法启动。 |
-| 停止传送带 | USART1 串口助手 | `BELTSTOP` | 传送带停止。 | 检查 UART4 TX/RX 是否交叉、Emm42 地址是否为 `0x01`。 |
-| 查询摄像头电机 | USART1 串口助手 | `CAMINFO` | 输出 `USART6=PC6/PC7, lateral_addr=3, z_addr=2`，并显示两轴 `min_step/speed/dir`。 | 如果未知命令，检查 `weight_service.c` 是否接入 `CameraMotorService_HandleCommand()`；如果仍是 `lateral_addr=2,z_addr=3`，说明 F4 还没有重新编译下载新固件或 MP157 参数没有重新下发。 |
+| 确认传送带串口 | USART2 命令输入 + USART1 日志 | 向 USART2 发送 `BELTINFO` | USART1 输出 `[INFO][BELT] ... track=<对中速度> rpm, scan=<上料速度> rpm`，启动日志应含 `UART4=PC10/PC11, addr=1`。 | 检查 `conveyor_motor_service.c` 是否绑定 `huart4`，检查 USART2 输入、USART1 日志线、PC10/PC11 接线和共地。 |
+| 启动传送带扫描 | USART2 命令输入 | `BELTSCAN` | 只有传送带电机动作，日志从 USART1 输出。 | 如果摄像头电机动作，检查接线是否把传送带接到了 USART6。 |
+| 验证上方来料跟踪方向 | USART2 命令输入或 MP157 自动流程 | 先 `BELTSCAN` 观察扫描送入方向，再发 `BELTTRACK -80` | 传送带应沿扫描送入方向继续运动，把上方刚入画的零件送向 ROI 中心。 | 如果 `BELTTRACK -80` 把零件推回上方，确认 `CONVEYOR_MOTOR_POSITIVE_ERROR_IS_CW` 已为 `0U` 且 F407 已重新编译下载；再检查 MP157 参数页是否把传送带 direction 下发为 `-1`。 |
+| 验证视觉跟踪速度 | USART2 命令输入或 MP157 自动流程 | 先在 MP157 参数页把传送带 `对中速度` 设为 `137rpm` 并下发，再依次发送 `BELTTRACK -120`、`BELTTRACK -60`、`BELTTRACK -25`、`BELTTRACK 0` | USART1 日志或 `BELTINFO` 中 `track=137 rpm`，实际跟踪速度最高不超过该参数；误差进入 `24 px` 死区后传送带停止，零件应减少 ROI 前后往返。 | 如果仍过冲，先降低 MP157 参数页传送带 `对中速度` 并确认 `BELTINFO track=<新值>`；如果停得太早，把 `CONVEYOR_MOTOR_CENTER_DEADBAND_PX` 从 `24` 缩到 `20` 或 `18` 后重新编译下载。 |
+| 验证小误差不再卡滞 | USART2 命令输入或 MP157 自动流程 | 依次发送 `BELTTRACK 23`、`BELTTRACK 25`、`BELTTRACK -25` | `BELTTRACK 23` 应直接进入死区停机；`BELTTRACK 25/-25` 应以 `20 rpm` 附近低速实际动作，不能只显示发命令但传送带不动。 | 如果 `25px` 仍不动，把 `CONVEYOR_MOTOR_TRACK_MIN_SPEED_RPM` 改到 `25U`；如果 `25px` 动作后又过冲，先把死区缩到 `20`，不要再降低最小速度到无法启动。 |
+| 停止传送带 | USART2 命令输入 | `BELTSTOP` | 传送带停止，日志从 USART1 输出。 | 检查 UART4 TX/RX 是否交叉、Emm42 地址是否为 `0x01`。 |
+| 查询摄像头电机 | USART2 命令输入 + USART1 日志 | 向 USART2 发送 `CAMINFO` | USART1 输出 `USART6=PC6/PC7, lateral_addr=3, z_addr=2`，并显示两轴 `min_step/speed/dir`。 | 如果未知命令，检查 `weight_service.c` 是否接入 `CameraMotorService_HandleCommand()`；如果仍是 `lateral_addr=2,z_addr=3`，说明 F4 还没有重新编译下载新固件或 MP157 参数没有重新下发。 |
 | 下发三电机参数 | MP157 Qt 参数页 | `参数设置 -> 步进参数 -> 保存并下发` | F4 返回 `ACK acked_cmd=0x42 status=0`；再发 `BELTINFO` 能看到传送带 `track/scan` 双速度，发 `CAMINFO` 能看到摄像头两轴参数变化。 | 如果只保存 JSON 没 ACK，说明没有下发；如果 F4 没变化，确认 F4 固件已重新编译下载；如果 `NACK error_code=4`，检查 MP157 是否仍发送旧 25 字节负载。 |
 | 手动传送带持续运动 | MP157 Qt 手动三轴弹窗 | 切到传送带页，点击正转或反转，再点击停止。 | F4 返回 `ACK acked_cmd=0x52 status=0` 后传送带持续运动；停止返回 `ACK acked_cmd=0x51 status=0` 并停机。 | 若点击一次只动一下，确认 MP157 发的是 `ACTUATOR_VEL_MOVE`；若显示 `status=1/2`，确认 F4 已烧录 ACK 修复。 |
 | 传送带当前位置设零 | MP157 Qt 参数页步进弹窗 | 切到传送带页，点击 `设当前位置为零点`。 | F4 返回 `ACK acked_cmd=0x53 status=0`，传送带不主动运动，只发送 Emm42 `[addr 0A 6D 6B]`。 | 若返回未知命令，F4 仍是旧固件；若 ACK 但设零无效，检查传送带地址、Emm42 命令支持和 `[addr 0A 6D 6B]` 帧。 |
 | 传送带位置到位事件 | MP157 Qt 自动流程或二进制串口工具 | 发送 `ACTUATOR_POS_MOVE actuator=0 direction=0/1 steps>0`。 | F4 先返回 `ACK acked_cmd=0x50 status=0`；传送带主动回包到位后返回 `EVENT_REPORT event=0x14 status=0 related_seq=<本次SEQ>`；未收到主动回包但估算到期后返回 `event=0x14 status=5`。 | 若总是 `status=5`，检查传送带 Emm42 Response 是否为 `Reached/Both`、UART4 RX `PC11` 是否接好、地址是否 `0x01`、电源和共地；流程不会再因为缺少主动回包永久卡住。 |
-| 测试摄像头右移 | USART1 串口助手 | `CAMLAT RIGHT 30` | 只有摄像头左右轴动作。 | 如果上下轴动作，检查两个摄像头电机 ID 是否接反。 |
-| 测试摄像头上下轴 | USART1 串口助手 | `CAMZ UP 30` | 只有摄像头上下轴动作。 | 如果两个电机都动，检查两个电机是否仍是相同地址。 |
-| 停止摄像头两个轴 | USART1 串口助手 | `CAMSTOP` | 两个摄像头运动轴停止。 | 检查 USART6 接线、地址和供电。 |
+| 测试摄像头右移 | USART2 命令输入 | `CAMLAT RIGHT 30` | 只有摄像头左右轴动作，日志从 USART1 输出。 | 如果上下轴动作，检查两个摄像头电机 ID 是否接反。 |
+| 测试摄像头上下轴 | USART2 命令输入 | `CAMZ UP 30` | 只有摄像头上下轴动作，日志从 USART1 输出。 | 如果两个电机都动，检查两个电机是否仍是相同地址。 |
+| 停止摄像头两个轴 | USART2 命令输入 | `CAMSTOP` | 两个摄像头运动轴停止，日志从 USART1 输出。 | 检查 USART6 接线、地址和供电。 |
 
 ## 8. Modification Record
 
@@ -156,3 +158,4 @@
 | 2026-07-05 | 新增位置运动完成事件链：传送带位置命令成功发送后，任务轮询 `[addr FD 9F 6B]`，主动回包到位上报 `EVENT_REPORT event=0x14 status=0`，估算完成兜底上报 `event=0x14 status=5`，真实通信/驱动故障才上报 `event=0x15`；ACK 不再被当成运动完成。 |
 | 2026-07-05 | 复核张大头官方位置模式例程后确认示例没有解析主动完成帧；位置运动完成机制改为 `status=0` 表示真实主动回包到位，`status=5 estimated-done` 表示估算完成兜底，真实通信错误才用 `event=0x15`。 |
 | 2026-07-05 | 传送带运行参数拆成双速度：`scan_speed_rpm` 用于未检测到零件时的上料扫描，`normal_speed_rpm` 用于检测到零件后的视觉对中和短步微调；`STEPPER_PARAM_SET` 改为 31 字节负载、单条 9 字节记录。 |
+| 2026-07-16 | MP157-F4 主链路迁移到 USART2(PA2/PA3)，Emm42 文本维护命令从 USART2 输入，响应和运行日志从 USART1(PA9) 输出。 |

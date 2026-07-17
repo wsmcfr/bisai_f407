@@ -23,7 +23,7 @@
 | `UART4` | F4 到传送带 Emm42 的 TTL 串口 | 115200 8N1，`PC10=TX`、`PC11=RX`。 |
 | Emm42 地址 | 传送带电机站号 | 默认 `0x01`，可由 MP157 `STEPPER_PARAM_SET` 运行时更新，合法范围 `1~247`。 |
 | FreeRTOS 队列 | 协议层向传送带任务投递控制命令 | 队列长度为 1，使用覆盖写入，视觉坐标以最新误差为准。 |
-| MP157 主链路 | 二进制协议入口 | USART1 收到 `START_CYCLE/VISION_POS/STEPPER_PARAM_SET/ACTUATOR_POS_MOVE` 后转交本模块。 |
+| MP157 主链路 | 二进制协议入口 | USART2 收到 `START_CYCLE/VISION_POS/STEPPER_PARAM_SET/ACTUATOR_POS_MOVE` 后转交本模块。 |
 | Emm42 Response | 位置到位事件 | 配置为 `Reached` 或 `Both` 时 F4 可收到 `[addr FD 9F 6B]` 主动到位回包；若现场没有主动回包，F4 按步数、速度和安全余量估算到期后上报 `DONE status=5 estimated-done`。 |
 
 ## 使用方法
@@ -42,9 +42,9 @@
 |---|---|---|---|---|
 | 主机协议测试 | `E:\hal\bisai_f407_project` | `gcc -std=c99 -Wall -Wextra -DBINARY_PROTOCOL_HOST_TEST -I User\App User\App\binary_protocol_service_host_test.c User\App\binary_protocol_service.c -o tmp\binary_protocol_service_host_test.exe; .\tmp\binary_protocol_service_host_test.exe` | 输出 `binary protocol host tests passed`，`STEPPER_PARAM_SET` 按 31 字节负载解码。 | 若提示长度错误，检查 `BINARY_PROTOCOL_STEPPER_PARAM_PAYLOAD_LENGTH` 是否为 31，单条记录是否为 9 字节。 |
 | Keil 编译 | `E:\hal\bisai_f407_project` | 使用 Keil/命令行构建 `MDK-ARM\bisai_f407_project.uvprojx` | 编译 0 Error；warning 需要逐条确认是否与本次修改相关。 | 若 `ConveyorMotorService_RequestRuntimeConfig` 参数不匹配，检查 `binary_protocol_service.c`、`conveyor_motor_service.h` 和调用点是否同步。 |
-| 查询运行参数 | F4 USART1 串口助手 | `BELTINFO` | 日志含 `track=<normal_speed_rpm> rpm, scan=<scan_speed_rpm> rpm`。 | 若没有 `track/scan` 字段，说明 F4 未烧录新固件或串口连接到旧程序。 |
-| 验证上料速度 | F4 USART1 串口助手 | 先下发 `STEPPER_PARAM_SET` 设置 `scan_speed_rpm=60`，再发 `BELTSCAN` | 传送带按 60rpm 附近扫描，`BELTINFO` 显示 `scan=60 rpm`。 | 若仍按旧速度转，检查 MP157 是否收到 `ACK acked_cmd=0x42`、F4 是否打印 `Runtime config applied`。 |
-| 验证对中速度 | F4 USART1 串口助手 | 设置 `normal_speed_rpm=137` 后发送 `BELTTRACK -120` | `BELTINFO` 显示 `track=137 rpm`，实际跟踪速度不超过该值。 | 若速度仍受固定 80rpm 限制，检查 `ConveyorMotorService_MapErrorToSpeed()` 是否使用 `runtime->config.normal_speed_rpm`。 |
+| 查询运行参数 | F4 USART2 命令输入 + USART1 日志 | 向 USART2 发送 `BELTINFO` | USART1 调试口日志含 `track=<normal_speed_rpm> rpm, scan=<scan_speed_rpm> rpm`。 | 若没有 `track/scan` 字段，说明 F4 未烧录新固件、USART2 命令未到达或 USART1 日志线未接好。 |
+| 验证上料速度 | F4 USART2 命令输入 + USART1 日志 | 先下发 `STEPPER_PARAM_SET` 设置 `scan_speed_rpm=60`，再向 USART2 发 `BELTSCAN` | 传送带按 60rpm 附近扫描，USART1 日志中 `BELTINFO` 显示 `scan=60 rpm`。 | 若仍按旧速度转，检查 MP157 是否收到 `ACK acked_cmd=0x42`、F4 是否在 USART1 打印 `Runtime config applied`。 |
+| 验证对中速度 | F4 USART2 命令输入 + USART1 日志 | 设置 `normal_speed_rpm=137` 后向 USART2 发送 `BELTTRACK -120` | USART1 日志中 `BELTINFO` 显示 `track=137 rpm`，实际跟踪速度不超过该值。 | 若速度仍受固定 80rpm 限制，检查 `ConveyorMotorService_MapErrorToSpeed()` 是否使用 `runtime->config.normal_speed_rpm`。 |
 | 验证位置到位事件 | MP157 Qt 自动流程或二进制串口工具 | 发送 `ACTUATOR_POS_MOVE actuator=0 speed_rpm=0 steps>0` | F4 先 ACK；收到 `[addr FD 9F 6B]` 时发 `EVENT_REPORT event=0x14 status=0 related_seq=<本次SEQ>`；没有主动回包但估算运动时间到期时发 `event=0x14 status=5`；UART 读取错误或发送失败才发 `event=0x15`。 | 若总是 `status=5`，检查 Emm42 Response、UART4 RX `PC11`、地址和共地；流程不会再因缺少主动回包永久等待。 |
 
 ## 读写验证
@@ -75,3 +75,13 @@
 | 2026-07-05 | `ConveyorMotorService_RequestRuntimeConfig()` 增加 `scan_speed_rpm`，传送带 SCAN 使用上料速度，TRACK 和短步位置运动使用 `normal_speed_rpm`。 |
 | 2026-07-05 | `BELTINFO` 增加 `track/scan` 输出，用于现场确认 MP157 参数页是否同步到 F4 运行内存。 |
 | 2026-07-05 | 位置运动完成机制改为“主动到位回包优先、估算完成兜底”：张大头官方位置模式例程没有证明默认一定主动返回完成帧，所以没有 `[addr FD 9F 6B]` 时不再发 `TIMEOUT` 卡住 MP157，而是发 `EVENT_REPORT event=0x14 status=5 estimated-done`。 |
+| 2026-07-10 | 安全 STOP 不再因为 `applied_mode==STOP` 跳过底层发送；每次 STOP 都向 UART4 发送 `[addr FE 98 00 6B]`，并输出发送结果、任务栈水位、当前堆和历史最小堆。 |
+| 2026-07-16 | MP157 主链路迁移到 USART2(PA2/PA3)，传送带 STOP 和运行日志从 USART1(PA9) 调试口输出。 |
+
+## 2026-07-10 STOP 故障验证
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 确认传送带真实执行停止 | F4 USART1 调试口 `PA9(TX)`，115200 8N1 | MP157 自动流程触发超时 STOP，或通过 USART2 发送 `ACTUATOR_STOP actuator=0xFF` | USART1 出现 `[STOP][BELT] addr=1 uart=4 status=0 ...`，传送带停止。 | `status!=0` 时检查 UART4、PC10、驱动器 RX、共地和供电；完全无日志时先查 STOP 是否到达协议层和队列，再查 PA9 日志线。 |
+| 判断是否任务栈不足 | F4 USART1 调试口 | 观察 `[STOP][BELT]` 中的 `stack_hw` | 数值明显大于 0，且运行中不持续逼近 0。 | 出现 `[FATAL] F4 STACK OVERFLOW` 或 `stack_hw` 接近 0 才增加对应任务栈。 |
+| 判断是否 FreeRTOS 堆不足 | F4 USART1 调试口 | 观察 `heap`、`heap_min` | 两者大于 0；`heap_min` 是上电以来最差余量。 | 出现 `[FATAL] F4 MALLOC FAILED` 才确认动态堆耗尽，并检查任务、队列和信号量创建。 |

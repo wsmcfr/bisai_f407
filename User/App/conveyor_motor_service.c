@@ -15,8 +15,8 @@
  * @brief 传送带文本命令和 Emm42 控制效果速查。
  *
  * 通信链路：
- * 1. 用户/MP157 通过 USART1 发送 ASCII 文本命令，命令先由 `weight_service.c` 统一取出并规范化；
- * 2. 本文件只处理 `BELT...` 前缀命令，不直接读取 USART1 DMA 缓存；
+ * 1. 用户/MP157 通过 USART2 发送 ASCII 文本命令，命令先由 `weight_service.c` 统一取出并规范化；
+ * 2. 本文件只处理 `BELT...` 前缀命令，不直接读取 USART2 DMA 缓存；
  * 3. 传送带任务独占 UART4，PC10(TX) 接传送带 Emm42 RX、PC11(RX) 接传送带 Emm42 TX，115200 8N1，必须共地；
  * 4. 摄像头左右和上下两个 Emm42 电机共用 USART6，不能再让传送带占用 USART6。
  *
@@ -373,7 +373,7 @@ typedef struct
 /**
  * @brief 传送带电机命令队列。
  *
- * 由 `USART1` 命令分发入口写入，由电机任务独占读取。
+ * 由 `USART2` 命令分发入口写入，由电机任务独占读取。
  */
 static QueueHandle_t g_conveyor_motor_command_queue = NULL;
 
@@ -760,7 +760,7 @@ static void ConveyorMotorService_PollPendingMoveReport(const EMM42_MotorHandle_t
  * @return uint8_t 1 表示请求已投递，0 表示传送带任务尚未就绪。
  *
  * 该函数是二进制协议层调用传送带服务的公共入口。
- * 它只投递内部队列命令，不直接碰 Emm42 串口，确保 USART1 命令分发路径保持轻量。
+ * 它只投递内部队列命令，不直接碰 Emm42 串口，确保 USART2 命令分发路径保持轻量。
  */
 uint8_t ConveyorMotorService_RequestScan(void)
 {
@@ -964,7 +964,7 @@ uint8_t ConveyorMotorService_RequestRuntimeConfig(uint8_t address,
  * @return uint8_t 1 表示读取成功，0 表示参数为空或传送带任务尚未创建队列。
  *
  * 该函数只做一次受临界区保护的内存拷贝，不访问 Emm42 串口，
- * 因此可以被二进制协议层在 USART1 命令处理上下文中快速调用。
+ * 因此可以被二进制协议层在 USART2 命令处理上下文中快速调用。
  */
 uint8_t ConveyorMotorService_GetStatus(ConveyorMotor_Status_t *status)
 {
@@ -1253,7 +1253,9 @@ static EMM42_MotorDirection_t ConveyorMotorService_MapRuntimeDirection(EMM42_Mot
  * @param runtime 任务运行时状态，不能为空。
  * @return EMM42_MotorStatus_t 发送结果。
  *
- * 该函数会同步更新“已应用状态”，避免后续重复发送相同的停止命令。
+ * 安全 STOP 每次都必须真实发送到 UART4，不能因为软件 applied_mode 已经是 STOP 就跳过。
+ * 现场可能出现“软件状态认为已停，但上一帧未真正到达驱动器”的状态漂移；重复停止帧无运动副作用，
+ * 因此这里优先保证物理停机，而不是优化掉一次 5 字节发送。
  */
 static EMM42_MotorStatus_t ConveyorMotorService_ApplyStop(const EMM42_MotorHandle_t *motor,
                                                           ConveyorMotor_Runtime_t *runtime)
@@ -1265,12 +1267,14 @@ static EMM42_MotorStatus_t ConveyorMotorService_ApplyStop(const EMM42_MotorHandl
         return EMM42_MOTOR_STATUS_INVALID_PARAM;
     }
 
-    if (runtime->applied_mode == CONVEYOR_MOTOR_MODE_STOP)
-    {
-        return EMM42_MOTOR_STATUS_OK;
-    }
-
     status = EMM42_MotorStopNow(motor, false);
+    my_printf(&huart1,
+              "[STOP][BELT] addr=%u uart=4 status=%d stack_hw=%lu heap=%lu heap_min=%lu\r\n",
+              (unsigned int)motor->address,
+              (int)status,
+              (unsigned long)uxTaskGetStackHighWaterMark(NULL),
+              (unsigned long)xPortGetFreeHeapSize(),
+              (unsigned long)xPortGetMinimumEverFreeHeapSize());
     if (status == EMM42_MOTOR_STATUS_OK)
     {
         runtime->applied_mode = CONVEYOR_MOTOR_MODE_STOP;

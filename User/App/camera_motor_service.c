@@ -15,8 +15,8 @@
  * @brief 摄像头运动电机文本命令和 Emm42 地址速查。
  *
  * 通信链路：
- * 1. 用户/MP157 通过 USART1 发送 ASCII 文本命令，命令先由 `weight_service.c` 统一取出并规范化；
- * 2. 本文件只处理 `CAM...` 前缀命令，不直接读取 USART1 DMA 缓存；
+ * 1. 用户/MP157 通过 USART2 发送 ASCII 文本命令，命令先由 `weight_service.c` 统一取出并规范化；
+ * 2. 本文件只处理 `CAM...` 前缀命令，不直接读取 USART2 DMA 缓存；
  * 3. 摄像头两个运动电机共用 USART6，PC6(TX) 接两个 Emm42 RX，PC7(RX) 接两个 Emm42 TX，115200 8N1，必须共地；
  * 4. 摄像头左右轴电机现场默认地址为 `0x03`，该硬件通道复用旧前进/后退电机；
  * 5. 摄像头上下轴电机现场默认地址为 `0x02`；
@@ -242,7 +242,7 @@ typedef struct
 /**
  * @brief 摄像头电机服务命令队列。
  *
- * 由 USART1 命令分发入口写入，由摄像头电机任务独占读取。
+ * 由 USART2 命令分发入口写入，由摄像头电机任务独占读取。
  */
 static QueueHandle_t g_camera_motor_command_queue = NULL;
 
@@ -302,7 +302,7 @@ static CameraMotor_RuntimeConfigSet_t CameraMotorService_GetDefaultConfigSet(voi
  * @brief 读取当前 STOP 代际编号。
  * @return uint32_t 当前 STOP 代际编号。
  *
- * 该值会被 USART1 协议任务和摄像头电机任务同时访问，因此读取时进入 FreeRTOS 临界区。
+ * 该值会被 USART2 协议任务和摄像头电机任务同时访问，因此读取时进入 FreeRTOS 临界区。
  */
 static uint32_t CameraMotorService_ReadStopEpoch(void)
 {
@@ -1398,30 +1398,52 @@ static void CameraMotorService_ApplyCommand(const CameraMotor_Command_t *command
 
     if (command->type == CAMERA_MOTOR_COMMAND_STOP_ALL)
     {
+        EMM42_MotorStatus_t lateral_stop_status;
+        EMM42_MotorStatus_t z_stop_status;
+
         CameraMotorService_ClearPendingMoveReport(runtime);
-        status = EMM42_MotorStopNow(lateral_motor, false);
-        if (status != EMM42_MOTOR_STATUS_OK)
+        lateral_stop_status = EMM42_MotorStopNow(lateral_motor, false);
+        if (lateral_stop_status != EMM42_MOTOR_STATUS_OK)
         {
             BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
-            BinaryProtocolService_ReportFault((uint16_t)status,
+            BinaryProtocolService_ReportFault((uint16_t)lateral_stop_status,
                                               BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR,
                                               BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
-                                              (int32_t)status,
+                                              (int32_t)lateral_stop_status,
                                               0U);
-            my_printf(&huart1, "[ERROR][CAM] lateral stop failed, status=%d\r\n", (int)status);
+            my_printf(&huart1,
+                      "[ERROR][CAM] lateral stop failed, status=%d\r\n",
+                      (int)lateral_stop_status);
         }
 
-        status = EMM42_MotorStopNow(z_motor, false);
-        if (status != EMM42_MOTOR_STATUS_OK)
+        z_stop_status = EMM42_MotorStopNow(z_motor, false);
+        if (z_stop_status != EMM42_MOTOR_STATUS_OK)
         {
             BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR);
-            BinaryProtocolService_ReportFault((uint16_t)status,
+            BinaryProtocolService_ReportFault((uint16_t)z_stop_status,
                                               BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR,
                                               BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
-                                              (int32_t)status,
+                                              (int32_t)z_stop_status,
                                               0U);
-            my_printf(&huart1, "[ERROR][CAM] z stop failed, status=%d\r\n", (int)status);
+            my_printf(&huart1,
+                      "[ERROR][CAM] z stop failed, status=%d\r\n",
+                      (int)z_stop_status);
         }
+
+        /*
+         * USART1 是独立调试口，不会污染 MP157 的 USART2 二进制主链路。
+         * 每次 STOP 都记录两路底层发送结果与当前任务资源水位，用运行证据判断是否栈/堆不足。
+         */
+        my_printf(&huart1,
+                  "[STOP][CAM] lat_addr=%u lat_status=%d z_addr=%u z_status=%d epoch=%lu stack_hw=%lu heap=%lu heap_min=%lu\r\n",
+                  (unsigned int)lateral_motor->address,
+                  (int)lateral_stop_status,
+                  (unsigned int)z_motor->address,
+                  (int)z_stop_status,
+                  (unsigned long)command->stop_epoch,
+                  (unsigned long)uxTaskGetStackHighWaterMark(NULL),
+                  (unsigned long)xPortGetFreeHeapSize(),
+                  (unsigned long)xPortGetMinimumEverFreeHeapSize());
 
         CameraMotorService_UpdateActionSnapshot(CAMERA_MOTOR_AXIS_LATERAL,
                                                 EMM42_MOTOR_DIRECTION_CW,

@@ -31,6 +31,7 @@
 #include "robot_arm_service.h"
 #include "system_heartbeat_service.h"
 #include "weight_service.h"
+#include "usart.h"
 
 /* USER CODE END Includes */
 
@@ -81,13 +82,13 @@ static const osThreadAttr_t heartbeatTask_attributes = {
   .priority = (osPriority_t) osPriorityLow, /* 低优先级避免心跳显示影响称重、LDC 检测和电机控制等业务任务。 */
 };
 
-/* 机械臂转发任务句柄保留在用户区，负责把 USART1 收到的 LeArm 协议帧异步转发到 USART3。 */
+/* 机械臂转发任务句柄保留在用户区，负责把 USART2 主链路触发的机械臂动作异步转发到 USART3。 */
 static osThreadId_t robotArmTaskHandle = NULL;
 
 /* 机械臂转发任务只处理短帧队列和 USART3 阻塞发送，USART3 当前按 115200 8N1 对接 ESP32 PA5/PA4 串口。 */
 /* 栈和优先级保持在普通业务任务级别，避免机械臂短帧转发影响称重、电感检测等更高实时性路径。 */
 static const osThreadAttr_t robotArmTask_attributes = {
-  .name = "robotArmTask",                  /* 任务名称用于 RTOS 调试视图中识别机械臂 USART1->USART3 转发线程。 */
+  .name = "robotArmTask",                  /* 任务名称用于 RTOS 调试视图中识别机械臂 USART2->USART3 转发线程。 */
   .stack_size = 512 * 4,                   /* 机械臂任务会叠加 ACK/DONE 帧缓存、称重结果打包和日志调用链，扩到 512 word 规避栈踩踏。 */
   .priority = (osPriority_t) osPriorityNormal, /* 普通优先级保证机械臂命令及时转发，同时不压制更高实时性采样或中断回调。 */
 };
@@ -187,12 +188,12 @@ void MX_FREERTOS_Init(void) {
     Error_Handler();
   }
 
-  /* 机械臂服务先创建队列，再启动转发任务，确保 USART1 收到 `55 55 ...` 帧后有可投递的目标。 */
+  /* 机械臂服务先创建队列，再启动转发任务，确保 USART2 主链路触发机械臂动作后有可投递的目标。 */
   if (RobotArmService_Init() == 0U)
   {
     /*
      * 机械臂队列创建失败说明 FreeRTOS 堆空间不足。
-     * 此时即使 USART1 还能收到命令，也无法安全异步转发到 USART3，因此直接进入统一错误处理。
+     * 此时即使 USART2 还能收到命令，也无法安全异步转发到 USART3，因此直接进入统一错误处理。
      */
     Error_Handler();
   }
@@ -256,6 +257,56 @@ void StartLdc1614Task(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+/**
+  * @brief FreeRTOS 检测到任务栈越界时的致命故障钩子。
+  * @param xTask 发生栈越界的任务句柄；故障现场不再解引用，避免访问已损坏对象。
+  * @param pcTaskName 发生栈越界的任务名称；故障现场不格式化输出，避免继续消耗栈。
+  * @retval None 本函数发送固定诊断字节后关闭中断并停机，不返回调度器。
+  *
+  * 设计原因：栈已经损坏时不能安全调用 printf、互斥锁或复杂协议发送，
+  * 因此仅使用非 MP157 主链路的 USART2 轮询发送固定英文标记，
+  * 现场看到 `F4 STACK OVERFLOW` 即可确认资源根因，同时避免污染 USART1 二进制主链路。
+  */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+  static const uint8_t message[] = "\r\n[FATAL] F4 STACK OVERFLOW\r\n";
+
+  (void)xTask;
+  (void)pcTaskName;
+  (void)HAL_UART_Transmit(&huart2,
+                          (uint8_t *)message,
+                          (uint16_t)(sizeof(message) - 1U),
+                          100U);
+  __disable_irq();
+  for (;;)
+  {
+    /* 保持停机，避免栈损坏后继续执行电机控制产生不可预测动作。 */
+  }
+}
+
+/**
+  * @brief FreeRTOS 动态内存申请失败时的致命故障钩子。
+  * @retval None 本函数发送固定诊断字节后关闭中断并停机，不返回调度器。
+  *
+  * 队列、信号量或任务创建时若 heap_4 空间不足会进入这里，
+  * USART2 固定标记用于区分“队列投递逻辑问题”和“真正的 FreeRTOS 堆耗尽”，
+  * USART1 继续保持 MP157 二进制主链路，不直接输出致命文本。
+  */
+void vApplicationMallocFailedHook(void)
+{
+  static const uint8_t message[] = "\r\n[FATAL] F4 MALLOC FAILED\r\n";
+
+  (void)HAL_UART_Transmit(&huart2,
+                          (uint8_t *)message,
+                          (uint16_t)(sizeof(message) - 1U),
+                          100U);
+  __disable_irq();
+  for (;;)
+  {
+    /* 保持停机，避免关键任务或队列创建失败后系统继续处于半工作状态。 */
+  }
+}
 
 /* USER CODE END Application */
 

@@ -51,7 +51,7 @@ void ConveyorMotorService_Task(void *argument);
  * 5. `BELTENABLE <0|1> [signed_error_px]`
  * 6. `BELTINFO`
  *
- * 命令仍然沿用当前 `USART1` 统一入口进行分发，
+ * 命令仍然沿用当前 `USART2` 统一入口进行分发，
  * 避免多个任务同时直接消费串口接收缓存。
  */
 uint8_t ConveyorMotorService_HandleCommand(const char *command_buffer);

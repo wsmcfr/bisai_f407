@@ -17,9 +17,9 @@
  * @brief LDC1614 串口标定命令速查。
  *
  * 通信入口：
- * - 用户通过 USART1 发送 ASCII 文本命令；
+ * - 用户通过 USART2 发送 ASCII 文本命令；
  * - `weight_service.c` 先完成统一接收和大小写规范化，再调用 `Ldc1614Service_HandleCommand()`；
- * - 本文件不直接读取 USART1 DMA 缓存，避免和其它服务抢同一帧命令。
+ * - 本文件不直接读取 USART2 DMA 缓存，避免和其它服务抢同一帧命令。
  *
  * 用户可发送的 LDC 命令：
  * | 命令 | 参数含义 | 硬件效果 | 典型返回 |
@@ -1828,7 +1828,7 @@ void Ldc1614Service_Task(void *argument)
          * MP157-F4 主链路不再返回文本错误。
          * LDC 未接入或初始化失败时，持续保留二进制故障位。
          * FAULT_REPORT 只在第一次失败或底层状态变化时发送，
-         * 避免未接 LDC 的调试阶段每 1 秒刷一帧故障，占用 USART1 主链路。
+         * 避免未接 LDC 的调试阶段每 1 秒刷一帧故障，占用 USART1 调试输出口。
          * 这样 MP157 能结构化展示“电感模块未接入”，不会再被 `[ERROR][LDC]...` 文本污染协议解析。
          */
         BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_LDC_NOT_READY);

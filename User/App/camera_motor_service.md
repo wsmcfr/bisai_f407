@@ -46,12 +46,12 @@
 
 | 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
 |---|---|---|---|---|
-| 查询当前运行时配置 | USART1 串口助手 | `CAMINFO` | 输出 `USART6=PC6/PC7`、`lateral_addr=3`、`z_addr=2`、`min_step/speed/dir` 和最近动作。 | 若未知命令，检查 `weight_service.c` 是否调用 `CameraMotorService_HandleCommand()`；若仍输出旧 `forward_addr`，说明 F4 还没烧录新固件。 |
-| 左右轴左移 | USART1 串口助手 | `CAMLAT LEFT 30` | 只有地址 `0x03` 的左右轴动作。 | 若上下轴动作，检查两个摄像头电机 ID 是否接反；若方向反，调整 MP157 参数页方向映射。 |
-| 左右轴右移 | USART1 串口助手 | `CAMLAT RIGHT 30` | 只有地址 `0x03` 的左右轴反向动作。 | 查 `USART6` 接线、地址、使能和供电。 |
-| 旧命令兼容 | USART1 串口助手 | `CAMFWD FORWARD 30` | 仍能驱动左右轴右移，仅作为旧调试别名。 | 新文档和新 UI 不再使用该命令作为主路径。 |
-| 上下轴指定速度点动 | USART1 串口助手 | `CAMZ UP 137` | 上下轴以 `137 rpm` 点动。 | 若速度被截断，检查是否已使用支持 `0~5000 rpm` 的新固件。 |
-| 停止两个摄像头轴 | USART1 串口助手 | `CAMSTOP` | 左右轴和上下轴都停止，日志出现 `Stop applied. lateral_addr=3, z_addr=2`。 | 检查两个电机地址是否不同，`USART6` 是否被其它任务占用。 |
+| 查询当前运行时配置 | USART2 命令输入 + USART1 日志 | 向 USART2 发送 `CAMINFO` | USART1 输出 `USART6=PC6/PC7`、`lateral_addr=3`、`z_addr=2`、`min_step/speed/dir` 和最近动作。 | 若未知命令，检查 `weight_service.c` 是否调用 `CameraMotorService_HandleCommand()`；若仍输出旧 `forward_addr`，说明 F4 还没烧录新固件。 |
+| 左右轴左移 | USART2 命令输入 | `CAMLAT LEFT 30` | 只有地址 `0x03` 的左右轴动作，日志从 USART1 输出。 | 若上下轴动作，检查两个摄像头电机 ID 是否接反；若方向反，调整 MP157 参数页方向映射。 |
+| 左右轴右移 | USART2 命令输入 | `CAMLAT RIGHT 30` | 只有地址 `0x03` 的左右轴反向动作，日志从 USART1 输出。 | 查 `USART6` 接线、地址、使能和供电。 |
+| 旧命令兼容 | USART2 命令输入 | `CAMFWD FORWARD 30` | 仍能驱动左右轴右移，仅作为旧调试别名。 | 新文档和新 UI 不再使用该命令作为主路径。 |
+| 上下轴指定速度点动 | USART2 命令输入 | `CAMZ UP 137` | 上下轴以 `137 rpm` 点动，日志从 USART1 输出。 | 若速度被截断，检查是否已使用支持 `0~5000 rpm` 的新固件。 |
+| 停止两个摄像头轴 | USART2 命令输入 + USART1 日志 | `CAMSTOP` | 左右轴和上下轴都停止，USART1 日志出现 `Stop applied. lateral_addr=3, z_addr=2`。 | 检查两个电机地址是否不同，`USART6` 是否被其它任务占用。 |
 | MP157 下发参数 | MP157 Qt 参数页 | `参数设置 -> 步进参数 -> 保存并下发` | F4 返回 `ACK acked_cmd=0x42 status=0`；随后 `CAMINFO` 可看到左右轴地址、步长、速度、方向变化。 | 若返回 `NACK error_code=5`，检查字段范围；若 `error_code=10`，检查摄像头电机任务队列是否已创建或队列是否已满。 |
 | MP157 左右轴持续运动 | MP157 Qt 手动三轴弹窗 | 切到 `摄像头左右电机`，点击 `左移` 或 `右移`，再点击停止。 | F4 先返回 `ACK acked_cmd=0x52 status=0`；停止时返回 `ACK acked_cmd=0x51 status=0`，左右轴停止。 | 若点击一次只动一下，确认 MP157 发的是 `ACTUATOR_VEL_MOVE`；若 STOP 后又动，确认已烧录包含 `stop_epoch` 的固件。 |
 | 自动 ROI 微调 | MP157 首页自动流程 | Z 轴下降并对焦等待后，ROI 复查 `errorY` 用传送带短步微调，`errorX` 用 `ACTUATOR_POS_MOVE actuator=1` 左右微调。 | X/Y 都进入死区后进入模型检测，检测完成后 Z 轴回升。 | 若现场仍按旧前后语义动作，检查 F4 是否还是旧固件、MP157 是否部署新 Qt 二进制。 |
@@ -61,10 +61,10 @@
 
 | 数据通路 | 写操作 | 读/确认操作 | 判定 |
 |---|---|---|---|
-| USART1 文本到摄像头任务 | 发送 `CAMLAT LEFT 137`、`CAMLAT RIGHT 137` 或 `CAMZ UP 137`。 | 观察对应轴动作，再发送 `CAMSTOP`。 | 只有目标轴动作，说明文本分发和 `USART6` 地址区分正常。 |
+| USART2 文本到摄像头任务 | 向 USART2 发送 `CAMLAT LEFT 137`、`CAMLAT RIGHT 137` 或 `CAMZ UP 137`。 | 观察对应轴动作，再发送 `CAMSTOP`，从 USART1 看文本日志。 | 只有目标轴动作，说明文本分发和 `USART6` 地址区分正常。 |
 | MP157 二进制参数到摄像头任务 | 发送 `STEPPER_PARAM_SET 0x42`，role 2/3 分别填写摄像头左右和上下轴参数。 | F4 回 ACK 后发送 `CAMINFO`。 | `CAMINFO` 中 role 2/3 对应地址、速度、步长、方向与 MP157 参数页一致。 |
 | MP157 二进制运动到摄像头任务 | 发送 `ACTUATOR_VEL_MOVE actuator=1`、`ACTUATOR_POS_MOVE actuator=1/2` 或 `ACTUATOR_STOP actuator=1/2/0xFF`。 | 观察目标轴动作或停机；位置命令除 ACK 外，还要等待 `EVENT_REPORT event=0x14`，并读取 `status=0/5` 判断真实回包或估算完成。 | ACK `status=0` 且只有目标轴动作，DONE 事件 `related_seq` 匹配原始命令，说明协议层、队列、`USART6` 地址区分和 Emm42 完成兜底链路正常。 |
-| STOP 后旧运动命令丢弃 | 快速连续发送 `ACTUATOR_VEL_MOVE actuator=1` 和 `ACTUATOR_STOP actuator=1`。 | 左右轴停止，USART1 日志至少出现 `Stop applied`；若 STOP 插队时旧运动命令还在队列中，应出现 `Drop stale motion after STOP`。 | 若停止后又继续动，检查 `CameraMotorService_PostCommand()` 是否给 STOP 递增 `stop_epoch`。 |
+| STOP 后旧运动命令丢弃 | 快速连续发送 `ACTUATOR_VEL_MOVE actuator=1` 和 `ACTUATOR_STOP actuator=1`。 | 左右轴停止，USART1 调试口至少出现 `Stop applied`；若 STOP 插队时旧运动命令还在队列中，应出现 `Drop stale motion after STOP`。 | 若停止后又继续动，检查 `CameraMotorService_PostCommand()` 是否给 STOP 递增 `stop_epoch`。 |
 
 ## 修改记录
 
@@ -77,3 +77,13 @@
 | 2026-07-04 | 自动检测流程调整为：传送带负责前后/Y 方向微调，左右轴负责 X 方向微调。 |
 | 2026-07-05 | 新增位置运动完成事件链：左右轴/Z 轴位置命令成功发送后，任务轮询 `[addr FD 9F 6B]`，主动回包到位上报 `EVENT_REPORT event=0x14 status=0`，估算完成兜底上报 `event=0x14 status=5`，真实通信/驱动故障才上报 `event=0x15`；ACK 不再被当成运动完成。 |
 | 2026-07-05 | 按张大头官方位置模式例程复核后发现示例只发送位置命令并等待串口帧，没有证明默认会主动返回完成帧；因此摄像头轴位置运动改为“收到 `[addr FD 9F 6B]` 上报 `DONE status=0`，未收到主动回包但估算到期上报 `DONE status=5 estimated-done`”，避免 MP157 在 Z 轴下降完成后无响应。 |
+| 2026-07-10 | 双轴 STOP 增加执行诊断，分别记录左右轴和 Z 轴底层停止返回值、STOP epoch、任务栈水位、当前堆和历史最小堆。 |
+| 2026-07-16 | MP157 主链路迁移到 USART2(PA2/PA3)，摄像头 STOP 和运行日志从 USART1(PA9) 调试口输出。 |
+
+## 2026-07-10 STOP 故障验证
+
+| 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
+|---|---|---|---|---|
+| 确认摄像头两轴真实执行停止 | F4 USART1 调试口 `PA9(TX)`，115200 8N1 | MP157 自动流程触发超时 STOP，或通过 USART2 发送 `ACTUATOR_STOP actuator=0xFF` | USART1 出现 `[STOP][CAM] lat_addr=3 lat_status=0 z_addr=2 z_status=0 ...`，左右轴和 Z 轴停止。 | 单路 status 非 0 时检查 USART6、PC6、对应电机地址、驱动器 RX 和共地；无日志时先查 STOP 是否成功入队，再查 PA9 日志线。 |
+| 确认旧运动命令不会重启 | F4 USART1 + 电机现场 | 快速发送左右点动后立刻 STOP | STOP 后保持静止；日志中的 epoch 递增，旧 JOG/POSITION 因 `stop_epoch` 被丢弃。 | 若再次运动，检查 MP157 是否在超时后仍发送新的 VEL/POS，而不是队列旧命令。 |
+| 判断是否资源不足 | F4 USART1 调试口 | 观察 `[STOP][CAM]` 的 `stack_hw/heap/heap_min` | 数值均大于 0，且没有 `[FATAL]` 标记。 | 只有出现 `STACK OVERFLOW`、`MALLOC FAILED` 或水位逼近 0 才调整资源配置。 |

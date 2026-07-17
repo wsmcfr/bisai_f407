@@ -82,7 +82,7 @@ extern "C" {
 /**
  * @brief 首版允许的最大负载长度，单位字节。
  *
- * 当前 USART1 DMA 单帧缓存为 64 字节，扣除帧头、版本、命令、长度、序号、CRC 和帧尾后，
+ * 当前 MP157 主链路 DMA 单帧缓存为 64 字节，扣除帧头、版本、命令、长度、序号、CRC 和帧尾后，
  * 48 字节能保证整帧不超过 58 字节，给字符串结束符和边界处理留下空间。
  */
 #define BINARY_PROTOCOL_MAX_PAYLOAD_LENGTH           (48U)
@@ -371,7 +371,7 @@ typedef enum
  */
 typedef enum
 {
-    BINARY_PROTOCOL_FAULT_SOURCE_UART = 1U,        /* USART1 或协议解析相关故障。 */
+    BINARY_PROTOCOL_FAULT_SOURCE_UART = 1U,        /* MP157 主链路串口或协议解析相关故障。 */
     BINARY_PROTOCOL_FAULT_SOURCE_CONVEYOR = 2U,    /* 传送带 Emm42 或 UART4 控制故障。 */
     BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR = 3U, /* 摄像头运动电机或 USART6 控制故障。 */
     BINARY_PROTOCOL_FAULT_SOURCE_ARM = 4U,         /* ESP32 机械臂桥接故障。 */
