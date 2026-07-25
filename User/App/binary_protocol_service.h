@@ -135,6 +135,13 @@ extern "C" {
 #define BINARY_PROTOCOL_BELT_CENTERED_PAYLOAD_LENGTH (8U)
 
 /**
+ * @brief `FILL_LIGHT_CONTROL` 命令负载长度，单位字节。
+ *
+ * 固定格式：cycle_id:u16、action:u8、flags:u8。
+ */
+#define BINARY_PROTOCOL_FILL_LIGHT_CONTROL_PAYLOAD_LENGTH (4U)
+
+/**
  * @brief `QUERY_STATUS` 命令负载长度，单位字节。
  */
 #define BINARY_PROTOCOL_QUERY_STATUS_PAYLOAD_LENGTH (3U)
@@ -245,6 +252,14 @@ extern "C" {
 #define BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT  (0x15U)
 
 /**
+ * @brief EVENT_REPORT 事件：补光舵机已经到达开灯或关灯绝对位置并停止 PWM。
+ *
+ * `step_code` 原样回填 action（0=关灯，1=开灯），`detail_i32` 保存最终角度，
+ * `related_seq` 回填原始 FILL_LIGHT_CONTROL 命令序号。
+ */
+#define BINARY_PROTOCOL_EVENT_FILL_LIGHT_MOVE_DONE   (0x16U)
+
+/**
  * @brief 执行器位置运动完成状态：按估算运动时间兜底完成。
  *
  * 该状态放在 `EVENT_REPORT detail_i32` 的低 16 位。
@@ -312,6 +327,7 @@ typedef enum
     BINARY_PROTOCOL_CMD_VISION_POS = 0x20U,         /* 视觉坐标命令，F4 根据坐标误差控制传送带。 */
     BINARY_PROTOCOL_CMD_VISION_LOST = 0x21U,        /* 视觉丢失命令，F4 根据原因回扫描或停机。 */
     BINARY_PROTOCOL_CMD_BELT_STOP_CENTERED = 0x22U, /* 零件已进中心 ROI，要求 F4 停止传送带。 */
+    BINARY_PROTOCOL_CMD_FILL_LIGHT_CONTROL = 0x23U, /* 控制补光舵机转到关灯 0 度或开灯 270 度位置。 */
     BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE = 0x30U,   /* 称重标定命令，使用已知砝码更新 HX711 运行时比例系数。 */
     BINARY_PROTOCOL_CMD_ARM_JOB_START = 0x31U,      /* 机械臂任务开始，F4 通知 ESP32S3 抓取并依次放称重/电感/分拣。 */
     BINARY_PROTOCOL_CMD_MODEL_READY = 0x32U,        /* MP157 模型检测和 SD 卡保存完成，F4 缓存模型结果但不触发云端上传。 */
@@ -332,6 +348,17 @@ typedef enum
     BINARY_PROTOCOL_CMD_CYCLE_DONE = 0x86U,         /* 整轮 F4 侧动作完成，首轮保留。 */
     BINARY_PROTOCOL_CMD_FAULT_REPORT = 0x87U        /* 故障上报，首轮保留。 */
 } BinaryProtocol_Command_t;
+
+/**
+ * @brief 补光灯舵机动作枚举。
+ *
+ * 该字段表达机械开关的绝对目标位置，不表达相对旋转方向，避免重复命令导致位置语义漂移。
+ */
+typedef enum
+{
+    BINARY_PROTOCOL_FILL_LIGHT_ACTION_OFF = 0U, /* 舵机回到绝对 0 度位置，机械关闭补光灯。 */
+    BINARY_PROTOCOL_FILL_LIGHT_ACTION_ON = 1U   /* 舵机转到绝对 270 度位置，机械打开补光灯。 */
+} BinaryProtocol_FillLightAction_t;
 
 /**
  * @brief 解析一帧二进制协议时可能返回的状态。
@@ -376,7 +403,8 @@ typedef enum
     BINARY_PROTOCOL_FAULT_SOURCE_CAMERA_MOTOR = 3U, /* 摄像头运动电机或 USART6 控制故障。 */
     BINARY_PROTOCOL_FAULT_SOURCE_ARM = 4U,         /* ESP32 机械臂桥接故障。 */
     BINARY_PROTOCOL_FAULT_SOURCE_WEIGHT = 5U,      /* HX711 称重故障。 */
-    BINARY_PROTOCOL_FAULT_SOURCE_LDC = 6U          /* LDC1614 电感检测故障。 */
+    BINARY_PROTOCOL_FAULT_SOURCE_LDC = 6U,         /* LDC1614 电感检测故障。 */
+    BINARY_PROTOCOL_FAULT_SOURCE_FILL_LIGHT = 7U   /* PB6/TIM4_CH1 补光舵机 PWM 故障。 */
 } BinaryProtocol_FaultSource_t;
 
 /**
@@ -398,7 +426,8 @@ typedef enum
     BINARY_PROTOCOL_FAULT_BIT_LDC_NOT_READY = 0x0002U,      /* LDC1614 未初始化成功或当前未接入。 */
     BINARY_PROTOCOL_FAULT_BIT_WEIGHT_NOT_READY = 0x0004U,   /* HX711 未初始化成功或称重无效。 */
     BINARY_PROTOCOL_FAULT_BIT_CAMERA_MOTOR = 0x0008U,       /* 摄像头运动电机服务故障。 */
-    BINARY_PROTOCOL_FAULT_BIT_ARM_LINK = 0x0010U            /* ESP32 机械臂链路故障。 */
+    BINARY_PROTOCOL_FAULT_BIT_ARM_LINK = 0x0010U,           /* ESP32 机械臂链路故障。 */
+    BINARY_PROTOCOL_FAULT_BIT_FILL_LIGHT = 0x0020U          /* 补光舵机 PWM 初始化、启动或停止故障。 */
 } BinaryProtocol_FaultBit_t;
 
 /**
@@ -501,6 +530,16 @@ typedef struct
     uint16_t hold_ms;                             /* 建议保持静止等待时间，单位毫秒。 */
     uint8_t reserved;                             /* 保留字段，首版填 0。 */
 } BinaryProtocol_BeltCenteredPayload_t;
+
+/**
+ * @brief `FILL_LIGHT_CONTROL` 负载解析结果。
+ */
+typedef struct
+{
+    uint16_t cycle_id;                            /* 当前自动检测流程 ID，必须与 F4 活动流程一致。 */
+    uint8_t action;                               /* 绝对目标动作：0=关灯/0 度，1=开灯/270 度。 */
+    uint8_t flags;                                /* 保留标志位，首版必须固定为 0。 */
+} BinaryProtocol_FillLightControlPayload_t;
 
 /**
  * @brief `QUERY_STATUS` 负载解析结果。
@@ -730,6 +769,9 @@ uint8_t BinaryProtocolService_DecodeVisionLost(const uint8_t *payload,
 uint8_t BinaryProtocolService_DecodeBeltCentered(const uint8_t *payload,
                                                  uint8_t payload_length,
                                                  BinaryProtocol_BeltCenteredPayload_t *decoded_payload);
+uint8_t BinaryProtocolService_DecodeFillLightControl(const uint8_t *payload,
+                                                     uint8_t payload_length,
+                                                     BinaryProtocol_FillLightControlPayload_t *decoded_payload);
 uint8_t BinaryProtocolService_DecodeQueryStatus(const uint8_t *payload,
                                                 uint8_t payload_length,
                                                 BinaryProtocol_QueryStatusPayload_t *decoded_payload);

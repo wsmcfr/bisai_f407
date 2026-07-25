@@ -204,6 +204,51 @@ static void test_decode_pause_resume_payload(void)
 }
 
 /**
+ * @brief 验证补光灯控制负载的小端字段布局和动作范围校验。
+ *
+ * 主要流程：
+ *   1. 构造 cycle_id=0x2468、action=开灯、flags=0 的合法 4 字节负载；
+ *   2. 断言解码函数能还原 cycle_id、动作和保留标志；
+ *   3. 把 action 改成协议未定义的 2，断言解码函数拒绝该负载。
+ *
+ * 返回值：
+ *   无返回值；任一断言失败时通过 g_failed_count 汇总失败数量。
+ */
+static void test_decode_fill_light_control_payload(void)
+{
+    uint8_t payload[BINARY_PROTOCOL_FILL_LIGHT_CONTROL_PAYLOAD_LENGTH]; /* 保存 MP157 下发的固定 4 字节补光控制负载。 */
+    BinaryProtocol_FillLightControlPayload_t fill_light;               /* 接收协议层解码后的补光控制字段。 */
+    uint8_t ok;                                                        /* 保存解码结果，1 表示合法，0 表示拒绝。 */
+
+    (void)memset(payload, 0, sizeof(payload));                          /* 先清零全部字节，确保 flags 保持首版要求的 0。 */
+    write_u16_le(&payload[0], 0x2468U);                                /* 按小端序写入当前自动检测轮次编号。 */
+    payload[2] = BINARY_PROTOCOL_FILL_LIGHT_ACTION_ON;                 /* 请求舵机转到 270 度并机械打开补光灯。 */
+    payload[3] = 0U;                                                   /* 首版保留标志必须固定为 0。 */
+
+    ok = BinaryProtocolService_DecodeFillLightControl(payload,         /* 调用真实协议解码函数验证合法负载。 */
+                                                       (uint8_t)sizeof(payload),
+                                                       &fill_light);
+
+    expect_int("fill_light_command_is_0x23",                          /* 固化跨端命令码，防止 MP157 与 F4 漂移。 */
+               (int)BINARY_PROTOCOL_CMD_FILL_LIGHT_CONTROL,
+               0x23);
+    expect_int("decode_fill_light_ok", (int)ok, 1);                  /* 合法开灯负载必须被接受。 */
+    expect_u16("decode_fill_light_cycle", fill_light.cycle_id, 0x2468U); /* cycle_id 必须按小端序还原。 */
+    expect_int("decode_fill_light_action",                            /* action 必须保持为开灯枚举值。 */
+               (int)fill_light.action,
+               (int)BINARY_PROTOCOL_FILL_LIGHT_ACTION_ON);
+    expect_int("decode_fill_light_flags", (int)fill_light.flags, 0); /* 首版 flags 解码结果必须为 0。 */
+
+    payload[2] = 2U;                                                   /* 2 不属于关灯 0 或开灯 1，模拟越界动作。 */
+    ok = BinaryProtocolService_DecodeFillLightControl(payload,         /* 再次调用真实解码函数验证错误分支。 */
+                                                       (uint8_t)sizeof(payload),
+                                                       &fill_light);
+    expect_int("decode_fill_light_rejects_invalid_action",            /* 非法动作不得进入硬件服务。 */
+               (int)ok,
+               0);
+}
+
+/**
  * @brief 验证 VISION_POS 负载的坐标和置信度解码。
  *
  * 返回值：
@@ -540,6 +585,15 @@ static void test_event_report_actuator_move_contract(void)
     expect_int("event_report_length", (int)BINARY_PROTOCOL_EVENT_REPORT_PAYLOAD_LENGTH, 16);
     expect_int("event_actuator_move_done", (int)BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_DONE, 0x14);
     expect_int("event_actuator_move_timeout", (int)BINARY_PROTOCOL_EVENT_ACTUATOR_MOVE_TIMEOUT, 0x15);
+    expect_int("event_fill_light_move_done",                         /* 固化补光舵机完成事件编号，供 MP157 严格等待。 */
+               (int)BINARY_PROTOCOL_EVENT_FILL_LIGHT_MOVE_DONE,
+               0x16);
+    expect_int("fault_source_fill_light",                            /* 固化补光 PWM 故障来源编号，避免和已有模块重叠。 */
+               (int)BINARY_PROTOCOL_FAULT_SOURCE_FILL_LIGHT,
+               7);
+    expect_int("fault_bit_fill_light",                               /* 固化 STATUS_REPORT 中补光服务故障位。 */
+               (int)BINARY_PROTOCOL_FAULT_BIT_FILL_LIGHT,
+               0x0020);
     expect_int("event_actuator_estimated_done_status",
                (int)BINARY_PROTOCOL_ACTUATOR_MOVE_STATUS_ESTIMATED_DONE,
                0x0005);
@@ -564,6 +618,7 @@ int main(void)
     test_parse_start_cycle_frame();
     test_parse_crc_error();
     test_decode_pause_resume_payload();
+    test_decode_fill_light_control_payload();
     test_decode_vision_pos_payload();
     test_decode_stepper_param_payload();
     test_decode_weight_calibration_payload();

@@ -3,8 +3,11 @@
 #ifndef BINARY_PROTOCOL_HOST_TEST
 #include "camera_motor_service.h"
 #include "conveyor_motor_service.h"
+#include "fill_light_service.h"
+#include "FreeRTOS.h"
 #include "ldc1614_service.h"
 #include "robot_arm_service.h"
+#include "task.h"
 #include "uart_command.h"
 #include "usart.h"
 #include "weight_service.h"
@@ -587,6 +590,38 @@ uint8_t BinaryProtocolService_DecodeBeltCentered(const uint8_t *payload,
 }
 
 /**
+ * @brief 解码并校验 FILL_LIGHT_CONTROL 补光灯舵机控制负载。
+ * @param payload 原始负载，固定布局为 cycle_id:u16、action:u8、flags:u8。
+ * @param payload_length 原始负载长度，必须等于 4 字节。
+ * @param decoded_payload 解码输出对象，用于后续业务分发。
+ * @return uint8_t 1 表示字段完整且范围合法，0 表示参数、长度、动作或 flags 非法。
+ *
+ * 该函数在协议边界直接拒绝未定义动作和非零保留位，保证非法输入不会进入 PWM 服务。
+ */
+uint8_t BinaryProtocolService_DecodeFillLightControl(const uint8_t *payload,
+                                                     uint8_t payload_length,
+                                                     BinaryProtocol_FillLightControlPayload_t *decoded_payload)
+{
+    if ((payload == NULL) ||                                              /* 调用方没有提供原始负载时无法解码。 */
+        (decoded_payload == NULL) ||                                      /* 调用方没有提供输出对象时禁止写内存。 */
+        (payload_length != BINARY_PROTOCOL_FILL_LIGHT_CONTROL_PAYLOAD_LENGTH)) /* 固定协议长度必须严格一致。 */
+    {
+        return 0U;                                                        /* 参数或长度错误，交由业务层返回 NACK。 */
+    }
+
+    if ((payload[2] > (uint8_t)BINARY_PROTOCOL_FILL_LIGHT_ACTION_ON) ||  /* action 只允许 0 或 1。 */
+        (payload[3] != 0U))                                               /* flags 首版必须为 0，防止误解释未来扩展位。 */
+    {
+        return 0U;                                                        /* 字段越界时不修改输出对象。 */
+    }
+
+    decoded_payload->cycle_id = BinaryProtocolService_ReadU16Le(&payload[0]); /* 按协议小端序还原检测轮次号。 */
+    decoded_payload->action = payload[2];                                /* 保存绝对开灯或关灯目标动作。 */
+    decoded_payload->flags = payload[3];                                 /* 保存已验证为 0 的首版保留标志。 */
+    return 1U;                                                           /* 所有字段均合法，允许业务层继续处理。 */
+}
+
+/**
  * @brief 解码 QUERY_STATUS 负载。
  * @param payload 原始负载。
  * @param payload_length 原始负载长度。
@@ -976,9 +1011,15 @@ static void BinaryProtocolService_SendFrame(uint8_t command, const uint8_t *payl
 {
     uint8_t tx_buffer[BINARY_PROTOCOL_MAX_FRAME_LENGTH];
     uint16_t frame_length;
+    uint16_t tx_sequence; /* 保存本帧独占的 F4 发送序号，避免多个 RTOS 任务读取到同一个值。 */
+
+    taskENTER_CRITICAL(); /* 只保护 16 位序号领取，不把组帧或 UART 发送放进临界区。 */
+    tx_sequence = g_binary_protocol_runtime.tx_sequence; /* 读取当前序号作为本帧唯一编号。 */
+    ++g_binary_protocol_runtime.tx_sequence;             /* 立即递增全局值，下一任务只能领取后续编号。 */
+    taskEXIT_CRITICAL();  /* 领取完成后马上恢复调度，避免影响其它实时任务。 */
 
     frame_length = BinaryProtocolService_BuildFrame(command,
-                                                    g_binary_protocol_runtime.tx_sequence,
+                                                    tx_sequence,
                                                     payload,
                                                     payload_length,
                                                     tx_buffer,
@@ -988,7 +1029,6 @@ static void BinaryProtocolService_SendFrame(uint8_t command, const uint8_t *payl
         return;
     }
 
-    ++g_binary_protocol_runtime.tx_sequence;
     (void)UartCommand_SendRaw(UartCommand_GetMp157Huart(), tx_buffer, frame_length, 0xFFU);
 }
 
@@ -2110,6 +2150,76 @@ static void BinaryProtocolService_HandleBeltCentered(const BinaryProtocol_Frame_
 }
 
 /**
+ * @brief 处理 FILL_LIGHT_CONTROL 补光舵机绝对开关动作。
+ * @param frame 已完成帧头、长度、CRC 和帧尾校验的协议帧。
+ * @return 无返回值；通过 ACK/NACK 告知 MP157 是否成功入队。
+ *
+ * 处理顺序：
+ * 1. 先单独检查固定 4 字节长度，使长度错误准确返回 PAYLOAD_LENGTH；
+ * 2. 再解码 action/flags，字段越界返回 FIELD_RANGE；
+ * 3. 校验 cycle_id 必须匹配活动流程；
+ * 4. 非阻塞投递给补光专用任务，队列满返回 BUSY；
+ * 5. 入队成功立即 ACK，物理动作完成必须等待 EVENT_REPORT 0x16。
+ */
+static void BinaryProtocolService_HandleFillLightControl(const BinaryProtocol_Frame_t *frame)
+{
+    BinaryProtocol_FillLightControlPayload_t payload; /* 保存通过协议边界校验的补光开关字段。 */
+    uint16_t detail;                                  /* 保存 NACK 的错误字段详情，便于 MP157 日志定位。 */
+
+    if (frame->payload_length != BINARY_PROTOCOL_FILL_LIGHT_CONTROL_PAYLOAD_LENGTH) /* 先区分真正的长度错误。 */
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_PAYLOAD_LENGTH,
+                                       frame->payload_length);
+        return; /* 长度错误时不能读取 action 或 flags 字节。 */
+    }
+
+    if (BinaryProtocolService_DecodeFillLightControl(frame->payload, /* 解码函数同时验证 action 和 flags 范围。 */
+                                                     frame->payload_length,
+                                                     &payload) == 0U)
+    {
+        detail = (frame->payload[2] > (uint8_t)BINARY_PROTOCOL_FILL_LIGHT_ACTION_ON) /* 优先报告非法 action。 */
+                     ? (uint16_t)frame->payload[2]
+                     : (uint16_t)frame->payload[3]; /* action 合法时，失败来源只能是非零 flags。 */
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_FIELD_RANGE,
+                                       detail);
+        return; /* 字段越界时禁止投递 PWM 动作。 */
+    }
+
+    if (BinaryProtocolService_IsActiveCycle(payload.cycle_id) == 0U) /* 补光动作必须属于当前活动零件。 */
+    {
+        BinaryProtocolService_SendNack(g_binary_protocol_runtime.active_cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_CYCLE_MISMATCH,
+                                       payload.cycle_id);
+        return; /* 旧 cycle 的晚到开关命令不能改变当前补光状态。 */
+    }
+
+    if (FillLightService_Request(payload.cycle_id, /* 协议任务只负责非阻塞入队，不在这里等待 2 秒。 */
+                                 payload.action,
+                                 frame->sequence) == 0U)
+    {
+        BinaryProtocolService_SendNack(payload.cycle_id,
+                                       frame->sequence,
+                                       frame->command,
+                                       BINARY_PROTOCOL_ERROR_BUSY,
+                                       payload.action);
+        return; /* 服务未就绪或队列已有等待动作时，明确要求 MP157 停止或稍后重试。 */
+    }
+
+    BinaryProtocolService_SendAck(payload.cycle_id, /* 入队成功只确认接收，不代表舵机已经转到目标位置。 */
+                                  frame->sequence,
+                                  frame->command,
+                                  0U);
+}
+
+/**
  * @brief 处理 QUERY_STATUS。
  * @param frame 已解析帧。
  *
@@ -3065,6 +3175,10 @@ uint8_t BinaryProtocolService_HandleFrame(const uint8_t *frame_buffer, uint16_t 
 
         case BINARY_PROTOCOL_CMD_BELT_STOP_CENTERED:
             BinaryProtocolService_HandleBeltCentered(&frame);
+            break;
+
+        case BINARY_PROTOCOL_CMD_FILL_LIGHT_CONTROL:
+            BinaryProtocolService_HandleFillLightControl(&frame);
             break;
 
         case BINARY_PROTOCOL_CMD_WEIGHT_CALIBRATE:

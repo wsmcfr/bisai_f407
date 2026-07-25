@@ -3,8 +3,8 @@
 | 项目 | 内容 |
 |---|---|
 | 模块位置 | `User/App/binary_protocol_service.c`、`User/App/binary_protocol_service.h` |
-| 模块用途 | 解析 STM32MP157 发给 STM32F407 的自动检测二进制协议帧，并把已接入命令分发给传送带服务和摄像头电机服务。 |
-| 当前阶段 | 已接入传送带居中闭环、手动传送带控制、状态查询、三台步进电机运行时参数下发、三轴位置/速度/停止执行器命令、当前位置设零和称重标定；机械臂、电感结果命令字先保留。 |
+| 模块用途 | 解析 STM32MP157 发给 STM32F407 的自动检测二进制协议帧，并分发给传送带、摄像头电机、补光舵机、称重和机械臂等服务。 |
+| 当前阶段 | 已接入传送带居中闭环、补光舵机控制、手动传送带控制、状态查询、三台步进电机参数、三轴执行器命令、称重标定及机械臂/传感器结果链路。 |
 
 ## 本次创建或修改文件
 
@@ -24,6 +24,9 @@
 | `MDK-ARM/bisai_f407_project.uvprojx` | 修改 | 把 `binary_protocol_service.c` 加入 Keil 编译工程。 |
 | `MDK-ARM/bisai_f407_project.uvoptx` | 修改 | 把 `binary_protocol_service.c` 加入 Keil 工程视图。 |
 | `User/App/binary_protocol_service_host_test.c` | 新增 | Windows 主机侧测试 CRC、解帧、CRC 错误、`PAUSE_CYCLE/RESUME_CYCLE`、`VISION_POS`、`STEPPER_PARAM_SET` 和 `WEIGHT_CALIBRATE` 负载解码，不依赖 F4 硬件。 |
+| `User/App/fill_light_service.c/.h` | 新增 | 使用 PB6/TIM4_CH1 输出 50 Hz 舵机 PWM，按 0~270 度公式计算脉宽，动作 2 秒后停止 PWM并上报完成事件。 |
+| `User/App/fill_light_service_host_test.c` | 新增 | 验证 0/135/270 度和越界角度的脉宽换算。 |
+| `Core/Src/freertos.c` | 修改 | 初始化补光服务并创建独立任务，避免 2 秒舵机动作阻塞协议接收。 |
 | `20_uvc_camera/qt_camera_display/main.cpp` | 修改 | MP157 侧把 `ACK status=1` 识别为重复帧未重新执行，不再显示为新的启动成功。 |
 | `20_uvc_camera/qt_camera_display/test_qt_kms_overlay_assets.sh` | 修改 | 增加静态契约检查，防止 Qt 再把重复 ACK 当成成功，也防止 F4 重复 `START_CYCLE` 分支退化为只 ACK 不动作。 |
 
@@ -35,6 +38,7 @@
 | USART2 | 非 MP157 正式主链路 | 115200 8N1，PA2(TX)、PA3(RX)，当前不再由 `uart_command.c` 作为 MP157 命令入口消费 |
 | UART4 | F4 到张大头 Emm42 传送带电机 | 115200 8N1，PC10(TX)、PC11(RX)，传送带地址 `0x01` |
 | USART6 | F4 到两个摄像头运动 Emm42 电机 | 115200 8N1，PC6(TX)、PC7(RX)，现场当前左右轴地址 `0x03`，上下轴地址 `0x02` |
+| PB6/TIM4_CH1 | 270 度补光舵机 PWM | AF2，50 Hz，默认 500~2500 us 映射 0~270 度；外部供电并与 F4 共地 |
 | FreeRTOS 队列 | 协议层到传送带任务和摄像头电机任务的异步控制 | 传送带复用内部队列；摄像头电机服务使用长度为 4 的短 FIFO，STOP 队首优先，避免运行时配置被后续动作覆盖 |
 | 串口发送互斥锁 | 防止 ACK/NACK 与文本日志交叉 | 复用 `uart_command.c` 内部 `g_uart_tx_mutex` |
 
@@ -68,6 +72,7 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | `0x20` | `VISION_POS` | 校验 `cycle_id` 和坐标有效位，计算 `axis_px - target_px` 后请求传送带 `TRACK`，成功回 `ACK`。 |
 | `0x21` | `VISION_LOST` | 相机离线时停机，其它视觉丢失原因回到扫描，成功回 `ACK`，队列不可用回 `NACK`。 |
 | `0x22` | `BELT_STOP_CENTERED` | 校验 `cycle_id`，请求传送带停止，并回 ACK。 |
+| `0x23` | `FILL_LIGHT_CONTROL` | 校验 4 字节负载和活动 `cycle_id`，把绝对开/关动作投递给补光任务；ACK 只表示入队，真实完成另发 `EVENT_REPORT event=0x16`。 |
 | `0x30` | `WEIGHT_CALIBRATE` | 校验 5 字节负载，调用称重服务用已知砝码更新 HX711 运行时比例系数；成功回 `ACK`，未去皮、克重越界或采样异常回 `NACK`。 |
 | `0x40` | `QUERY_STATUS` | 查询 F4 协议状态和传送带状态，成功直接回 `STATUS_REPORT`。 |
 | `0x41` | `BELT_MANUAL_CONTROL` | 手动调试传送带扫描/停止，成功回 `ACK`，失败回 `NACK`。 |
@@ -76,6 +81,16 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | `0x51` | `ACTUATOR_STOP` | 停止指定执行器；`actuator=0xFF` 停止传送带、摄像头左右轴和摄像头上下轴；成功回 `ACK status=0`。 |
 | `0x52` | `ACTUATOR_VEL_MOVE` | 手动调试速度连续运动，只允许传送带和摄像头左右轴，直到收到 `ACTUATOR_STOP`；上下轴速度连续运动会返回 `NACK`。 |
 | `0x53` | `ACTUATOR_HOME` | 参数页当前位置设零，F4 先停目标轴，再发送 Emm42 `[addr 0A 6D 6B]` 清零帧；不做主动回零运动，也不支持 `actuator=0xFF`。 |
+
+## `FILL_LIGHT_CONTROL 0x23` 负载
+
+| 偏移 | 字段 | 类型 | 合法范围 | 说明 |
+|---:|---|---|---|---|
+| 0 | `cycle_id` | `u16` | 当前活动流程 | 必须与 F4 `active_cycle_id` 匹配，旧轮次不能改变灯态。 |
+| 2 | `action` | `u8` | `0/1` | `0=回0度关灯`，`1=到270度开灯`。 |
+| 3 | `flags` | `u8` | 固定 `0` | 首版保留字段，非零返回 `NACK FIELD_RANGE`。 |
+
+成功入队先回 `ACK status=0`。舵机输出目标 PWM 2 秒并停止后，F4 再发送 `EVENT_REPORT event_code=0x16`：`step_code=action`、`source=7(FILL_LIGHT)`、`detail_i32=最终绝对角度`、`related_seq=原始 0x23 命令序号`。MP157 必须同时匹配 `cycle_id`、`related_seq`、事件码、`source=7`、action 和最终绝对角度，才能认为动作完成。
 
 ## `STEPPER_PARAM_SET` 负载
 
@@ -166,7 +181,7 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 
 | 场景 | F4 返回帧 | 负载长度 | MP157 判断规则 |
 |---|---|---:|---|
-| `HELLO/HEARTBEAT/START_CYCLE/PAUSE_CYCLE/RESUME_CYCLE/STOP_CYCLE/VISION_POS/VISION_LOST/BELT_STOP_CENTERED/WEIGHT_CALIBRATE/BELT_MANUAL_CONTROL/STEPPER_PARAM_SET/ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME` 执行成功 | `ACK 0x80` | 7 | `acked_seq`、`acked_cmd`、`cycle_id` 匹配，且 `status=0` 才算本次命令成功；执行器命令不能把 `actuator` 填到 `status`。 |
+| `HELLO/HEARTBEAT/START_CYCLE/PAUSE_CYCLE/RESUME_CYCLE/STOP_CYCLE/VISION_POS/VISION_LOST/BELT_STOP_CENTERED/FILL_LIGHT_CONTROL/WEIGHT_CALIBRATE/BELT_MANUAL_CONTROL/STEPPER_PARAM_SET/ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME` 执行成功 | `ACK 0x80` | 7 | `acked_seq`、`acked_cmd`、`cycle_id` 匹配且 `status=0`；位置运动还要等 `event=0x14`，补光动作还要等 `event=0x16`，ACK 本身不代表物理完成。 |
 | `QUERY_STATUS` 执行成功 | `STATUS_REPORT 0x82` | 24 | `replied_seq`、`replied_cmd=QUERY_STATUS`、`cycle_id` 匹配才算查询成功。 |
 | 命令字未知、CRC 错、长度错、状态不允许、cycle 不匹配、硬件队列未就绪 | `NACK 0x81` | 9 | MP157 读取 `error_code/state/detail` 显示失败原因，不再解析任何 `[ERROR]` 文本。 |
 | LDC、称重、传送带、摄像头电机、机械臂等模块主动发现故障 | `FAULT_REPORT 0x87` | 16 | MP157 读取 `fault_source/severity/fault_code/detail_i32/fault_bits`，作为结构化故障展示和上传依据。 |
@@ -177,7 +192,8 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 
 | 测试目标 | 执行位置 | 命令 | 预期输出/现象 | 失败时排查 |
 |---|---|---|---|---|
-| 主机侧协议测试 | `E:\hal\bisai_f407_project` | `gcc -std=c99 -Wall -Wextra -DBINARY_PROTOCOL_HOST_TEST -I User\App User\App\binary_protocol_service_host_test.c User\App\binary_protocol_service.c -o tmp\binary_protocol_service_host_test.exe; .\tmp\binary_protocol_service_host_test.exe` | 输出 `binary protocol host tests passed`；当前 host-test 裁剪硬件发送路径，会出现 `WriteI32Le` 未使用 warning，可接受。 | 若提示头文件找不到，检查 `-I User\App`；若 CRC、`STEPPER_PARAM_SET` 或 `WEIGHT_CALIBRATE` 解码失败，检查 CRC 覆盖范围和负载偏移。 |
+| 主机侧协议测试 | `E:\hal\bisai_f407_project` | `gcc -std=c99 -Wall -Wextra -Werror -DBINARY_PROTOCOL_HOST_TEST -I User\App User\App\binary_protocol_service_host_test.c User\App\binary_protocol_service.c -o tmp\binary_protocol_service_host_test.exe; .\tmp\binary_protocol_service_host_test.exe` | 无 warning，输出 `binary protocol host tests passed`；包含 `0x23` 合法/非法 action、`0x16` 和补光故障常量。 | 若提示头文件找不到，检查 `-I User\App`；若解码失败，检查 CRC、4 字节补光负载和 action/flags 偏移。 |
+| 补光角度公式测试 | 同上 | `gcc -std=c99 -Wall -Wextra -Werror -DBINARY_PROTOCOL_HOST_TEST -I User\App User\App\fill_light_service_host_test.c User\App\fill_light_service.c -o tmp\fill_light_service_host_test.exe; .\tmp\fill_light_service_host_test.exe` | 输出 `fill light service host tests passed`。 | 查 0~270 度限幅、500~2500 us 宏和 32 位中间乘法。 |
 | Keil 工程包含新文件 | `E:\hal\bisai_f407_project` | `Select-String -Path MDK-ARM\bisai_f407_project.uvprojx -Pattern "binary_protocol_service.c"` | 能看到 `../User/App/binary_protocol_service.c`。 | 如果查不到，Keil 不会编译新模块，需要重新加入工程文件。 |
 | 二进制握手 | MP157 串口工具 | 发送合法 `HELLO` 或 `HEARTBEAT` 帧 | F4 返回 `ACK 0x80` 二进制帧，负载 7 字节。 | 若无 ACK，检查帧头、帧尾、CRC 和 `BinaryProtocolService_HandleFrame()` 是否已在 `weight_service.c` 中优先调用。 |
 | 二进制状态查询 | MP157 串口工具 | 发送合法 `QUERY_STATUS 0x40` 帧，`query_mask=0x03` | F4 从 USART1 返回 `STATUS_REPORT 0x82`，负载 24 字节，能看到传送带模式、速度、误差和故障位。 | 若收到 `NACK`，按 `error_code` 排查；若无帧，先查 USART1 PA9/PA10 TX/RX、共地、波特率和 F4 是否烧录最新固件。 |
@@ -200,6 +216,7 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | 协议层 -> 三台步进电机运行参数 | `STEPPER_PARAM_SET` 调用 `ConveyorMotorService_RequestRuntimeConfig()` 和 `CameraMotorService_RequestRuntimeConfig()` 写入各自任务队列。 | F4 回 `ACK` 只表示运行内存已接收；发送 `BELTINFO` 可读传送带 `track/scan` 双速度，发送 `CAMINFO` 可读摄像头两个轴参数。传送带 `scan_speed_rpm` 影响下一次 `BELTSCAN/START_CYCLE` 上料扫描，`normal_speed_rpm` 影响 TRACK 和短步微调。 |
 | 协议层 -> 三台执行器运动 | `ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE` 调用传送带或摄像头电机服务的 JOG、POSITION、STOP 接口。 | 观察目标电机动作，并核对 ACK `status=0`；传送带还可用 `QUERY_STATUS` 查看 JOG/POSITION 状态，摄像头轴用 `CAMINFO` 看最近动作。 |
 | 协议层 -> Emm42 当前位置清零 | `ACTUATOR_HOME` 调用 `ConveyorMotorService_RequestSetCurrentPositionZero()`、`CameraMotorService_RequestLateralSetCurrentPositionZero()` 或 `CameraMotorService_RequestZSetCurrentPositionZero()`。 | F4 回 `ACK status=0` 后，目标电机不会转动；若再用相对位置移动，驱动器以新的当前位置作为位置基准。 |
+| 协议层 -> PB6 补光舵机 | `FILL_LIGHT_CONTROL` 调用 `FillLightService_Request()` 写入补光队列。 | ACK 只表示入队；示波器确认 PB6 输出 50 Hz、开灯约 2500 us 或关灯约 500 us，2 秒后停止；MP157 收到匹配 `event=0x16` 才推进。 |
 | 协议层 -> HX711 称重标定 | `WEIGHT_CALIBRATE` 调用 `WeightService_RequestCalibration()`，复用称重任务最近一次去皮状态和采样值。 | F4 回 `ACK` 表示 HX711 运行时 `scale_counts_per_g` 已更新；该值当前不写 Flash，F4 断电后需要重新标定或后续扩展持久化。 |
 
 ## 失败排查
@@ -225,6 +242,9 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | 称重标定返回 `ERR_HARDWARE_FAULT` | 最近一次 HX711 采样失败或净计数为 0；检查 DOUT/SCK、供电、砝码是否放稳和 `latest_status`。 |
 | 暂停后继续没有立刻运动 | 如果暂停前是 `TRACKING`，F4 不复用旧坐标，必须等 MP157 发送新的 `VISION_POS`；如果要强制重新扫描，`RESUME_CYCLE.resume_mode` 填 `1`。 |
 | 停止后继续旧流程 | 停止会清 `active_cycle_id`，MP157 应重新发送新的 `START_CYCLE` 和新 `cycle_id`。 |
+| 补光 ACK 后一直不检测 | 查 F4 是否发送 `EVENT_REPORT event=0x16`，其 `cycle_id/related_seq/step_code/detail_i32` 是否分别匹配当前轮次、原 0x23 序号、action 和 0/270 度。 |
+| PB6 没有 50 Hz 波形 | 查 `fill_light_service.c` 是否进入 Keil 工程、TIM4 输入时钟是否为 50 MHz、PB6 是否为 AF2、DCMI_D5 是否冲突、补光任务是否创建。 |
+| 舵机抖动、撞限位或 F4 复位 | 立即断开舵机电源；检查舵机是否独立供电并与 F4 共地，缩小 500~2500 us 标定范围或开关角度，禁止由 GPIO 供电。 |
 
 ## 修改记录
 
@@ -243,6 +263,7 @@ A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD... CRC_L CRC_H 6B
 | 2026-07-04 | 新增 `ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME` 执行器协议；传送带和左右轴手动速度模式按一次持续运动，停止键结束；上下轴继续使用固定步数位置模式；参数页可发送 `ACTUATOR_HOME` 把当前位置设为零点。 |
 | 2026-07-04 | 修正执行器命令成功 ACK：`ACTUATOR_POS_MOVE/ACTUATOR_STOP/ACTUATOR_VEL_MOVE/ACTUATOR_HOME` 成功时统一返回 `status=0`，不能把 `actuator` 写入 ACK `status`，避免 MP157 把左右轴/上下轴成功回包误判为失败。 |
 | 2026-07-04 | 摄像头轴默认地址按现场实物改为左右轴 `0x03`、上下轴 `0x02`；摄像头电机服务队列改为短 FIFO，STOP 队首优先，避免 `STEPPER_PARAM_SET` 已 ACK 但 CONFIG 被下一条手动动作覆盖。 |
+| 2026-07-25 | 新增 `FILL_LIGHT_CONTROL 0x23`、4 字节负载、PB6/TIM4_CH1 补光服务、`EVENT_REPORT 0x16`、结构化故障位和主机回归测试；动作 2 秒后停止 PWM。 |
 | 2026-07-04 | 修正左右轴停止键无效：摄像头电机服务新增 `stop_epoch`，STOP 后自动丢弃旧 JOG/POSITION/HOME 运动命令，避免旧队列命令在 STOP 后重新启动左右轴。 |
 | 2026-07-05 | `STEPPER_PARAM_SET 0x42` 扩展为 31 字节负载、三条 9 字节电机记录；新增 `scan_speed_rpm`，传送带 SCAN 使用上料速度，TRACK/短步使用 `normal_speed_rpm`，摄像头两轴继续使用常规速度。 |
 | 2026-07-05 | 新增位置运动估算完成状态：张大头官方位置模式例程只演示发送 `Emm_V5_Pos_Control()` 并等待串口帧，没有证明默认一定主动返回完成帧；因此 F4 没收到 `[addr FD 9F 6B]` 时，按估算运动时间发送 `EVENT_REPORT event=0x14 status=5 estimated-done`，不再用普通无回包场景卡住 MP157 自动流程。 |

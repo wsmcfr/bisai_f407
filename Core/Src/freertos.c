@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "camera_motor_service.h"
 #include "conveyor_motor_service.h"
+#include "fill_light_service.h"
 #include "ldc1614_service.h"
 #include "robot_arm_service.h"
 #include "system_heartbeat_service.h"
@@ -70,6 +71,16 @@ static const osThreadAttr_t cameraMotorTask_attributes = {
   .name = "cameraMotorTask",               /* 任务名称用于 RTOS 调试视图识别摄像头运动电机服务线程。 */
   .stack_size = 320 * 4,                   /* 摄像头电机任务同样会经过双电机控制和日志路径，扩到 320 word 给后续调试留余量。 */
   .priority = (osPriority_t) osPriorityNormal, /* 普通优先级保证点动命令能及时执行，同时不压制更高实时性采样任务。 */
+};
+
+/* 补光舵机任务句柄保留在用户区，负责 PB6/TIM4_CH1 的串行开灯和关灯动作。 */
+static osThreadId_t fillLightTaskHandle = NULL;
+
+/* 补光任务只等待短队列并保持 PWM 2 秒，普通优先级可保证动作及时且不抢占采样任务。 */
+static const osThreadAttr_t fillLightTask_attributes = {
+  .name = "fillLightTask",                 /* 任务名称用于 RTOS 调试视图定位补光舵机线程。 */
+  .stack_size = 192 * 4,                    /* 调用 HAL PWM、延时和事件打包，192 word 为当前调用链留出余量。 */
+  .priority = (osPriority_t) osPriorityNormal, /* 普通优先级与其它执行器服务一致。 */
 };
 
 /* 心跳灯任务句柄保留在用户区，避免后续 CubeMX 重新生成时被覆盖。 */
@@ -173,6 +184,24 @@ void MX_FREERTOS_Init(void) {
      * 摄像头电机任务创建失败时，后续 `CAMFWD/CAMZ/CAMSTOP` 命令无法执行，
      * 自动视觉微调也无法工作，因此按关键业务任务失败处理。
      */
+    Error_Handler();
+  }
+
+  /* 先创建补光命令队列并配置 PB6/TIM4_CH1，再启动任务，避免协议早到时队列尚未就绪。 */
+  if (FillLightService_Init() == 0U)
+  {
+    /*
+     * 初始化失败意味着 FreeRTOS 队列不足或 TIM4/PB6 配置失败。
+     * 此时自动流程无法确认补光灯状态，因此进入统一错误处理，不允许带故障继续检测。
+     */
+    Error_Handler();
+  }
+
+  /* 补光任务独占 PWM 动作的 2 秒保持等待，协议接收线程不会被舵机时序阻塞。 */
+  fillLightTaskHandle = osThreadNew(FillLightService_Task, NULL, &fillLightTask_attributes);
+  if (fillLightTaskHandle == NULL)
+  {
+    /* 任务创建失败后队列虽存在但无人消费，继续运行只会让 MP157 等待完成事件超时。 */
     Error_Handler();
   }
 
