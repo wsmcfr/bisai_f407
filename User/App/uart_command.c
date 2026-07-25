@@ -439,10 +439,9 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     uint16_t copy_index;
     UBaseType_t critical_state;
 
-    /* USART3: 机械臂ESP32链路，DMA+空闲中断接收，交由robot_arm_service处理。 */
+    /* USART3 现在用单字节中断接收，不再走 RxEventCallback。 */
     if (huart == &huart3)
     {
-        RobotArmService_RxEventFromISR(Size);
         return;
     }
 
@@ -533,4 +532,21 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     huart->ErrorCode = HAL_UART_ERROR_NONE;
 
     UartCommand_RestartReceive();
+}
+
+
+/**
+ * @brief HAL 串口接收完成回调（单字节中断模式）。
+ * @param huart 完成接收的串口句柄。
+ *
+ * USART3 使用单字节中断接收（9600 波特率下避免 DMA 空闲中断分帧问题），
+ * 每收到 1 字节由 HAL 调用此回调，交给 robot_arm_service 压入环形缓冲区。
+ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart == &huart3)
+    {
+        RobotArmService_RxCpltFromISR();
+        return;
+    }
 }

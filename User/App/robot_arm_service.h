@@ -96,21 +96,16 @@ uint8_t RobotArmService_RequestFinalSort(uint16_t cycle_id,
 void RobotArmService_Task(void *argument);
 
 /**
- * @brief USART3 DMA+空闲中断接收事件回调（从ISR中调用）。
- * @param size 本次DMA传输的实际字节数。
+ * @brief USART3 单字节接收完成回调（从 HAL_UART_RxCpltCallback 中调用）。
  *
- * 由 HAL_UARTEx_RxEventCallback 在 huart==&huart3 时调用，
- * 负责把DMA缓冲区中收到的字节压入内部环形缓冲区并唤醒等待任务。
+ * 每收到 1 字节压入内部环形缓冲区并唤醒等待任务，然后重新挂起下一字节接收。
  */
-void RobotArmService_RxEventFromISR(uint16_t size);
+void RobotArmService_RxCpltFromISR(void);
 
 /**
  * @brief USART3 接收错误后的恢复入口（从 HAL 错误回调中调用）。
  *
- * 当 USART3 在 DMA+空闲接收过程中出现 ORE/FE/NE/PE 等错误时，
- * HAL 会中止当前接收流程；该函数负责清除 USART3 错误标志、
- * 丢弃可能已经不完整的接收缓存，并重新挂起下一轮 DMA+空闲中断接收。
- * 该函数运行在中断上下文，内部只做状态复位和接收重启，不做日志输出。
+ * 清除错误标志、清空缓冲区并重新启动单字节中断接收。
  */
 void RobotArmService_RecoverRxFromISR(void);
 

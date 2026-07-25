@@ -3,7 +3,7 @@
 | 项目 | 内容 |
 |---|---|
 | 模块位置 | `User/App/robot_arm_service.c`、`User/App/robot_arm_service.h`、`User/App/robot_arm_rx_parser.c`、`User/App/robot_arm_rx_parser.h` |
-| 硬件链路 | STM32F407 USART3 `<->` ESP32S3 UART，固定 `115200 8N1`，3.3V TTL，共地 |
+| 硬件链路 | STM32F407 USART3 `<->` ESP32S3 UART，固定 `9600 8N1`，3.3V TTL，共地 |
 | 当前协议 | 只使用 `A5 5A VER CMD LEN SEQ_L SEQ_H PAYLOAD CRC_L CRC_H 6B` 正式二进制协议 |
 | 上游入口 | `binary_protocol_service.c` 调用 `RobotArmService_RequestPlaceWeight()`、`RobotArmService_RequestPlaceLdc()`、`RobotArmService_RequestFinalSort()` |
 | 下游回包 | ESP32S3 必须回 `ARM_ACK`，动作真实完成后再回 `ARM_STAGE_DONE` |
@@ -11,6 +11,7 @@
 | 当前诊断增强 | `robotArmTask` 会打印最小栈水位；USART3 等待改为分片轮询并主动让出调度，不再长时间霸占 CPU |
 | 当前串口定位 | `robot_arm_service.c` 会把 `[ARM]` 和 `[ARM-LOOP]` 调试日志输出到独立 `USART1(PA9/PA10)`，用于确认 PD9 是否真的收到 ESP 回传而不占用 MP157-F4 的 `USART2(PA2/PA3)` 主链路 |
 | 当前接收策略 | 正式模式下新增 `robot_arm_rx_parser` 缓存与重同步层；ACK/DONE 等待从缓存取帧，空闲时每 `5ms` 也会轮询 USART3 把主动故障帧先收进缓存，不再只在发送后临时读 RX。 |
+| 当前接收中断 | USART3 使用 `HAL_UART_Receive_IT(..., 1)` 单字节接收；`HAL_UART_RxCpltCallback()` 每收到 1 字节就写入环形缓冲并立即挂起下一字节，避免 9600 波特率下 DMA+IDLE 把一帧拆成多段。 |
 | 当前自检开关 | `robot_arm_service.c` 的 `ROBOT_ARM_SERVICE_ENABLE_FORMAL_PROTOCOL_FLOW` 当前已恢复为 `1U`，默认进入正式协议自动流程；只有单独做 `USART3` 回环时才临时改成 `0U` |
 
 ## 修改文件清单
@@ -95,13 +96,14 @@
 | 2026-07-07 | 历史阶段调试日志迁移到独立 USART2 | 当时为避免自动流程期间 `USART1` 被 MP157 占用，机械臂服务调试日志曾从 `USART1` 迁移到新增 `USART2(PA2/PA3)`；该安排已被 2026-07-16 的 USART2 主链路方案取代。 |
 | 2026-07-07 | 新增接收缓存与空闲期轮询 | 新增 `robot_arm_rx_parser.c/.h` 和主机侧测试，正式模式下 ACK/DONE 不再直接按阻塞读拼帧，而是先进入解析缓存；坏帧后继续找下一帧，且空闲期也轮询 USART3，避免主动 `FAULT_REPORT` 被下一次发送前的 flush 静默丢掉。 |
 | 2026-07-16 | 调试日志迁移到 USART1 | 因 MP157-F4 主链路改用 `USART2(PA2/PA3)`，机械臂 `[ARM]` 和 `[ARM-LOOP]` 调试日志改到 `USART1(PA9)`，避免污染 MP157 二进制回包。 |
+| 2026-07-25 | USART3 固化为 9600 单字节中断接收 | `robot_arm_service.c/.h` 和 `uart_command.c` 改用 `HAL_UART_Receive_IT`/`HAL_UART_RxCpltCallback`；同步更新 CubeMX `.ioc` 和本文，避免重新生成工程恢复 115200。 |
 
 ## 硬件资源
 
 | 资源 | 用途 | 要求 |
 |---|---|---|
-| USART3 TX | F4 发送正式机械臂命令到 ESP32S3 RX | 115200 8N1，3.3V TTL |
-| USART3 RX | F4 接收 ESP32S3 ACK/DONE/NACK/FAULT | 115200 8N1，3.3V TTL |
+| USART3 TX | F4 发送正式机械臂命令到 ESP32S3 RX | 9600 8N1，3.3V TTL |
+| USART3 RX | F4 接收 ESP32S3 ACK/DONE/NACK/FAULT | 9600 8N1，单字节 RX 中断，3.3V TTL |
 | GND | 两板信号参考地 | 必须共地 |
 | USART1 TX | F4 输出机械臂调试日志到串口助手 | `PA9(TX)`，115200 8N1，接 USB-TTL RX |
 | USART1 RX | 预留调试输入 | `PA10(RX)`，当前机械臂服务不主动读取 |

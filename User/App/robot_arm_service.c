@@ -35,23 +35,25 @@
 /**
  * @brief USART3 单帧发送超时时间，单位毫秒。
  *
- * 正式机械臂帧最长不超过 58 字节，115200 波特率下 200ms 已有足够余量。
+ * 正式机械臂帧最长不超过 58 字节，9600 波特率下每字节约 1.04ms，
+ * 58 字节需约 60ms，这里留 500ms 余量覆盖低速链路。
  */
-#define ROBOT_ARM_SERVICE_TX_TIMEOUT_MS             (200U)
+#define ROBOT_ARM_SERVICE_TX_TIMEOUT_MS             (500U)
 
 /**
  * @brief 等待 ESP32S3 ACK 首字节的超时时间，单位毫秒。
  *
- * ACK 只表示 ESP32S3 已经接收并接受命令，应快速返回；超过该时间说明链路或固件状态异常。
+ * 9600 波特率下 ESP32 处理+返回延迟更大，留 2000ms 容忍慢响应。
  */
-#define ROBOT_ARM_SERVICE_ACK_TIMEOUT_MS            (500U)
+#define ROBOT_ARM_SERVICE_ACK_TIMEOUT_MS            (2000U)
 
 /**
  * @brief 读取一帧内后续字节的短超时时间，单位毫秒。
  *
- * 首字节到达后，同一帧后续字节应连续出现；短超时可避免任务被坏帧长时间拖住。
+ * 9600 波特率下每字节传输约 1.04ms，DMA 空闲检测可能在字节间隙触发回调
+ * 导致半帧分两次到达。50ms 足以覆盖字节间正常间隔，又不会被坏帧卡太久。
  */
-#define ROBOT_ARM_SERVICE_RX_NEXT_TIMEOUT_MS        (10U)
+#define ROBOT_ARM_SERVICE_RX_NEXT_TIMEOUT_MS        (50U)
 
 /**
  * @brief 寻找正式帧头时允许跳过的前置噪声字节数量。
@@ -113,16 +115,13 @@
  */
 #define ROBOT_ARM_SERVICE_NACK_PAYLOAD_LEN          (9U)
 
-/* ========== USART3 DMA+空闲中断接收 ========== */
-
-/* DMA接收缓冲区大小，单帧最大58字节，64足够。 */
-#define ROBOT_ARM_DMA_RX_BUF_SIZE                  (64U)
+/* ========== USART3 单字节中断接收 ========== */
 
 /* 环形缓冲区大小，需容纳至少两帧（ACK+DONE连续到达）。 */
 #define ROBOT_ARM_RING_BUF_SIZE                    (128U)
 
-/* DMA硬件写入的接收缓冲区（不可被任务直接读取，由ISR搬运到环形缓冲区）。 */
-static uint8_t g_robot_arm_dma_buf[ROBOT_ARM_DMA_RX_BUF_SIZE];
+/* 单字节中断接收临时变量。 */
+static uint8_t g_robot_arm_rx_byte;
 
 /* ISR与任务之间共享的环形缓冲区，ISR写、任务读。 */
 static uint8_t g_robot_arm_ring_buf[ROBOT_ARM_RING_BUF_SIZE];
@@ -132,7 +131,7 @@ static volatile uint16_t g_robot_arm_ring_read = 0U;
 /* 任务等待新数据的信号量，ISR中Give、任务中Take。 */
 static SemaphoreHandle_t g_robot_arm_rx_semaphore = NULL;
 
-/* ========== 结束 DMA 接收定义 ========== */
+/* ========== 结束接收定义 ========== */
 
 /**
  * @brief 机械臂正式协议命令字。
@@ -357,7 +356,7 @@ static const char *RobotArmService_GetSourceDescription(const char *source_label
  *
  * 副作用：清除错误标志会读取 USART 状态/数据寄存器，错误期间残留的坏字节会被丢弃。
  */
-static void RobotArmService_StartDmaReceive(void);
+static void RobotArmService_StartRxIT(void);
 
 static void RobotArmService_ClearUsart3ErrorFlags(void)
 {
@@ -385,74 +384,48 @@ static void RobotArmService_ClearUsart3ErrorFlags(void)
 }
 
 /**
- * @brief 清理 USART3 上残留的旧字节和错误标志。
+ * @brief 清理 USART3 软件环形缓冲区中的残留字节。
  *
- * DMA 接收期间不能直接读 DR 寄存器（会和 DMA 竞争同一个数据源导致丢字节或状态异常）。
- * 正确做法：先中止 DMA 接收 → 清空软件环形缓冲区 → 清除硬件错误标志 → 重启 DMA 接收。
- * 这样保证发送命令后读到的 ACK/DONE 帧一定是本次命令的响应。
+ * 在发送新命令前清空软件缓冲区，确保后续读到的帧是本次命令的响应。
+ * 不停止 DMA 接收——DMA 保持活跃可以避免低速波特率下因停/起窗口期丢字节。
+ * DMA 继续往环形缓冲区写入的字节会被清空操作覆盖，不影响后续帧解析。
  */
 static void RobotArmService_FlushUsart3Rx(void)
 {
-    /* 先停止当前 DMA 接收流程，避免后续操作和 DMA 竞争 DR 寄存器。 */
-    (void)HAL_UART_DMAStop(&huart3);
-
-    /* 清空软件环形缓冲区中可能残留的旧帧/噪声字节。 */
+    taskENTER_CRITICAL();
     g_robot_arm_ring_write = 0U;
     g_robot_arm_ring_read = 0U;
-
-    /* 清除 USART3 硬件侧的接收错误标志和可能残留在 DR 中的字节。 */
-    RobotArmService_ClearUsart3ErrorFlags();
-    while (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_RXNE) != RESET)
-    {
-        volatile uint32_t discard = huart3.Instance->DR;
-        (void)discard;
-    }
-
-    /* 清空 DMA 缓冲区并重新挂起 DMA+空闲中断接收。 */
-    (void)memset(g_robot_arm_dma_buf, 0, sizeof(g_robot_arm_dma_buf));
-    RobotArmService_StartDmaReceive();
+    taskEXIT_CRITICAL();
 }
 
 /**
- * @brief 启动 USART3 DMA+空闲中断接收。
+ * @brief 启动 USART3 单字节中断接收。
  *
- * 使用 HAL_UARTEx_ReceiveToIdle_DMA：当ESP32发完一帧后总线空闲，
- * 硬件自动触发中断，DMA缓冲区里就是完整的一帧数据。
- * 关闭半传输中断以避免短帧场景下的多余回调。
+ * 9600 波特率下 DMA+空闲中断容易把一帧拆成多段（字节间隙触发 IDLE），
+ * 改用 HAL_UART_Receive_IT 每次收 1 字节，在 RxCpltCallback 中压入环形缓冲区。
+ * 9600 最高 960 字节/秒，逐字节中断 CPU 负担可忽略。
  */
-static void RobotArmService_StartDmaReceive(void)
+static void RobotArmService_StartRxIT(void)
 {
-    if (HAL_UARTEx_ReceiveToIdle_DMA(&huart3,
-                                      g_robot_arm_dma_buf,
-                                      ROBOT_ARM_DMA_RX_BUF_SIZE) == HAL_OK)
+    HAL_StatusTypeDef status;
+
+    status = HAL_UART_Receive_IT(&huart3, &g_robot_arm_rx_byte, 1U);
+    if (status == HAL_BUSY)
     {
-        if (huart3.hdmarx != NULL)
-        {
-            __HAL_DMA_DISABLE_IT(huart3.hdmarx, DMA_IT_HT);
-        }
+        huart3.RxState = HAL_UART_STATE_READY;
+        (void)HAL_UART_Receive_IT(&huart3, &g_robot_arm_rx_byte, 1U);
     }
 }
 
 /**
- * @brief 从 HAL 错误回调中恢复 USART3 DMA+空闲中断接收。
+ * @brief USART3 接收错误后的恢复入口（从 HAL 错误回调中调用）。
  *
- * 主要流程：
- * 1. 清除 USART3 的 PE/ORE/FE/NE 等错误标志；
- * 2. 清空软件环形缓冲区读写位置，丢弃错误前后可能拼接出的半帧；
- * 3. 清空 DMA 临时缓冲并重新挂起 `HAL_UARTEx_ReceiveToIdle_DMA()`。
- *
- * @return 无返回值。
- * 副作用：该函数运行在中断上下文，会丢弃 USART3 当前缓存中的未解析字节；
- * 这是为了避免错误恢复后把坏帧残留误解析成 ESP32S3 的 ACK/DONE。
+ * 清除错误标志，清空环形缓冲区，重新启动单字节中断接收。
  */
 void RobotArmService_RecoverRxFromISR(void)
 {
     UBaseType_t critical_state;
 
-    /*
-     * USART3 接收错误后，HAL 可能已经终止 DMA 接收流程。
-     * 先清错误标志，再丢弃软件环形缓冲中的半帧/坏帧，避免任务侧把错误前后的字节拼成假帧。
-     */
     RobotArmService_ClearUsart3ErrorFlags();
 
     critical_state = taskENTER_CRITICAL_FROM_ISR();
@@ -460,56 +433,32 @@ void RobotArmService_RecoverRxFromISR(void)
     g_robot_arm_ring_read = 0U;
     taskEXIT_CRITICAL_FROM_ISR(critical_state);
 
-    (void)memset(g_robot_arm_dma_buf, 0, sizeof(g_robot_arm_dma_buf));
-    RobotArmService_StartDmaReceive();
+    huart3.RxState = HAL_UART_STATE_READY;
+    RobotArmService_StartRxIT();
 }
 
 /**
- * @brief USART3 DMA接收事件回调（从ISR中调用）。
- * @param size 本次接收到的字节数。
+ * @brief USART3 单字节接收完成回调（从 HAL_UART_RxCpltCallback 调用）。
  *
- * 主要流程：
- * 1. 先把 HAL 给出的长度限制在 DMA 缓冲区容量内，避免异常长度造成越界；
- * 2. 在中断临界区内把 DMA 缓冲区搬到软件环形缓冲区；
- * 3. 立即重启下一轮 DMA+空闲中断接收；
- * 4. 只有本次确实收到字节时才唤醒等待任务，避免空事件造成误唤醒。
+ * 每收到 1 字节就压入环形缓冲区，释放信号量唤醒任务，并立即挂起下一字节接收。
  */
-void RobotArmService_RxEventFromISR(uint16_t size)
+void RobotArmService_RxCpltFromISR(void)
 {
     BaseType_t higher_priority_woken = pdFALSE;
-    UBaseType_t critical_state;
-    uint16_t copy_length;
-    uint16_t i;
     uint16_t next_write;
 
-    copy_length = size;
-    if (copy_length > ROBOT_ARM_DMA_RX_BUF_SIZE)
+    next_write = (uint16_t)((g_robot_arm_ring_write + 1U) % ROBOT_ARM_RING_BUF_SIZE);
+    if (next_write != g_robot_arm_ring_read)
     {
-        copy_length = ROBOT_ARM_DMA_RX_BUF_SIZE;
+        g_robot_arm_ring_buf[g_robot_arm_ring_write] = g_robot_arm_rx_byte;
+        g_robot_arm_ring_write = next_write;
     }
 
-    if (copy_length > 0U)
-    {
-        critical_state = taskENTER_CRITICAL_FROM_ISR();
-        for (i = 0U; i < copy_length; ++i)
-        {
-            next_write = (uint16_t)((g_robot_arm_ring_write + 1U) % ROBOT_ARM_RING_BUF_SIZE);
-            if (next_write == g_robot_arm_ring_read)
-            {
-                break; /* 环形缓冲区满时丢弃本次剩余字节，避免覆盖任务尚未读取的旧帧。 */
-            }
-            g_robot_arm_ring_buf[g_robot_arm_ring_write] = g_robot_arm_dma_buf[i];
-            g_robot_arm_ring_write = next_write;
-        }
-        taskEXIT_CRITICAL_FROM_ISR(critical_state);
+    /* 立即挂起下一字节接收。 */
+    huart3.RxState = HAL_UART_STATE_READY;
+    (void)HAL_UART_Receive_IT(&huart3, &g_robot_arm_rx_byte, 1U);
 
-        (void)memset(g_robot_arm_dma_buf, 0, sizeof(g_robot_arm_dma_buf));
-    }
-
-    /* 重启下一轮DMA接收。 */
-    RobotArmService_StartDmaReceive();
-
-    if ((copy_length > 0U) && (g_robot_arm_rx_semaphore != NULL))
+    if (g_robot_arm_rx_semaphore != NULL)
     {
         (void)xSemaphoreGiveFromISR(g_robot_arm_rx_semaphore, &higher_priority_woken);
         portYIELD_FROM_ISR(higher_priority_woken);
@@ -940,54 +889,77 @@ static uint8_t RobotArmService_WaitAck(const RobotArmService_TxContext_t *contex
 {
     uint8_t rx_frame[ROBOT_ARM_SERVICE_FRAME_MAX_SIZE];
     BinaryProtocol_Frame_t parsed_frame;
+    TickType_t deadline_tick;
+    TickType_t now_tick;
+    TickType_t remain_tick;
+    uint32_t remain_ms;
 
     if (context == NULL)
     {
         return 0U;
     }
 
-    if (RobotArmService_ReadFormalFrame(rx_frame,
-                                        (uint16_t)sizeof(rx_frame),
-                                        &parsed_frame,
-                                        ROBOT_ARM_SERVICE_ACK_TIMEOUT_MS) == 0U)
+    deadline_tick = xTaskGetTickCount() + pdMS_TO_TICKS(ROBOT_ARM_SERVICE_ACK_TIMEOUT_MS);
+
+    for (;;)
     {
-        BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
-        BinaryProtocolService_ReportFault((uint16_t)context->command,
-                                          BINARY_PROTOCOL_FAULT_SOURCE_ARM,
-                                          BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
-                                          0,
-                                          context->sequence);
+        now_tick = xTaskGetTickCount();
+        if ((int32_t)(deadline_tick - now_tick) <= 0)
+        {
+            break;
+        }
+
+        remain_tick = deadline_tick - now_tick;
+        remain_ms = (uint32_t)remain_tick * (uint32_t)portTICK_PERIOD_MS;
+        if (remain_ms == 0U)
+        {
+            remain_ms = 1U;
+        }
+
+        if (RobotArmService_ReadFormalFrame(rx_frame,
+                                            (uint16_t)sizeof(rx_frame),
+                                            &parsed_frame,
+                                            remain_ms) == 0U)
+        {
+            /* 读帧失败（噪声/半帧），继续重试直到总超时。 */
+            continue;
+        }
+
+        if (parsed_frame.command == ROBOT_ARM_CMD_ACK)
+        {
+            return RobotArmService_HandleAckFrame(context, &parsed_frame);
+        }
+
+        if (parsed_frame.command == ROBOT_ARM_CMD_NACK)
+        {
+            RobotArmService_HandleNackFrame(context, &parsed_frame);
+            return 0U;
+        }
+
+        if (parsed_frame.command == ROBOT_ARM_CMD_FAULT_REPORT)
+        {
+            RobotArmService_HandleFaultFrame(&parsed_frame);
+            return 0U;
+        }
+
         my_printf(&huart2,
-                  "[ARM] ACK timeout: cmd=%s, cycle=%u, seq=%u. Check ESP32 formal protocol, TX/RX, GND and 115200 8N1.\r\n",
-                  RobotArmService_GetCommandDescription(context->command),
-                  (unsigned int)context->cycle_id,
-                  (unsigned int)context->sequence);
-        return 0U;
-    }
-
-    if (parsed_frame.command == ROBOT_ARM_CMD_ACK)
-    {
-        return RobotArmService_HandleAckFrame(context, &parsed_frame);
-    }
-
-    if (parsed_frame.command == ROBOT_ARM_CMD_NACK)
-    {
-        RobotArmService_HandleNackFrame(context, &parsed_frame);
-        return 0U;
-    }
-
-    if (parsed_frame.command == ROBOT_ARM_CMD_FAULT_REPORT)
-    {
-        RobotArmService_HandleFaultFrame(&parsed_frame);
-        return 0U;
+                  "[ARM] Unexpected frame while waiting ACK: cmd=0x%02X(%s), seq=%u.\r\n",
+                  (unsigned int)parsed_frame.command,
+                  RobotArmService_GetCommandDescription(parsed_frame.command),
+                  (unsigned int)parsed_frame.sequence);
     }
 
     BinaryProtocolService_SetFaultBit(BINARY_PROTOCOL_FAULT_BIT_ARM_LINK);
+    BinaryProtocolService_ReportFault((uint16_t)context->command,
+                                      BINARY_PROTOCOL_FAULT_SOURCE_ARM,
+                                      BINARY_PROTOCOL_FAULT_SEVERITY_WARNING,
+                                      0,
+                                      context->sequence);
     my_printf(&huart2,
-              "[ARM] Unexpected frame while waiting ACK: cmd=0x%02X(%s), seq=%u.\r\n",
-              (unsigned int)parsed_frame.command,
-              RobotArmService_GetCommandDescription(parsed_frame.command),
-              (unsigned int)parsed_frame.sequence);
+              "[ARM] ACK timeout: cmd=%s, cycle=%u, seq=%u.\r\n",
+              RobotArmService_GetCommandDescription(context->command),
+              (unsigned int)context->cycle_id,
+              (unsigned int)context->sequence);
     return 0U;
 }
 
@@ -1036,7 +1008,8 @@ static uint8_t RobotArmService_WaitStageDone(const RobotArmService_TxContext_t *
                                             &parsed_frame,
                                             remain_ms) == 0U)
         {
-            break;
+            /* 读帧失败（噪声/半帧/短超时），不放弃，继续循环直到总超时。 */
+            continue;
         }
 
         if (parsed_frame.command == ROBOT_ARM_CMD_STAGE_DONE)
@@ -1319,7 +1292,7 @@ uint8_t RobotArmService_Init(void)
     }
     g_robot_arm_ring_write = 0U;
     g_robot_arm_ring_read = 0U;
-    RobotArmService_StartDmaReceive();
+    RobotArmService_StartRxIT();
 
     return 1U;
 }
